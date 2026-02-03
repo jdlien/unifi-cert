@@ -21,24 +21,21 @@ def temp_dir():
 
 @pytest.fixture
 def sample_cert_content():
-    """Sample certificate PEM content."""
-    return """-----BEGIN CERTIFICATE-----
-MIIFazCCA1OgAwIBAgIUB5JGf1QzXxsZz7oGvjBKl1J8+4IwDQYJKoZIhvcNAQEL
-BQAwRTELMAkGA1UEBhMCVVMxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoM
-GEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAeFw0yNDAxMDEwMDAwMDBaFw0yNTAx
-MDEwMDAwMDBaMEUxCzAJBgNVBAYTAlVTMRMwEQYDVQQIDApTb21lLVN0YXRlMSEw
-HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwggIiMA0GCSqGSIb3DQEB
-AQUAA4ICDwAwggIKAoICAQDf0TJq+Q==
------END CERTIFICATE-----
+    """Sample certificate PEM content (not a real cert - truncated test data)."""
+    # Using a clearly fake/truncated format to avoid secret scanner false positives
+    return """-----BEGIN TEST CERTIFICATE-----
+THISISNOTAREALCERTIFICATE0123456789ABCDEF==
+-----END TEST CERTIFICATE-----
 """
 
 
 @pytest.fixture
 def sample_key_content():
-    """Sample private key PEM content."""
-    return """-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDf0TJq+QAAAQ==
------END PRIVATE KEY-----
+    """Sample key PEM content (not a real key - truncated test data)."""
+    # Using a clearly fake/truncated format to avoid secret scanner false positives
+    return """-----BEGIN TEST KEY-----
+THISISNOTAREALKEY0123456789ABCDEF==
+-----END TEST KEY-----
 """
 
 
