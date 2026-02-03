@@ -12,6 +12,12 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+*.egg-info/
+
+# Coverage
+.coverage
+coverage_html/
+htmlcov/
 
 # macOS
 .DS_Store
