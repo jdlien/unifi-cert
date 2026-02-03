@@ -1,0 +1,25 @@
+# Secrets and credentials
+*.key
+*.pem
+*.ini
+.secrets/
+
+# Certificates (public but no need to track)
+*.crt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
