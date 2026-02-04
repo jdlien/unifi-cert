@@ -158,6 +158,16 @@ UniFi OS stores certificates in two places that must stay synchronized:
 - **Service Restart:** By default, the tool restarts `unifi-core` after installation. This briefly takes the console offline (~10-30 seconds). Use `--skip-restart` to avoid this, but the WebUI won't reflect changes until the next restart.
 - **UI Removal:** If you remove a certificate via the UniFi UI, it only removes the PostgreSQL entry and UUID files. The EUS certificates (what's actually served) remain untouched. This tool can re-sync them.
 
+### Automatic Renewal
+
+When you obtain a certificate using this tool, it automatically installs a renewal hook at `/etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh`. This ensures that when certbot auto-renews your certificate (typically 30 days before expiry), the new cert is automatically synced to both the EUS paths and PostgreSQL, keeping the WebUI in sync.
+
+Certbot's renewal runs automatically via systemd timer. You can verify the hook is installed:
+
+```bash
+cat /etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh
+```
+
 ## Supported Devices
 
 - UniFi Dream Machine (UDM, UDM Pro, UDM SE)

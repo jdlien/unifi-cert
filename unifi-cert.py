@@ -1282,6 +1282,37 @@ def main() -> int:
             return 0
         return 1
 
+    # Handle renewal (called by certbot post-renewal hook)
+    if args.renew:
+        cert_path = f'/etc/letsencrypt/live/{args.domain}/fullchain.pem'
+        key_path = f'/etc/letsencrypt/live/{args.domain}/privkey.pem'
+
+        if not os.path.exists(cert_path):
+            ui.error(f'Certificate not found: {cert_path}')
+            return 1
+        if not os.path.exists(key_path):
+            ui.error(f'Key not found: {key_path}')
+            return 1
+
+        ui.status(f'Syncing renewed certificate for {args.domain}...')
+
+        platform = UnifiPlatform.detect()
+        if not platform:
+            ui.error('Not running on a UniFi device.')
+            return 1
+
+        success = install_certificate(
+            cert_path, key_path, args.domain, platform,
+            skip_postgres=args.skip_postgres,
+            skip_restart=args.skip_restart,
+            dry_run=args.dry_run,
+        )
+
+        if success:
+            ui.success(f'Renewed certificate for {args.domain} synced to UniFi')
+            return 0
+        return 1
+
     # Install existing certificate
     if args.install:
         if not args.cert or not args.key:
@@ -1392,6 +1423,13 @@ def main() -> int:
             return 0
 
     if success:
+        # Set up renewal hook to keep UI in sync after future renewals
+        script_path = os.path.abspath(__file__)
+        if setup_renewal_hook(args.domain, script_path):
+            ui.info('Renewal hook installed - UI will stay in sync after renewals')
+        else:
+            ui.warning('Could not set up renewal hook. Run --setup-hook manually.')
+
         ui.header('Complete')
         ui.success(f'Certificate for {args.domain} obtained and installed!')
         ui.table([

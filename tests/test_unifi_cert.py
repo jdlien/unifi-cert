@@ -2184,6 +2184,44 @@ class TestMain:
             result = unifi_cert.main()
         assert result == 0
 
+    def test_main_renew_success(self):
+        """Test main --renew syncs renewed certificate."""
+        mock_platform = unifi_cert.UnifiPlatform(
+            device_type='UDM',
+            core_version='4.0.6',
+            has_eus_certs=True,
+            has_postgres=True,
+            active_cert_id='uuid',
+        )
+
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=mock_platform), \
+             patch.object(unifi_cert, 'install_certificate', return_value=True):
+            result = unifi_cert.main()
+        assert result == 0
+
+    def test_main_renew_cert_not_found(self):
+        """Test main --renew fails when cert not found."""
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(unifi_cert, 'ui'):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_main_renew_no_platform(self):
+        """Test main --renew fails when not on UniFi device."""
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=None):
+            result = unifi_cert.main()
+        assert result == 1
+
 
 class TestInteractiveMode:
     """Tests for interactive mode."""
