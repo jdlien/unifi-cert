@@ -321,6 +321,33 @@ class CertMetadata:
         )
 
 
+def detect_domain_from_cert(cert_path: str = None) -> Optional[str]:
+    """
+    Auto-detect domain from an existing certificate.
+
+    Args:
+        cert_path: Path to certificate file. If None, uses default EUS cert path.
+
+    Returns:
+        Domain name (CN) if found, None otherwise.
+    """
+    if cert_path is None:
+        cert_path = UNIFI_PATHS['eus_cert']
+
+    if not os.path.exists(cert_path):
+        return None
+
+    try:
+        meta = CertMetadata.from_cert_file(cert_path)
+        if meta.cn and meta.cn != 'localhost' and not meta.cn.startswith('UniFi'):
+            ui.debug(f'Auto-detected domain from certificate: {meta.cn}')
+            return meta.cn
+    except Exception as e:
+        ui.debug(f'Failed to extract domain from certificate: {e}')
+
+    return None
+
+
 # =============================================================================
 # IP LOOKUP - Multi-provider fallback
 # =============================================================================
@@ -1093,8 +1120,13 @@ def interactive_mode() -> dict:
     ui.header('UniFi Certificate Manager')
     print()
 
-    # Domain
-    config['domain'] = ui.prompt('Domain name')
+    # Try to auto-detect domain from existing certificate
+    detected_domain = detect_domain_from_cert()
+    if detected_domain:
+        ui.info(f'Detected existing certificate for: {detected_domain}')
+
+    # Domain (with auto-detected default if available)
+    config['domain'] = ui.prompt('Domain name', default=detected_domain)
     if not config['domain']:
         ui.error('Domain is required')
         sys.exit(1)
@@ -1161,9 +1193,25 @@ def main() -> int:
         args.key = config.get('key')
         args.host = config.get('host')
 
-    # Validate required args
+    # Auto-detect domain from existing certificate if not specified
+    if not args.domain and not args.setup_hook:
+        # For --install with a cert file, try to detect from that cert
+        if args.install and args.cert and os.path.exists(args.cert):
+            detected = detect_domain_from_cert(args.cert)
+            if detected:
+                ui.info(f'Auto-detected domain from certificate: {detected}')
+                args.domain = detected
+        # For local installations, try the EUS cert
+        elif not args.host:
+            detected = detect_domain_from_cert()
+            if detected:
+                ui.info(f'Auto-detected domain from existing certificate: {detected}')
+                args.domain = detected
+
+    # Validate required args (after auto-detection attempt)
     if not args.domain and not args.setup_hook:
         ui.error('Domain is required. Use -d/--domain or run interactively.')
+        ui.info('Tip: If a certificate is already installed, the domain can be auto-detected.')
         return 1
 
     # Setup renewal hook only

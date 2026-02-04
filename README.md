@@ -8,6 +8,7 @@ A clean Python tool for managing Let's Encrypt SSL certificates on UniFi OS devi
 
 - **Fixes DNS credential bug** - Uses correct field names (`dns_digitalocean_token` not `DO_AUTH_TOKEN`)
 - **Syncs WebUI** - Updates PostgreSQL so the UniFi interface shows accurate cert info
+- **Auto-detects domain** - Reads CN from existing certificate, no need to specify `-d` when syncing
 - **No dependencies** - Pure Python stdlib, works anywhere Python 3.8+ runs
 - **Remote installation** - Run from your workstation, install via SSH
 - **Curl-pipe friendly** - Single file, works with `curl | python3 -`
@@ -38,11 +39,11 @@ curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py 
 If you previously used GlennR's script (or have certs in EUS but UI shows wrong info):
 
 ```bash
+# Domain is auto-detected from the certificate - no -d needed!
 curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
   --install \
   --cert /data/eus_certificates/unifi-os.crt \
-  --key /data/eus_certificates/unifi-os.key \
-  -d your-domain.com
+  --key /data/eus_certificates/unifi-os.key
 ```
 
 ### Remote Installation (From Workstation)

@@ -298,6 +298,88 @@ class TestCertMetadata:
 
 
 # =============================================================================
+# DOMAIN AUTO-DETECTION TESTS
+# =============================================================================
+
+class TestDomainAutoDetection:
+    """Tests for detect_domain_from_cert function."""
+
+    def test_detect_domain_from_cert_success(self, temp_dir, sample_cert_content):
+        """Test successful domain detection from certificate."""
+        cert_path = os.path.join(temp_dir, "test.crt")
+        with open(cert_path, 'w') as f:
+            f.write(sample_cert_content)
+
+        mock_meta = MagicMock()
+        mock_meta.cn = "example.com"
+
+        with patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=mock_meta):
+            result = unifi_cert.detect_domain_from_cert(cert_path)
+
+        assert result == "example.com"
+
+    def test_detect_domain_from_cert_file_not_found(self):
+        """Test domain detection when cert file doesn't exist."""
+        result = unifi_cert.detect_domain_from_cert("/nonexistent/path.crt")
+        assert result is None
+
+    def test_detect_domain_from_cert_localhost_ignored(self, temp_dir, sample_cert_content):
+        """Test that localhost CN is ignored for auto-detection."""
+        cert_path = os.path.join(temp_dir, "test.crt")
+        with open(cert_path, 'w') as f:
+            f.write(sample_cert_content)
+
+        mock_meta = MagicMock()
+        mock_meta.cn = "localhost"
+
+        with patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=mock_meta):
+            result = unifi_cert.detect_domain_from_cert(cert_path)
+
+        assert result is None
+
+    def test_detect_domain_from_cert_unifi_ignored(self, temp_dir, sample_cert_content):
+        """Test that UniFi default CNs are ignored for auto-detection."""
+        cert_path = os.path.join(temp_dir, "test.crt")
+        with open(cert_path, 'w') as f:
+            f.write(sample_cert_content)
+
+        mock_meta = MagicMock()
+        mock_meta.cn = "UniFi OS"
+
+        with patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=mock_meta):
+            result = unifi_cert.detect_domain_from_cert(cert_path)
+
+        assert result is None
+
+    def test_detect_domain_from_default_path(self, temp_dir, sample_cert_content):
+        """Test domain detection using default EUS certificate path."""
+        # Patch UNIFI_PATHS to use temp dir
+        test_cert_path = os.path.join(temp_dir, "unifi-os.crt")
+        with open(test_cert_path, 'w') as f:
+            f.write(sample_cert_content)
+
+        mock_meta = MagicMock()
+        mock_meta.cn = "myrouter.example.com"
+
+        with patch.dict(unifi_cert.UNIFI_PATHS, {'eus_cert': test_cert_path}):
+            with patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=mock_meta):
+                result = unifi_cert.detect_domain_from_cert()
+
+        assert result == "myrouter.example.com"
+
+    def test_detect_domain_from_cert_exception_handled(self, temp_dir, sample_cert_content):
+        """Test that exceptions during detection are handled gracefully."""
+        cert_path = os.path.join(temp_dir, "test.crt")
+        with open(cert_path, 'w') as f:
+            f.write(sample_cert_content)
+
+        with patch.object(unifi_cert.CertMetadata, 'from_cert_file', side_effect=Exception("openssl error")):
+            result = unifi_cert.detect_domain_from_cert(cert_path)
+
+        assert result is None
+
+
+# =============================================================================
 # IP LOOKUP TESTS
 # =============================================================================
 
