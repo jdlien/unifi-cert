@@ -1,13 +1,16 @@
 # UniFi Certificate Manager
 
-A clean Python tool for managing Let's Encrypt SSL certificates on UniFi OS devices.
+A Python tool for managing Let's Encrypt SSL certificates on UniFi OS devices.
 
-**Why this exists:** The popular GlennR script has bugs - it uses the wrong DNS credential field name and doesn't update PostgreSQL, so the WebUI shows stale certificate info. This tool fixes both issues.
+Inspired by [GlennR's UniFi Easy Encrypt](https://community.ui.com/questions/UniFi-OS-Server-Installation-Scripts-or-UniFi-Network-Application-Installation-Scripts-or-UniFi-Eas/ccbc7530-dd61-40a7-82ec-22b17f027776) script, this tool improves on it in several key ways:
+
+- **Fixes the WebUI desync** - GlennR's script updates certificate files but not PostgreSQL, so the UniFi interface shows stale cert info. This tool updates both.
+- **Fixes DNS credential fields** - Uses correct certbot field names (e.g., `dns_digitalocean_token` instead of `DO_AUTH_TOKEN`)
+- **Simpler codebase** - ~800 lines of Python vs ~6000 lines of bash, making it easier to maintain and debug
+- **Interactive wizard** - Just run it and answer prompts; no need to remember CLI flags
 
 ## Features
 
-- **Fixes DNS credential bug** - Uses correct field names (`dns_digitalocean_token` not `DO_AUTH_TOKEN`)
-- **Syncs WebUI** - Updates PostgreSQL so the UniFi interface shows accurate cert info
 - **Auto-detects domain** - Reads CN from existing certificate, no need to specify `-d` when syncing
 - **Auto-detects credentials** - Finds `~/.secrets/certbot/{provider}.ini` automatically
 - **Remembers preferences** - Saves email and DNS provider to `~/.secrets/certbot/config.ini`
