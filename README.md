@@ -14,24 +14,44 @@ A clean Python tool for managing Let's Encrypt SSL certificates on UniFi OS devi
 
 ## Quick Start
 
-### Install an Existing Certificate
+### One-Liner (Run on Router)
+
+SSH into your UniFi device and run:
+
+```bash
+# First, create credentials file (one-time setup)
+mkdir -p ~/.secrets/certbot && cat > ~/.secrets/certbot/digitalocean.ini << 'EOF'
+dns_digitalocean_token = YOUR_TOKEN_HERE
+EOF
+chmod 600 ~/.secrets/certbot/digitalocean.ini
+
+# Then obtain and install certificate
+curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
+  -d your-domain.com \
+  -e you@example.com \
+  --dns-provider digitalocean \
+  --dns-credentials ~/.secrets/certbot/digitalocean.ini
+```
+
+### Sync Existing Certificate to WebUI
+
+If you previously used GlennR's script (or have certs in EUS but UI shows wrong info):
+
+```bash
+curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
+  --install \
+  --cert /data/eus_certificates/unifi-os.crt \
+  --key /data/eus_certificates/unifi-os.key \
+  -d your-domain.com
+```
+
+### Remote Installation (From Workstation)
 
 ```bash
 python3 unifi-cert.py --install \
   --cert /path/to/fullchain.pem \
   --key /path/to/privkey.pem \
-  --domain example.com \
-  --host 192.168.1.1
-```
-
-### Obtain & Install a New Certificate
-
-```bash
-python3 unifi-cert.py \
-  --domain example.com \
-  --email you@example.com \
-  --dns-provider digitalocean \
-  --dns-credentials ~/.secrets/certbot/digitalocean.ini \
+  -d example.com \
   --host 192.168.1.1
 ```
 
@@ -39,13 +59,6 @@ python3 unifi-cert.py \
 
 ```bash
 python3 unifi-cert.py
-```
-
-### Curl-Pipe Usage
-
-```bash
-curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | \
-  python3 - --help
 ```
 
 ## DNS Credentials
