@@ -1485,6 +1485,50 @@ class TestCertbot:
 
         assert result is False
 
+    def test_ensure_script_installed_downloads_when_stdin(self, temp_dir):
+        """Test that script downloads from GitHub when running from stdin (curl pipe)."""
+        permanent_path = os.path.join(temp_dir, 'unifi-cert.py')
+
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            if 'curl' in cmd:
+                # Simulate successful download
+                with open(cmd[cmd.index('-o') + 1], 'w') as f:
+                    f.write('#!/usr/bin/env python3\n# Downloaded script')
+                result.returncode = 0
+            else:
+                result.returncode = 1
+            return result
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'PERMANENT_SCRIPT_PATH', permanent_path), \
+             patch('subprocess.run', side_effect=mock_run), \
+             patch('os.path.abspath', return_value=None):  # Simulate no __file__
+
+            # Call the function - it should download when current_path is None
+            result = unifi_cert.ensure_script_installed()
+
+        assert result == permanent_path
+        assert os.path.exists(permanent_path)
+
+    def test_ensure_script_installed_copies_when_file(self, temp_dir):
+        """Test that script copies itself when running from a file."""
+        source_path = os.path.join(temp_dir, 'source.py')
+        permanent_path = os.path.join(temp_dir, 'scripts', 'unifi-cert.py')
+
+        # Create a source file
+        with open(source_path, 'w') as f:
+            f.write('#!/usr/bin/env python3\n# Source script')
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'PERMANENT_SCRIPT_PATH', permanent_path), \
+             patch('os.path.abspath', return_value=source_path):
+
+            result = unifi_cert.ensure_script_installed()
+
+        assert result == permanent_path
+        assert os.path.exists(permanent_path)
+
 
 # =============================================================================
 # REMOTE SSH OPERATIONS TESTS
