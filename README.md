@@ -118,12 +118,29 @@ Modifiers:
 
 ## How It Works
 
-UniFi OS stores certificates in two places:
+UniFi OS stores certificates in two places that must stay synchronized:
 
-1. **Nginx** reads from `/data/eus_certificates/unifi-os.crt|.key`
-2. **WebUI** reads from PostgreSQL `user_certificates` table + UUID-named files
+```
+┌─────────────────────────────┐    ┌─────────────────────────────┐
+│     EUS Certificates        │    │     WebUI/PostgreSQL        │
+│   (what nginx serves)       │    │   (what the UI displays)    │
+├─────────────────────────────┤    ├─────────────────────────────┤
+│ /data/eus_certificates/     │    │ /data/unifi-core/config/    │
+│   unifi-os.crt              │◄──►│   {UUID}.crt                │
+│   unifi-os.key              │    │   {UUID}.key                │
+└─────────────────────────────┘    │ PostgreSQL user_certificates│
+                                   │ settings.yaml activeCertId  │
+                                   └─────────────────────────────┘
+```
 
-This tool updates **both**, ensuring the certificate works AND the WebUI displays correct information.
+**The GlennR script bug:** Only updates the EUS path, leaving the WebUI showing stale certificate information.
+
+**This tool's approach:** Updates **both** paths with the same certificate, keeping them synchronized. Uses PostgreSQL UPSERT to handle edge cases where the UI has deleted a certificate but files remain.
+
+### Important Notes
+
+- **Service Restart:** By default, the tool restarts `unifi-core` after installation. This briefly takes the console offline (~10-30 seconds). Use `--skip-restart` to avoid this, but the WebUI won't reflect changes until the next restart.
+- **UI Removal:** If you remove a certificate via the UniFi UI, it only removes the PostgreSQL entry and UUID files. The EUS certificates (what's actually served) remain untouched. This tool can re-sync them.
 
 ## Supported Devices
 
@@ -170,6 +187,48 @@ See [docs/NVR-SETUP.md](docs/NVR-SETUP.md) for NVR-specific configuration.
 - Python 3.8+
 - SSH access to UniFi device (for remote installation)
 - certbot + DNS plugin (for obtaining new certificates)
+
+## Development
+
+### Setup
+
+```bash
+# Clone the repo
+git clone https://github.com/jdlien/unifi-cert.git
+cd unifi-cert
+
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+
+# Run with coverage
+pytest --cov=. --cov-report=term-missing
+```
+
+### Testing on a Device
+
+```bash
+# Dry run (no changes)
+python3 unifi-cert.py --install \
+  --cert /path/to/cert.pem --key /path/to/key.pem \
+  -d example.com --host 192.168.1.1 --dry-run -v
+
+# Skip service restart during testing
+python3 unifi-cert.py --install \
+  --cert /path/to/cert.pem --key /path/to/key.pem \
+  -d example.com --host 192.168.1.1 --skip-restart -v
+```
+
+### Project Structure
+
+```
+unifi-cert.py          # Single-file tool (no dependencies for runtime)
+pyproject.toml         # Dev dependencies only
+tests/                 # Pytest test suite (93%+ coverage)
+docs/                  # Additional documentation
+```
 
 ## License
 
