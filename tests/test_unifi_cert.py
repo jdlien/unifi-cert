@@ -2481,6 +2481,293 @@ class TestConfigFile:
         assert 'dns_provider = linode' in content
         assert 'custom_field = preserved' in content
 
+    def test_load_config_ioerror(self):
+        """Test load_config handles IOError gracefully."""
+        with patch('os.path.exists', return_value=True), \
+             patch('builtins.open', side_effect=IOError("Permission denied")):
+            config = unifi_cert.load_config()
+        assert config == {}
+
+    def test_save_config_ioerror(self):
+        """Test save_config handles IOError gracefully."""
+        with patch('os.makedirs', side_effect=IOError("Permission denied")):
+            result = unifi_cert.save_config(email='test@example.com')
+        assert result is False
+
+
+# =============================================================================
+# UI SELECT DEFAULT TESTS
+# =============================================================================
+
+class TestUISelectDefault:
+    """Tests for UI select with default values."""
+
+    def test_select_with_default_empty_input(self):
+        """Test select returns default when user presses Enter."""
+        ui = unifi_cert.UI(color=False)
+        with patch.object(ui, '_input', return_value=''):
+            result = ui.select('Choose:', ['a', 'b', 'c'], default=1)
+        assert result == 1
+
+    def test_select_with_default_invalid_then_empty(self):
+        """Test select returns default after invalid input then Enter."""
+        ui = unifi_cert.UI(color=False)
+        with patch.object(ui, '_input', side_effect=['invalid', '']):
+            result = ui.select('Choose:', ['a', 'b', 'c'], default=2)
+        assert result == 2
+
+
+# =============================================================================
+# CREDENTIALS IOERROR TESTS
+# =============================================================================
+
+class TestCredentialsIOError:
+    """Tests for credentials IOError handling."""
+
+    def test_validate_dns_credentials_ioerror(self, temp_dir):
+        """Test validate_dns_credentials handles IOError."""
+        creds_path = os.path.join(temp_dir, 'creds.ini')
+
+        with patch('os.path.exists', return_value=True), \
+             patch('builtins.open', side_effect=IOError("Read error")):
+            valid, msg = unifi_cert.validate_dns_credentials('digitalocean', creds_path)
+
+        assert valid is False
+        assert 'Cannot read' in msg
+
+
+# =============================================================================
+# CERTBOT EDGE CASES
+# =============================================================================
+
+class TestCertbotEdgeCases:
+    """Tests for certbot edge cases."""
+
+    def test_run_certbot_files_not_found(self):
+        """Test certbot success but cert files not found."""
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        with patch('subprocess.run', side_effect=mock_run), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(unifi_cert, 'ui'):
+            success, cert, key = unifi_cert.run_certbot(
+                'example.com', 'admin@example.com', 'digitalocean', '/creds.ini'
+            )
+
+        assert success is False
+        assert cert == ''
+        assert key == ''
+
+
+# =============================================================================
+# SCRIPT INSTALLATION EDGE CASES
+# =============================================================================
+
+class TestScriptInstallationEdgeCases:
+    """Tests for script installation edge cases."""
+
+    def test_ensure_script_already_at_permanent_location(self, temp_dir):
+        """Test when script is already at permanent location."""
+        permanent_path = os.path.join(temp_dir, 'unifi-cert.py')
+        with open(permanent_path, 'w') as f:
+            f.write('# script')
+
+        with patch.object(unifi_cert, 'PERMANENT_SCRIPT_PATH', permanent_path), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('os.path.abspath', return_value=permanent_path):
+            result = unifi_cert.ensure_script_installed()
+
+        assert result == permanent_path
+
+    def test_ensure_script_download_timeout(self, temp_dir):
+        """Test script download timeout handling."""
+        permanent_path = os.path.join(temp_dir, 'scripts', 'unifi-cert.py')
+
+        with patch.object(unifi_cert, 'PERMANENT_SCRIPT_PATH', permanent_path), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('os.path.abspath', return_value=None), \
+             patch('subprocess.run', side_effect=subprocess.TimeoutExpired('curl', 30)):
+            result = unifi_cert.ensure_script_installed()
+
+        assert result == permanent_path
+
+    def test_ensure_script_download_failure(self, temp_dir):
+        """Test script download failure handling."""
+        permanent_path = os.path.join(temp_dir, 'scripts', 'unifi-cert.py')
+
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stderr = b'Connection refused'
+            return result
+
+        with patch.object(unifi_cert, 'PERMANENT_SCRIPT_PATH', permanent_path), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('os.path.abspath', return_value=None), \
+             patch('subprocess.run', side_effect=mock_run):
+            result = unifi_cert.ensure_script_installed()
+
+        assert result == permanent_path
+
+    def test_ensure_script_copy_ioerror(self, temp_dir):
+        """Test script copy IOError handling."""
+        source_path = os.path.join(temp_dir, 'source.py')
+        permanent_path = os.path.join(temp_dir, 'scripts', 'unifi-cert.py')
+
+        with open(source_path, 'w') as f:
+            f.write('# script')
+
+        with patch.object(unifi_cert, 'PERMANENT_SCRIPT_PATH', permanent_path), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('os.path.abspath', return_value=source_path), \
+             patch('shutil.copy2', side_effect=IOError("Permission denied")):
+            result = unifi_cert.ensure_script_installed()
+
+        assert result == permanent_path
+
+
+# =============================================================================
+# REMOTE INSTALLATION FAILURE TESTS
+# =============================================================================
+
+class TestRemoteInstallationFailures:
+    """Tests for remote installation failure cases."""
+
+    def test_install_remote_eus_key_failure(self, temp_dir):
+        """Test remote install fails on EUS key upload."""
+        cert_path = os.path.join(temp_dir, 'cert.pem')
+        key_path = os.path.join(temp_dir, 'key.pem')
+        with open(cert_path, 'w') as f:
+            f.write('CERT CONTENT')
+        with open(key_path, 'w') as f:
+            f.write('KEY CONTENT')
+
+        def mock_scp(local, host, remote):
+            if 'eus' in remote and 'key' in remote:
+                return False
+            return True
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote', return_value=(True, 'uuid-123')), \
+             patch.object(unifi_cert, 'scp_file', side_effect=mock_scp), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file') as mock_meta:
+            mock_meta.return_value = MagicMock(cn='example.com')
+
+            result = unifi_cert.install_certificate_remote(
+                cert_path, key_path, 'example.com', '192.168.1.1'
+            )
+
+        assert result is False
+
+    def test_install_remote_webui_cert_failure(self, temp_dir):
+        """Test remote install fails on WebUI cert upload."""
+        cert_path = os.path.join(temp_dir, 'cert.pem')
+        key_path = os.path.join(temp_dir, 'key.pem')
+        with open(cert_path, 'w') as f:
+            f.write('CERT CONTENT')
+        with open(key_path, 'w') as f:
+            f.write('KEY CONTENT')
+
+        call_count = [0]
+        def mock_scp(local, host, remote):
+            call_count[0] += 1
+            # First two succeed (EUS), third fails (WebUI cert)
+            if call_count[0] == 3:
+                return False
+            return True
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote', return_value=(True, 'uuid-123')), \
+             patch.object(unifi_cert, 'scp_file', side_effect=mock_scp), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file') as mock_meta:
+            mock_meta.return_value = MagicMock(cn='example.com')
+
+            result = unifi_cert.install_certificate_remote(
+                cert_path, key_path, 'example.com', '192.168.1.1'
+            )
+
+        assert result is False
+
+    def test_install_remote_webui_key_failure(self, temp_dir):
+        """Test remote install fails on WebUI key upload."""
+        cert_path = os.path.join(temp_dir, 'cert.pem')
+        key_path = os.path.join(temp_dir, 'key.pem')
+        with open(cert_path, 'w') as f:
+            f.write('CERT CONTENT')
+        with open(key_path, 'w') as f:
+            f.write('KEY CONTENT')
+
+        call_count = [0]
+        def mock_scp(local, host, remote):
+            call_count[0] += 1
+            # First three succeed, fourth fails (WebUI key)
+            if call_count[0] == 4:
+                return False
+            return True
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote', return_value=(True, 'uuid-123')), \
+             patch.object(unifi_cert, 'scp_file', side_effect=mock_scp), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file') as mock_meta:
+            mock_meta.return_value = MagicMock(cn='example.com')
+
+            result = unifi_cert.install_certificate_remote(
+                cert_path, key_path, 'example.com', '192.168.1.1'
+            )
+
+        assert result is False
+
+
+# =============================================================================
+# MAIN FUNCTION EDGE CASES
+# =============================================================================
+
+class TestMainEdgeCases:
+    """Tests for main function edge cases."""
+
+    def test_main_renew_key_not_found(self, temp_dir):
+        """Test --renew when key file is missing."""
+        cert_path = os.path.join(temp_dir, 'fullchain.pem')
+        with open(cert_path, 'w') as f:
+            f.write('cert')
+
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('os.path.exists', side_effect=lambda p: 'fullchain' in p):
+            result = unifi_cert.main()
+
+        assert result == 1
+
+    def test_main_renew_install_failure(self):
+        """Test --renew when installation fails."""
+        mock_platform = MagicMock()
+        mock_platform.active_cert_id = 'uuid-123'
+        mock_platform.has_eus_certs = True
+        mock_platform.has_postgres = True
+
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=mock_platform), \
+             patch.object(unifi_cert, 'install_certificate', return_value=False):
+            result = unifi_cert.main()
+
+        assert result == 1
+
+    def test_main_certbot_missing_credentials_file(self):
+        """Test certbot path when credentials file doesn't exist."""
+        with patch('sys.argv', ['unifi-cert', '-d', 'example.com', '-e', 'test@test.com',
+                               '--dns-provider', 'digitalocean']), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch('os.path.exists', return_value=False):
+            result = unifi_cert.main()
+
+        assert result == 1
+
 
 # =============================================================================
 # CONFIGURATION TESTS
