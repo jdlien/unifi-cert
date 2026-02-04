@@ -10,6 +10,7 @@ A clean Python tool for managing Let's Encrypt SSL certificates on UniFi OS devi
 - **Syncs WebUI** - Updates PostgreSQL so the UniFi interface shows accurate cert info
 - **Auto-detects domain** - Reads CN from existing certificate, no need to specify `-d` when syncing
 - **Auto-detects credentials** - Finds `~/.secrets/certbot/{provider}.ini` automatically
+- **Remembers preferences** - Saves email and DNS provider to `~/.secrets/certbot/config.ini`
 - **No dependencies** - Pure Python stdlib, works anywhere Python 3.8+ runs
 - **Remote installation** - Run from your workstation, install via SSH
 - **Curl-pipe friendly** - Single file, works with `curl | python3 -`
@@ -131,6 +132,7 @@ Modifiers:
   --skip-postgres            Skip database update
   --skip-restart             Skip service restart
   -v, --verbose              Verbose output
+  --no-color                 Disable colored output
 ```
 
 ## How It Works
@@ -164,8 +166,9 @@ UniFi OS stores certificates in two places that must stay synchronized:
 When you obtain a certificate using this tool, it automatically installs a renewal hook at `/etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh`. This ensures that when certbot auto-renews your certificate (typically 30 days before expiry), the new cert is automatically synced to both the EUS paths and PostgreSQL, keeping the WebUI in sync.
 
 The renewal hook:
-- Downloads the latest script from GitHub (self-updating)
-- Saves it to `/data/scripts/unifi-cert.py` (persistent location)
+- Attempts to download the latest script from GitHub (self-updating)
+- Falls back to existing script if download fails (resilient to network issues)
+- Saves to `/data/scripts/unifi-cert.py` (persistent across firmware updates)
 - Syncs the renewed cert to UniFi
 
 Certbot's renewal runs automatically via systemd timer. You can verify the hook:
@@ -263,7 +266,7 @@ python3 unifi-cert.py --install \
 ```
 unifi-cert.py          # Single-file tool (no dependencies for runtime)
 pyproject.toml         # Dev dependencies only
-tests/                 # Pytest test suite (93%+ coverage)
+tests/                 # Pytest test suite (90%+ coverage)
 docs/                  # Additional documentation
 ```
 
