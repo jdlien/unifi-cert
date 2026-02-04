@@ -40,8 +40,7 @@ That's it. The interactive wizard will walk you through everything:
 If you previously used GlennR's script (or have certs in EUS but UI shows wrong info):
 
 ```bash
-curl -sL jdlien.com/unifi-cert | python3 - \
-  --install \
+curl -sL jdlien.com/unifi-cert | python3 - --install \
   --cert /data/eus_certificates/unifi-os.crt \
   --key /data/eus_certificates/unifi-os.key
 ```
@@ -71,7 +70,7 @@ python3 unifi-cert.py --install \
 
 ## DNS Credentials
 
-> **Note:** The interactive wizard can create this file for you. Just run the tool and it will prompt for your API token if the file doesn't exist.
+> The interactive wizard can create this file for you. Just run the tool and it will prompt for your API token if the file doesn't exist.
 
 To set up credentials manually:
 
@@ -97,15 +96,15 @@ chmod 600 ~/.secrets/certbot/*.ini
 <details>
 <summary>Other DNS Providers</summary>
 
-| Provider | Credential Field |
-|----------|------------------|
-| digitalocean | `dns_digitalocean_token` |
-| cloudflare | `dns_cloudflare_api_token` |
-| route53 | Uses AWS credentials |
-| google | Service account JSON |
-| linode | `dns_linode_key` |
-| namecheap | `dns_namecheap_api_key` |
-| ovh | `dns_ovh_application_key` |
+| Provider     | Credential Field           |
+|:-------------|:---------------------------|
+| digitalocean | `dns_digitalocean_token`   |
+| cloudflare   | `dns_cloudflare_api_token` |
+| route53      | Uses AWS credentials       |
+| google       | Service account JSON       |
+| linode       | `dns_linode_key`           |
+| namecheap    | `dns_namecheap_api_key`    |
+| ovh          | `dns_ovh_application_key`  |
 
 </details>
 
