@@ -64,7 +64,9 @@ python3 unifi-cert.py --install \
 
 ## DNS Credentials
 
-Create a credentials file with the **correct** field name:
+> **Note:** The interactive wizard can create this file for you. Just run the tool and it will prompt for your API token if the file doesn't exist.
+
+To set up credentials manually:
 
 ```bash
 mkdir -p ~/.secrets/certbot
