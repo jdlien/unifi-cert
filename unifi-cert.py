@@ -830,10 +830,51 @@ def run_certbot(
         return False, '', ''
 
 
-def setup_renewal_hook(domain: str, script_path: str) -> bool:
+PERMANENT_SCRIPT_PATH = '/data/scripts/unifi-cert.py'
+
+
+def ensure_script_installed() -> str:
+    """
+    Ensure the script is installed at a permanent location.
+    Returns the path to the permanent script location.
+    """
+    script_dir = os.path.dirname(PERMANENT_SCRIPT_PATH)
+
+    # If we're already running from the permanent location, we're good
+    current_path = os.path.abspath(__file__) if '__file__' in dir() else None
+    if current_path and os.path.exists(current_path) and os.path.samefile(current_path, PERMANENT_SCRIPT_PATH):
+        return PERMANENT_SCRIPT_PATH
+
+    # Create directory if needed
+    try:
+        os.makedirs(script_dir, exist_ok=True)
+    except IOError as e:
+        ui.warning(f"Could not create {script_dir}: {e}")
+        return current_path or PERMANENT_SCRIPT_PATH
+
+    # Copy current script to permanent location
+    try:
+        if current_path and os.path.exists(current_path):
+            shutil.copy2(current_path, PERMANENT_SCRIPT_PATH)
+            os.chmod(PERMANENT_SCRIPT_PATH, 0o755)
+            ui.info(f"Installed script to {PERMANENT_SCRIPT_PATH}")
+        else:
+            # Running from stdin (curl pipe) - read ourselves and save
+            # This won't work for stdin, but we'll handle it gracefully
+            ui.warning(f"Script not found at permanent location. Run from a file to install.")
+    except IOError as e:
+        ui.warning(f"Could not install script to {PERMANENT_SCRIPT_PATH}: {e}")
+
+    return PERMANENT_SCRIPT_PATH
+
+
+def setup_renewal_hook(domain: str, script_path: str = None) -> bool:
     """Set up certbot renewal hook."""
     hook_dir = '/etc/letsencrypt/renewal-hooks/post'
     hook_path = os.path.join(hook_dir, 'unifi-cert-hook.sh')
+
+    # Always use the permanent script location for the hook
+    permanent_path = script_path or PERMANENT_SCRIPT_PATH
 
     hook_content = f"""#!/bin/bash
 # UniFi Certificate renewal hook
@@ -841,7 +882,11 @@ def setup_renewal_hook(domain: str, script_path: str) -> bool:
 
 RENEWED_DOMAINS="${{RENEWED_DOMAINS:-{domain}}}"
 
-/usr/bin/python3 {script_path} --renew --domain "$RENEWED_DOMAINS"
+# Re-download latest version to ensure we have updates
+curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py -o {permanent_path}
+chmod +x {permanent_path}
+
+/usr/bin/python3 {permanent_path} --renew --domain "$RENEWED_DOMAINS"
 """
 
     try:
@@ -1276,8 +1321,8 @@ def main() -> int:
 
     # Setup renewal hook only
     if args.setup_hook:
-        script_path = os.path.abspath(__file__)
-        if setup_renewal_hook(args.domain or 'example.com', script_path):
+        ensure_script_installed()
+        if setup_renewal_hook(args.domain or 'example.com'):
             ui.success('Renewal hook configured')
             return 0
         return 1
@@ -1423,9 +1468,9 @@ def main() -> int:
             return 0
 
     if success:
-        # Set up renewal hook to keep UI in sync after future renewals
-        script_path = os.path.abspath(__file__)
-        if setup_renewal_hook(args.domain, script_path):
+        # Install script to permanent location and set up renewal hook
+        ensure_script_installed()
+        if setup_renewal_hook(args.domain):
             ui.info('Renewal hook installed - UI will stay in sync after renewals')
         else:
             ui.warning('Could not set up renewal hook. Run --setup-hook manually.')

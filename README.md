@@ -27,6 +27,7 @@ That's it. The interactive wizard will walk you through everything:
 - Email for Let's Encrypt
 - DNS provider selection
 - API credentials (creates the file for you if needed)
+- **Automatic renewal hook** (keeps WebUI in sync after renewals)
 
 ### Sync Existing Certificate to WebUI
 
@@ -162,10 +163,20 @@ UniFi OS stores certificates in two places that must stay synchronized:
 
 When you obtain a certificate using this tool, it automatically installs a renewal hook at `/etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh`. This ensures that when certbot auto-renews your certificate (typically 30 days before expiry), the new cert is automatically synced to both the EUS paths and PostgreSQL, keeping the WebUI in sync.
 
-Certbot's renewal runs automatically via systemd timer. You can verify the hook is installed:
+The renewal hook:
+- Downloads the latest script from GitHub (self-updating)
+- Saves it to `/data/scripts/unifi-cert.py` (persistent location)
+- Syncs the renewed cert to UniFi
+
+Certbot's renewal runs automatically via systemd timer. You can verify the hook:
 
 ```bash
 cat /etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh
+```
+
+To manually test renewal sync:
+```bash
+/data/scripts/unifi-cert.py --renew -d your-domain.com
 ```
 
 ## Supported Devices
