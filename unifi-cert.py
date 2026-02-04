@@ -623,8 +623,7 @@ def install_certificate(
     if platform.has_postgres and not skip_postgres:
         ui.status("Updating PostgreSQL certificate database...")
         if not dry_run:
-            success = update_postgres(cert_id, cert_name, cert_content, key_content, metadata,
-                                     is_new=not platform.active_cert_id)
+            success = update_postgres(cert_id, cert_name, cert_content, key_content, metadata)
             if success:
                 ui.success("PostgreSQL updated")
             else:
@@ -652,18 +651,22 @@ def update_postgres(
     meta: CertMetadata,
     is_new: bool = False,
 ) -> bool:
-    """Update PostgreSQL user_certificates table."""
-    # Prepare JSON fields
-    subject_json = json.dumps({'CN': meta.cn})
-    issuer_json = json.dumps({'C': meta.issuer_c, 'O': meta.issuer_o, 'CN': meta.issuer_cn})
-    sans_json = json.dumps({'DNS': meta.sans})
+    """Update PostgreSQL user_certificates table using UPSERT."""
+    # Prepare JSON fields - escape single quotes for SQL
+    subject_json = json.dumps({'CN': meta.cn}).replace("'", "''")
+    issuer_json = json.dumps({'C': meta.issuer_c, 'O': meta.issuer_o, 'CN': meta.issuer_cn}).replace("'", "''")
+    sans_json = json.dumps({'DNS': meta.sans}).replace("'", "''")
 
-    if is_new:
-        sql = f"""
+    # Escape name for SQL
+    name_escaped = name.replace("'", "''")
+
+    # Use UPSERT to handle both insert and update cases
+    # This avoids issues where settings.yaml has an ID but PostgreSQL row was deleted
+    sql = f"""
 INSERT INTO user_certificates (id, name, cert, key, subject, issuer, subject_alt_name, valid_from, valid_to, serial_number, fingerprint, version, created_at, updated_at)
 VALUES (
     '{cert_id}',
-    '{name}',
+    '{name_escaped}',
     $cert${cert}$cert$,
     $key${key}$key$,
     '{subject_json}',
@@ -676,24 +679,19 @@ VALUES (
     3,
     NOW(),
     NOW()
-);
-"""
-    else:
-        sql = f"""
-UPDATE user_certificates
-SET
-    name = '{name}',
-    cert = $cert${cert}$cert$,
-    key = $key${key}$key$,
-    subject = '{subject_json}',
-    issuer = '{issuer_json}',
-    subject_alt_name = '{sans_json}',
-    valid_from = '{meta.valid_from}',
-    valid_to = '{meta.valid_to}',
-    serial_number = '{meta.serial}',
-    fingerprint = '{meta.fingerprint}',
-    updated_at = NOW()
-WHERE id = '{cert_id}';
+)
+ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name,
+    cert = EXCLUDED.cert,
+    key = EXCLUDED.key,
+    subject = EXCLUDED.subject,
+    issuer = EXCLUDED.issuer,
+    subject_alt_name = EXCLUDED.subject_alt_name,
+    valid_from = EXCLUDED.valid_from,
+    valid_to = EXCLUDED.valid_to,
+    serial_number = EXCLUDED.serial_number,
+    fingerprint = EXCLUDED.fingerprint,
+    updated_at = NOW();
 """
 
     try:
