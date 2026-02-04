@@ -132,7 +132,7 @@ class UI:
             # stdin is a pipe, read from /dev/tty directly
             if self._tty is None:
                 try:
-                    self._tty = open('/dev/tty', 'r')
+                    self._tty = open('/dev/tty', 'r', encoding='utf-8')
                 except OSError:
                     # No TTY available (e.g., in tests or non-interactive environment)
                     raise EOFError("No TTY available for input")
@@ -407,7 +407,7 @@ def load_config() -> dict:
     config = {}
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
@@ -433,7 +433,7 @@ def save_config(email: str = None, dns_provider: str = None) -> bool:
         config_dir = os.path.dirname(CONFIG_FILE)
         os.makedirs(config_dir, mode=0o700, exist_ok=True)
 
-        with open(CONFIG_FILE, 'w') as f:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             f.write("# UniFi Certificate Manager config\n")
             for key, value in config.items():
                 f.write(f"{key} = {value}\n")
@@ -459,7 +459,7 @@ def validate_dns_credentials(provider: str, creds_file: str) -> tuple[bool, str]
     expected_field = config['field']
 
     try:
-        with open(creds_file, 'r') as f:
+        with open(creds_file, 'r', encoding='utf-8') as f:
             content = f.read()
 
         # Check for the correct field name
@@ -499,7 +499,7 @@ def create_credentials_file(provider: str, token: str, output_path: str) -> bool
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         # Write file with secure permissions
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(content)
         os.chmod(output_path, 0o600)
 
@@ -553,7 +553,7 @@ class UnifiPlatform:
         settings_path = UNIFI_PATHS['settings_yaml']
         if os.path.exists(settings_path):
             try:
-                with open(settings_path, 'r') as f:
+                with open(settings_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         if line.strip().startswith('activeCertId:'):
                             active_cert_id = line.split(':', 1)[1].strip()
@@ -619,9 +619,9 @@ def install_certificate(
 
     # Read certificate and key content
     try:
-        with open(cert_path, 'r') as f:
+        with open(cert_path, 'r', encoding='utf-8') as f:
             cert_content = f.read()
-        with open(key_path, 'r') as f:
+        with open(key_path, 'r', encoding='utf-8') as f:
             key_content = f.read()
     except IOError as e:
         ui.error(f"Cannot read certificate files: {e}")
@@ -706,7 +706,7 @@ def install_certificate(
         settings_path = UNIFI_PATHS['settings_yaml']
         if not dry_run and os.path.exists(settings_path):
             try:
-                with open(settings_path, 'r') as f:
+                with open(settings_path, 'r', encoding='utf-8') as f:
                     content = f.read()
 
                 if 'activeCertId:' in content:
@@ -715,7 +715,7 @@ def install_certificate(
                 else:
                     content += f'\nactiveCertId: {cert_id}\n'
 
-                with open(settings_path, 'w') as f:
+                with open(settings_path, 'w', encoding='utf-8') as f:
                     f.write(content)
                 ui.success("Updated settings.yaml")
             except IOError as e:
@@ -974,7 +974,7 @@ fi
 
     try:
         os.makedirs(hook_dir, exist_ok=True)
-        with open(hook_path, 'w') as f:
+        with open(hook_path, 'w', encoding='utf-8') as f:
             f.write(hook_content)
         os.chmod(hook_path, 0o755)
         ui.success(f"Created renewal hook: {hook_path}")
@@ -1065,9 +1065,9 @@ def install_certificate_remote(
         return True
 
     # Read local certificate content
-    with open(cert_path, 'r') as f:
+    with open(cert_path, 'r', encoding='utf-8') as f:
         cert_content = f.read()
-    with open(key_path, 'r') as f:
+    with open(key_path, 'r', encoding='utf-8') as f:
         key_content = f.read()
 
     # Extract metadata
