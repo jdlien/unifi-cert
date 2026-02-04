@@ -23,8 +23,10 @@ Inspired by [GlennR's UniFi Easy Encrypt](https://community.ui.com/questions/Uni
 SSH into your UniFi device and run:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 -
+curl -sL jdlien.com/unifi-cert | python3 -
 ```
+
+> This redirects to the [GitHub raw URL](https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py) - use that directly if you prefer.
 
 That's it. The interactive wizard will walk you through everything:
 - Domain name (auto-detected if you have an existing cert)
@@ -38,7 +40,7 @@ That's it. The interactive wizard will walk you through everything:
 If you previously used GlennR's script (or have certs in EUS but UI shows wrong info):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
+curl -sL jdlien.com/unifi-cert | python3 - \
   --install \
   --cert /data/eus_certificates/unifi-os.crt \
   --key /data/eus_certificates/unifi-os.key
@@ -49,7 +51,7 @@ curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py 
 For automation, pass all options on the command line:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
+curl -sL jdlien.com/unifi-cert | python3 - \
   -d your-domain.com \
   -e you@example.com \
   --dns-provider digitalocean
