@@ -1215,9 +1215,10 @@ def main() -> int:
     ui.header('UniFi Certificate Manager')
 
     # Determine if we should run interactive mode
-    # Run interactive if: TTY, not --install, not --setup-hook, and missing required args for certbot
+    # Run interactive if: TTY available (check stdout since stdin may be pipe from curl),
+    # not --install, not --setup-hook, and missing required args for certbot
     needs_interactive = (
-        sys.stdin.isatty() and
+        sys.stdout.isatty() and
         not args.install and
         not args.setup_hook and
         (not args.domain or not args.email or not args.dns_provider)
