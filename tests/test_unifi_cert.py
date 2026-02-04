@@ -154,42 +154,48 @@ class TestUI:
     def test_ui_prompt(self):
         """Test user prompt."""
         ui = unifi_cert.UI(color=False)
-        with patch('builtins.input', return_value='user_input'):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value='user_input'):
             result = ui.prompt("Enter value")
             assert result == "user_input"
 
     def test_ui_prompt_default(self):
         """Test user prompt with default value."""
         ui = unifi_cert.UI(color=False)
-        with patch('builtins.input', return_value=''):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value=''):
             result = ui.prompt("Enter value", default="default_value")
             assert result == "default_value"
 
     def test_ui_confirm_yes(self):
         """Test confirmation prompt with yes."""
         ui = unifi_cert.UI(color=False)
-        with patch('builtins.input', return_value='y'):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value='y'):
             result = ui.confirm("Confirm?")
             assert result is True
 
     def test_ui_confirm_no(self):
         """Test confirmation prompt with no."""
         ui = unifi_cert.UI(color=False)
-        with patch('builtins.input', return_value='n'):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value='n'):
             result = ui.confirm("Confirm?")
             assert result is False
 
     def test_ui_confirm_default_yes(self):
         """Test confirmation prompt with default yes."""
         ui = unifi_cert.UI(color=False)
-        with patch('builtins.input', return_value=''):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value=''):
             result = ui.confirm("Confirm?", default=True)
             assert result is True
 
     def test_ui_confirm_default_no(self):
         """Test confirmation prompt with default no."""
         ui = unifi_cert.UI(color=False)
-        with patch('builtins.input', return_value=''):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value=''):
             result = ui.confirm("Confirm?", default=False)
             assert result is False
 
@@ -197,7 +203,8 @@ class TestUI:
         """Test selection prompt."""
         ui = unifi_cert.UI(color=False)
         options = ["Option A", "Option B", "Option C"]
-        with patch('builtins.input', return_value='2'):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value='2'):
             result = ui.select("Choose:", options)
             assert result == 1  # 0-indexed
 
@@ -205,7 +212,8 @@ class TestUI:
         """Test selection prompt with invalid input then valid."""
         ui = unifi_cert.UI(color=False)
         options = ["Option A", "Option B"]
-        with patch('builtins.input', side_effect=['invalid', '5', '1']):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', side_effect=['invalid', '5', '1']):
             result = ui.select("Choose:", options)
             assert result == 0
 

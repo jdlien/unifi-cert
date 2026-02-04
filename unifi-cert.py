@@ -128,7 +128,11 @@ class UI:
         else:
             # stdin is a pipe, read from /dev/tty directly
             if self._tty is None:
-                self._tty = open('/dev/tty', 'r')
+                try:
+                    self._tty = open('/dev/tty', 'r')
+                except OSError:
+                    # No TTY available (e.g., in tests or non-interactive environment)
+                    raise EOFError("No TTY available for input")
             return self._tty.readline().strip()
 
     def _c(self, code: str, text: str) -> str:
