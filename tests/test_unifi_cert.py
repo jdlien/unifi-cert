@@ -217,6 +217,41 @@ class TestUI:
             result = ui.select("Choose:", options)
             assert result == 0
 
+    def test_ui_input_tty_fallback(self):
+        """Test _input falls back to /dev/tty when stdin is a pipe."""
+        ui = unifi_cert.UI(color=False)
+        mock_tty = MagicMock()
+        mock_tty.readline.return_value = 'tty_input\n'
+
+        with patch('sys.stdin.isatty', return_value=False), \
+             patch('builtins.open', return_value=mock_tty):
+            result = ui._input("Prompt: ")
+            assert result == 'tty_input'
+
+    def test_ui_input_no_tty_raises_eof(self):
+        """Test _input raises EOFError when no TTY available."""
+        ui = unifi_cert.UI(color=False)
+
+        with patch('sys.stdin.isatty', return_value=False), \
+             patch('builtins.open', side_effect=OSError("No TTY")):
+            with pytest.raises(EOFError):
+                ui._input("Prompt: ")
+
+    def test_ui_input_reuses_tty(self):
+        """Test _input reuses opened TTY handle."""
+        ui = unifi_cert.UI(color=False)
+        mock_tty = MagicMock()
+        mock_tty.readline.side_effect = ['first\n', 'second\n']
+
+        with patch('sys.stdin.isatty', return_value=False), \
+             patch('builtins.open', return_value=mock_tty) as mock_open:
+            result1 = ui._input("Prompt1: ")
+            result2 = ui._input("Prompt2: ")
+            assert result1 == 'first'
+            assert result2 == 'second'
+            # open should only be called once
+            assert mock_open.call_count == 1
+
 
 # =============================================================================
 # CERTIFICATE METADATA TESTS
@@ -287,6 +322,55 @@ class TestCertMetadata:
 
         assert "2024-01-01" in meta.valid_from
         assert "2024-12-31" in meta.valid_to
+
+    def test_cert_metadata_date_conversion_no_timezone(self, temp_dir, sample_cert_content):
+        """Test date format conversion without timezone suffix."""
+        cert_path = os.path.join(temp_dir, "test.crt")
+        with open(cert_path, 'w') as f:
+            f.write(sample_cert_content)
+
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stderr = ""
+            if '-startdate' in cmd:
+                # Date without proper timezone - triggers fallback parsing
+                result.stdout = 'notBefore=Jan  1 00:00:00 2024'
+            elif '-enddate' in cmd:
+                result.stdout = 'notAfter=Dec 31 23:59:59 2024'
+            else:
+                result.stdout = ""
+            return result
+
+        with patch('subprocess.run', side_effect=mock_run):
+            meta = unifi_cert.CertMetadata.from_cert_file(cert_path)
+
+        assert "2024-01-01" in meta.valid_from
+        assert "2024-12-31" in meta.valid_to
+
+    def test_cert_metadata_date_conversion_unparseable(self, temp_dir, sample_cert_content):
+        """Test date format that can't be parsed returns original string."""
+        cert_path = os.path.join(temp_dir, "test.crt")
+        with open(cert_path, 'w') as f:
+            f.write(sample_cert_content)
+
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stderr = ""
+            if '-startdate' in cmd:
+                result.stdout = 'notBefore=INVALID_DATE_FORMAT'
+            elif '-enddate' in cmd:
+                result.stdout = 'notAfter=ALSO_INVALID'
+            else:
+                result.stdout = ""
+            return result
+
+        with patch('subprocess.run', side_effect=mock_run):
+            meta = unifi_cert.CertMetadata.from_cert_file(cert_path)
+
+        assert meta.valid_from == "INVALID_DATE_FORMAT"
+        assert meta.valid_to == "ALSO_INVALID"
 
     def test_cert_metadata_openssl_failure(self, temp_dir, sample_cert_content):
         """Test handling of openssl command failure."""
@@ -740,6 +824,71 @@ class TestUnifiPlatform:
 
         assert platform is not None
         assert platform.active_cert_id is None
+
+    def test_detect_nvr_device(self):
+        """Test detection of NVR device via Alpine chip identifier."""
+        def mock_exists(path):
+            if path == '/data/unifi-core':
+                return True
+            if path == '/sys/firmware/devicetree/base/model':
+                return True
+            return False
+
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        def mock_open_file(path, *args, **kwargs):
+            if 'model' in str(path):
+                m = MagicMock()
+                m.__enter__ = MagicMock(return_value=m)
+                m.__exit__ = MagicMock(return_value=False)
+                m.read.return_value = b'Annapurna Labs Alpine V2 UBNT\x00'
+                return m
+            raise FileNotFoundError
+
+        with patch('os.path.exists', side_effect=mock_exists), \
+             patch('subprocess.run', side_effect=mock_run), \
+             patch('shutil.which', return_value=None), \
+             patch('builtins.open', side_effect=mock_open_file):
+
+            platform = unifi_cert.UnifiPlatform.detect()
+
+        assert platform is not None
+        assert platform.device_type == 'NVR'
+
+    def test_detect_io_error_reading_model(self):
+        """Test detection handles IOError when reading model file."""
+        def mock_exists(path):
+            if path == '/data/unifi-core':
+                return True
+            if path == '/sys/firmware/devicetree/base/model':
+                return True
+            return False
+
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        def mock_open_file(path, *args, **kwargs):
+            if 'model' in str(path):
+                raise IOError("Cannot read model")
+            raise FileNotFoundError
+
+        with patch('os.path.exists', side_effect=mock_exists), \
+             patch('subprocess.run', side_effect=mock_run), \
+             patch('shutil.which', return_value=None), \
+             patch('builtins.open', side_effect=mock_open_file):
+
+            platform = unifi_cert.UnifiPlatform.detect()
+
+        assert platform is not None
+        # IOError when reading model file leaves device_type as Unknown
+        assert platform.device_type == 'Unknown'
 
 
 # =============================================================================
@@ -1986,6 +2135,55 @@ class TestMain:
             result = unifi_cert.main()
         assert result == 1
 
+    def test_main_auto_detect_credentials(self, temp_dir, sample_cert_content, sample_key_content):
+        """Test main auto-detects credentials from default location."""
+        # Create credentials in default location
+        creds_dir = os.path.join(temp_dir, '.secrets', 'certbot')
+        os.makedirs(creds_dir)
+        creds_path = os.path.join(creds_dir, 'digitalocean.ini')
+        with open(creds_path, 'w') as f:
+            f.write("dns_digitalocean_token = test_token\n")
+        os.chmod(creds_path, 0o600)
+
+        with patch('sys.argv', ['unifi-cert', '-d', 'example.com', '-e', 'admin@example.com', '--dns-provider', 'digitalocean']), \
+             patch('sys.stdin.isatty', return_value=False), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch('os.path.expanduser', return_value=creds_path), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(unifi_cert, 'validate_dns_credentials', return_value=(True, '')), \
+             patch.object(unifi_cert, 'run_certbot', return_value=(True, '/path/cert.pem', '/path/key.pem')), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=None):
+            result = unifi_cert.main()
+        # Succeeds - cert obtained, just warns that it wasn't installed
+        assert result == 0
+
+    def test_main_install_auto_detect_domain(self, temp_dir, sample_cert_content, sample_key_content):
+        """Test main --install auto-detects domain from certificate."""
+        cert_path = os.path.join(temp_dir, "cert.crt")
+        key_path = os.path.join(temp_dir, "cert.key")
+        with open(cert_path, 'w') as f:
+            f.write(sample_cert_content)
+        with open(key_path, 'w') as f:
+            f.write(sample_key_content)
+
+        mock_platform = unifi_cert.UnifiPlatform(
+            device_type='UDM',
+            core_version='4.0.6',
+            has_eus_certs=True,
+            has_postgres=True,
+            active_cert_id='uuid',
+        )
+
+        with patch('sys.argv', ['unifi-cert', '--install', '--cert', cert_path, '--key', key_path]), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value='auto.example.com'), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=mock_platform), \
+             patch.object(unifi_cert, 'install_certificate', return_value=True):
+            result = unifi_cert.main()
+        assert result == 0
+
 
 class TestInteractiveMode:
     """Tests for interactive mode."""
@@ -2028,6 +2226,69 @@ class TestInteractiveMode:
                 unifi_cert.interactive_mode()
 
             assert exc_info.value.code == 1
+
+    def test_interactive_mode_existing_cert_sync(self):
+        """Test interactive mode with existing cert - sync to WebUI option."""
+        with patch.object(unifi_cert, 'ui') as mock_ui, \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value='detected.example.com'), \
+             patch('os.path.exists', return_value=True):
+            mock_ui.select.return_value = 0  # Sync option
+
+            config = unifi_cert.interactive_mode()
+
+        assert config['domain'] == 'detected.example.com'
+        assert config['install'] is True
+        assert config['cert'] == unifi_cert.UNIFI_PATHS['eus_cert']
+        assert config['key'] == unifi_cert.UNIFI_PATHS['eus_key']
+
+    def test_interactive_mode_existing_cert_renew(self):
+        """Test interactive mode with existing cert - renew option."""
+        with patch.object(unifi_cert, 'ui') as mock_ui, \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value='detected.example.com'), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=None):
+            mock_ui.select.return_value = 1  # Renew option
+            mock_ui.prompt.side_effect = ['admin@example.com', '~/.secrets/creds.ini']
+            mock_ui.confirm.return_value = False  # No remote
+
+            config = unifi_cert.interactive_mode()
+
+        assert config['domain'] == 'detected.example.com'
+        assert config['install'] is False
+        assert config['email'] == 'admin@example.com'
+
+    def test_interactive_mode_existing_cert_install_different(self):
+        """Test interactive mode with existing cert - install different cert option."""
+        with patch.object(unifi_cert, 'ui') as mock_ui, \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value='detected.example.com'), \
+             patch('os.path.exists', return_value=True):
+            mock_ui.select.return_value = 2  # Install different cert
+            mock_ui.prompt.side_effect = ['new.example.com', '/new/cert.pem', '/new/key.pem']
+
+            config = unifi_cert.interactive_mode()
+
+        assert config['domain'] == 'new.example.com'
+        assert config['install'] is True
+        assert config['cert'] == '/new/cert.pem'
+        assert config['key'] == '/new/key.pem'
+
+    def test_interactive_mode_creates_credentials(self, temp_dir):
+        """Test interactive mode creates credentials file if missing."""
+        creds_path = os.path.join(temp_dir, 'digitalocean.ini')
+
+        with patch.object(unifi_cert, 'ui') as mock_ui, \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=None), \
+             patch.object(unifi_cert, 'create_credentials_file') as mock_create:
+            mock_ui.prompt.side_effect = ['example.com', 'admin@example.com', creds_path, 'my_api_token']
+            mock_ui.confirm.side_effect = [False, True, False]  # No existing cert, create creds, no remote
+            mock_ui.select.return_value = 0  # digitalocean
+
+            # First call to exists for EUS paths, then for creds file
+            with patch('os.path.exists', side_effect=[False, False, False]):
+                config = unifi_cert.interactive_mode()
+
+            mock_create.assert_called_once()
 
 
 # =============================================================================
