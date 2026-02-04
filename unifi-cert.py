@@ -553,15 +553,20 @@ def install_certificate(
             # Create directory if needed
             os.makedirs(os.path.dirname(eus_cert), exist_ok=True)
 
-            # Backup existing
-            backup_file(eus_cert)
-            backup_file(eus_key)
+            # Only copy if source and destination are different files
+            if not os.path.exists(eus_cert) or not os.path.samefile(cert_path, eus_cert):
+                backup_file(eus_cert)
+                shutil.copy2(cert_path, eus_cert)
+                os.chmod(eus_cert, 0o644)
+            else:
+                ui.debug("Source and destination are same file, skipping copy")
 
-            # Copy new certificates
-            shutil.copy2(cert_path, eus_cert)
-            shutil.copy2(key_path, eus_key)
-            os.chmod(eus_cert, 0o644)
-            os.chmod(eus_key, 0o644)
+            if not os.path.exists(eus_key) or not os.path.samefile(key_path, eus_key):
+                backup_file(eus_key)
+                shutil.copy2(key_path, eus_key)
+                os.chmod(eus_key, 0o644)
+            else:
+                ui.debug("Source and destination are same file, skipping copy")
 
         ui.success(f"EUS certificates: {eus_cert}")
 
@@ -576,15 +581,20 @@ def install_certificate(
 
     ui.status(f"Installing to WebUI path ({cert_id[:8]}...)...")
     if not dry_run:
-        # Backup existing
-        backup_file(uuid_cert)
-        backup_file(uuid_key)
+        # Only copy if source and destination are different files
+        if not os.path.exists(uuid_cert) or not os.path.samefile(cert_path, uuid_cert):
+            backup_file(uuid_cert)
+            shutil.copy2(cert_path, uuid_cert)
+            os.chmod(uuid_cert, 0o644)
+        else:
+            ui.debug("Source and destination are same file, skipping copy")
 
-        # Copy new certificates
-        shutil.copy2(cert_path, uuid_cert)
-        shutil.copy2(key_path, uuid_key)
-        os.chmod(uuid_cert, 0o644)
-        os.chmod(uuid_key, 0o644)
+        if not os.path.exists(uuid_key) or not os.path.samefile(key_path, uuid_key):
+            backup_file(uuid_key)
+            shutil.copy2(key_path, uuid_key)
+            os.chmod(uuid_key, 0o644)
+        else:
+            ui.debug("Source and destination are same file, skipping copy")
 
     ui.success(f"WebUI certificates: {uuid_cert}")
 
