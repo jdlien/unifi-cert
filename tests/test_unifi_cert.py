@@ -826,7 +826,7 @@ class TestUnifiPlatform:
         assert platform.active_cert_id is None
 
     def test_detect_nvr_device(self):
-        """Test detection of NVR device via Alpine chip identifier."""
+        """Test detection of NVR device via UNVR in model string."""
         def mock_exists(path):
             if path == '/data/unifi-core':
                 return True
@@ -845,7 +845,7 @@ class TestUnifiPlatform:
                 m = MagicMock()
                 m.__enter__ = MagicMock(return_value=m)
                 m.__exit__ = MagicMock(return_value=False)
-                m.read.return_value = b'Annapurna Labs Alpine V2 UBNT\x00'
+                m.read.return_value = b'UNVR\x00'
                 return m
             raise FileNotFoundError
 
@@ -858,6 +858,44 @@ class TestUnifiPlatform:
 
         assert platform is not None
         assert platform.device_type == 'NVR'
+
+    def test_detect_udm_fallback_via_version_file(self):
+        """Test UDM detection fallback when model doesn't match but version file exists."""
+        def mock_exists(path):
+            if path == '/data/unifi-core':
+                return True
+            if path == '/sys/firmware/devicetree/base/model':
+                return True
+            if path == '/usr/lib/version':
+                return True  # Version file exists - triggers UDM fallback
+            return False
+
+        def mock_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        def mock_open_file(path, *args, **kwargs):
+            if 'model' in str(path):
+                m = MagicMock()
+                m.__enter__ = MagicMock(return_value=m)
+                m.__exit__ = MagicMock(return_value=False)
+                # Model string without "Dream Machine" or "UDM" - Alpine chip only
+                m.read.return_value = b'Annapurna Labs Alpine V2 UBNT\x00'
+                return m
+            raise FileNotFoundError
+
+        with patch('os.path.exists', side_effect=mock_exists), \
+             patch('subprocess.run', side_effect=mock_run), \
+             patch('shutil.which', return_value=None), \
+             patch('builtins.open', side_effect=mock_open_file):
+
+            platform = unifi_cert.UnifiPlatform.detect()
+
+        # Falls back to UDM when /usr/lib/version exists
+        assert platform is not None
+        assert platform.device_type == 'UDM'
 
     def test_detect_io_error_reading_model(self):
         """Test detection handles IOError when reading model file."""

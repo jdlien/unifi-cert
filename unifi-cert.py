@@ -513,16 +513,18 @@ class UnifiPlatform:
             try:
                 with open(model_path, 'rb') as f:
                     model = f.read().decode('utf-8', errors='ignore').strip('\x00')
-                    if 'Dream Machine' in model:
+                    if 'Dream Machine' in model or 'UDM' in model.upper():
                         device_type = 'UDM'
                     elif 'Cloud Key' in model:
                         device_type = 'CloudKey'
-                    elif 'NVR' in model or 'UNVR' in model or 'Alpine' in model:
+                    elif 'NVR' in model or 'UNVR' in model:
                         device_type = 'NVR'
             except IOError:
                 pass
-        elif os.path.exists('/usr/lib/version'):
-            device_type = 'UDM'  # Likely UDM if version file exists
+
+        # Fallback: if still unknown but has unifi-core version file, likely a UDM
+        if device_type == 'Unknown' and os.path.exists('/usr/lib/version'):
+            device_type = 'UDM'
 
         return cls(
             device_type=device_type,
