@@ -84,6 +84,9 @@ UNIFI_PATHS = {
     'eus_dir': '/data/eus_certificates',
 }
 
+# Config file for persisting user preferences
+CONFIG_FILE = os.path.expanduser('~/.secrets/certbot/config.ini')
+
 # IP lookup providers (fallback chain)
 IP_PROVIDERS = [
     ('https://ipwho.is/', lambda d: d.get('ip')),
@@ -226,18 +229,25 @@ class UI:
             return default
         return response in ('y', 'yes')
 
-    def select(self, text: str, options: list[str]) -> int:
-        """Prompt user to select from options."""
+    def select(self, text: str, options: list[str], default: int = None) -> int:
+        """Prompt user to select from options. Default is 0-indexed."""
         print(self._c(self.YELLOW, '? ') + text)
         for i, opt in enumerate(options, 1):
-            print(f'  {self._c(self.CYAN, str(i))}. {opt}')
+            marker = ' (default)' if default is not None and i - 1 == default else ''
+            print(f'  {self._c(self.CYAN, str(i))}. {opt}{marker}')
+
+        prompt_suffix = f' [{default + 1}]' if default is not None else ''
         while True:
             try:
-                choice = int(self._input(self._c(self.YELLOW, '  Enter choice: ')))
+                raw = self._input(self._c(self.YELLOW, f'  Enter choice{prompt_suffix}: '))
+                if not raw and default is not None:
+                    return default
+                choice = int(raw)
                 if 1 <= choice <= len(options):
                     return choice - 1
             except ValueError:
-                pass
+                if not raw and default is not None:
+                    return default
             print(self._c(self.RED, '  Invalid choice, try again'))
 
 
@@ -386,6 +396,51 @@ def get_public_ip(timeout: float = 2.0) -> Optional[str]:
         except (urllib.error.URLError, json.JSONDecodeError, KeyError, TimeoutError):
             continue
     return None
+
+
+# =============================================================================
+# CONFIG FILE - Persists user preferences
+# =============================================================================
+
+def load_config() -> dict:
+    """Load saved configuration from config file."""
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        config[key.strip()] = value.strip()
+        except IOError:
+            pass
+    return config
+
+
+def save_config(email: str = None, dns_provider: str = None) -> bool:
+    """Save configuration to config file."""
+    # Load existing config to preserve other values
+    config = load_config()
+
+    if email:
+        config['email'] = email
+    if dns_provider:
+        config['dns_provider'] = dns_provider
+
+    try:
+        # Ensure directory exists with secure permissions
+        config_dir = os.path.dirname(CONFIG_FILE)
+        os.makedirs(config_dir, mode=0o700, exist_ok=True)
+
+        with open(CONFIG_FILE, 'w') as f:
+            f.write("# UniFi Certificate Manager config\n")
+            for key, value in config.items():
+                f.write(f"{key} = {value}\n")
+        os.chmod(CONFIG_FILE, 0o600)
+        return True
+    except IOError:
+        return False
 
 
 # =============================================================================
@@ -1208,6 +1263,9 @@ def interactive_mode() -> dict:
     """Gather configuration interactively."""
     config = {}
 
+    # Load saved preferences
+    saved_config = load_config()
+
     ui.header('UniFi Certificate Manager')
     print()
 
@@ -1264,12 +1322,18 @@ def interactive_mode() -> dict:
             config['install'] = False
 
     # Getting new cert via certbot - need email and DNS provider
-    config['email'] = ui.prompt('Email for Let\'s Encrypt')
+    saved_email = saved_config.get('email')
+    config['email'] = ui.prompt('Email for Let\'s Encrypt', default=saved_email)
 
     # DNS provider selection
     providers = list(DNS_PROVIDERS.keys())
-    idx = ui.select('Select DNS provider:', providers)
+    saved_provider = saved_config.get('dns_provider')
+    default_idx = providers.index(saved_provider) if saved_provider in providers else None
+    idx = ui.select('Select DNS provider:', providers, default=default_idx)
     config['dns_provider'] = providers[idx]
+
+    # Save preferences for next time
+    save_config(email=config['email'], dns_provider=config['dns_provider'])
 
     # Credentials
     default_creds = os.path.expanduser(f'~/.secrets/certbot/{config["dns_provider"]}.ini')

@@ -2399,7 +2399,9 @@ class TestInteractiveMode:
         with patch.object(unifi_cert, 'ui') as mock_ui, \
              patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
              patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=None), \
-             patch.object(unifi_cert, 'create_credentials_file') as mock_create:
+             patch.object(unifi_cert, 'create_credentials_file') as mock_create, \
+             patch.object(unifi_cert, 'load_config', return_value={}), \
+             patch.object(unifi_cert, 'save_config', return_value=True):
             mock_ui.prompt.side_effect = ['example.com', 'admin@example.com', creds_path, 'my_api_token']
             mock_ui.confirm.side_effect = [False, True, False]  # No existing cert, create creds, no remote
             mock_ui.select.return_value = 0  # digitalocean
@@ -2409,6 +2411,75 @@ class TestInteractiveMode:
                 config = unifi_cert.interactive_mode()
 
             mock_create.assert_called_once()
+
+
+# =============================================================================
+# CONFIG FILE TESTS
+# =============================================================================
+
+class TestConfigFile:
+    """Tests for config file persistence."""
+
+    def test_load_config_empty(self):
+        """Test loading config when file doesn't exist."""
+        with patch('os.path.exists', return_value=False):
+            config = unifi_cert.load_config()
+        assert config == {}
+
+    def test_load_config_with_values(self, temp_dir):
+        """Test loading config with saved values."""
+        config_path = os.path.join(temp_dir, 'config.ini')
+        with open(config_path, 'w') as f:
+            f.write("# Comment\n")
+            f.write("email = test@example.com\n")
+            f.write("dns_provider = cloudflare\n")
+
+        with patch.object(unifi_cert, 'CONFIG_FILE', config_path):
+            config = unifi_cert.load_config()
+
+        assert config['email'] == 'test@example.com'
+        assert config['dns_provider'] == 'cloudflare'
+
+    def test_save_config(self, temp_dir):
+        """Test saving config creates file with correct permissions."""
+        config_path = os.path.join(temp_dir, 'secrets', 'config.ini')
+
+        with patch.object(unifi_cert, 'CONFIG_FILE', config_path):
+            result = unifi_cert.save_config(email='user@test.com', dns_provider='digitalocean')
+
+        assert result is True
+        assert os.path.exists(config_path)
+
+        # Check permissions (600)
+        mode = os.stat(config_path).st_mode & 0o777
+        assert mode == 0o600
+
+        # Verify content
+        with open(config_path) as f:
+            content = f.read()
+        assert 'email = user@test.com' in content
+        assert 'dns_provider = digitalocean' in content
+
+    def test_save_config_preserves_existing(self, temp_dir):
+        """Test save_config preserves existing values."""
+        config_path = os.path.join(temp_dir, 'config.ini')
+
+        # Create existing config
+        os.makedirs(temp_dir, exist_ok=True)
+        with open(config_path, 'w') as f:
+            f.write("email = old@example.com\n")
+            f.write("custom_field = preserved\n")
+        os.chmod(config_path, 0o600)
+
+        with patch.object(unifi_cert, 'CONFIG_FILE', config_path):
+            unifi_cert.save_config(dns_provider='linode')
+
+        # Check that both old and new values exist
+        with open(config_path) as f:
+            content = f.read()
+        assert 'email = old@example.com' in content
+        assert 'dns_provider = linode' in content
+        assert 'custom_field = preserved' in content
 
 
 # =============================================================================
