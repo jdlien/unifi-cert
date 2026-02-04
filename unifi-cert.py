@@ -1122,41 +1122,74 @@ def interactive_mode() -> dict:
 
     # Try to auto-detect domain from existing certificate
     detected_domain = detect_domain_from_cert()
-    if detected_domain:
-        ui.info(f'Detected existing certificate for: {detected_domain}')
+    eus_cert = UNIFI_PATHS['eus_cert']
+    eus_key = UNIFI_PATHS['eus_key']
+    has_existing_eus = os.path.exists(eus_cert) and os.path.exists(eus_key)
 
-    # Domain (with auto-detected default if available)
-    config['domain'] = ui.prompt('Domain name', default=detected_domain)
-    if not config['domain']:
-        ui.error('Domain is required')
-        sys.exit(1)
+    # If we have an existing certificate, offer streamlined options
+    if detected_domain and has_existing_eus:
+        ui.success(f'Found existing certificate for: {detected_domain}')
+        print()
+        choice = ui.select('What would you like to do?', [
+            'Sync existing certificate to WebUI (fixes UI showing wrong cert info)',
+            'Renew/obtain new certificate via Let\'s Encrypt',
+            'Install a different certificate file',
+        ])
 
-    # Check if installing existing cert or obtaining new
-    has_cert = ui.confirm('Do you have an existing certificate to install?', default=False)
-
-    if has_cert:
-        config['install'] = True
-        config['cert'] = ui.prompt('Certificate file path')
-        config['key'] = ui.prompt('Private key file path')
+        if choice == 0:
+            # Sync existing cert to WebUI
+            config['domain'] = detected_domain
+            config['install'] = True
+            config['cert'] = eus_cert
+            config['key'] = eus_key
+            return config
+        elif choice == 1:
+            # Renew via certbot - continue with normal flow
+            config['domain'] = detected_domain
+            config['install'] = False
+        else:
+            # Install different cert
+            config['domain'] = ui.prompt('Domain name', default=detected_domain)
+            config['install'] = True
+            config['cert'] = ui.prompt('Certificate file path')
+            config['key'] = ui.prompt('Private key file path')
+            return config
     else:
-        config['install'] = False
-        config['email'] = ui.prompt('Email for Let\'s Encrypt')
+        # No existing cert - ask for domain
+        config['domain'] = ui.prompt('Domain name', default=detected_domain)
+        if not config['domain']:
+            ui.error('Domain is required')
+            sys.exit(1)
 
-        # DNS provider selection
-        providers = list(DNS_PROVIDERS.keys())
-        idx = ui.select('Select DNS provider:', providers)
-        config['dns_provider'] = providers[idx]
+        # Check if installing existing cert or obtaining new
+        has_cert = ui.confirm('Do you have an existing certificate to install?', default=False)
 
-        # Credentials
-        default_creds = os.path.expanduser(f'~/.secrets/certbot/{config["dns_provider"]}.ini')
-        config['dns_credentials'] = ui.prompt('DNS credentials file', default=default_creds)
+        if has_cert:
+            config['install'] = True
+            config['cert'] = ui.prompt('Certificate file path')
+            config['key'] = ui.prompt('Private key file path')
+            return config
+        else:
+            config['install'] = False
 
-        # Check if credentials exist, offer to create
-        if not os.path.exists(config['dns_credentials']):
-            if ui.confirm(f'Credentials file not found. Create it?'):
-                field = DNS_PROVIDERS[config['dns_provider']]['field']
-                token = ui.prompt(f'Enter your {config["dns_provider"]} API token ({field})')
-                create_credentials_file(config['dns_provider'], token, config['dns_credentials'])
+    # Getting new cert via certbot - need email and DNS provider
+    config['email'] = ui.prompt('Email for Let\'s Encrypt')
+
+    # DNS provider selection
+    providers = list(DNS_PROVIDERS.keys())
+    idx = ui.select('Select DNS provider:', providers)
+    config['dns_provider'] = providers[idx]
+
+    # Credentials
+    default_creds = os.path.expanduser(f'~/.secrets/certbot/{config["dns_provider"]}.ini')
+    config['dns_credentials'] = ui.prompt('DNS credentials file', default=default_creds)
+
+    # Check if credentials exist, offer to create
+    if not os.path.exists(config['dns_credentials']):
+        if ui.confirm(f'Credentials file not found. Create it?'):
+            field = DNS_PROVIDERS[config['dns_provider']]['field']
+            token = ui.prompt(f'Enter your {config["dns_provider"]} API token ({field})')
+            create_credentials_file(config['dns_provider'], token, config['dns_credentials'])
 
     # Remote or local installation
     platform = UnifiPlatform.detect()
@@ -1181,8 +1214,16 @@ def main() -> int:
 
     ui.header('UniFi Certificate Manager')
 
-    # Check if running interactively or with args
-    if not args.domain and not args.install and not args.setup_hook and sys.stdin.isatty():
+    # Determine if we should run interactive mode
+    # Run interactive if: TTY, not --install, not --setup-hook, and missing required args for certbot
+    needs_interactive = (
+        sys.stdin.isatty() and
+        not args.install and
+        not args.setup_hook and
+        (not args.domain or not args.email or not args.dns_provider)
+    )
+
+    if needs_interactive:
         config = interactive_mode()
         args.domain = config.get('domain')
         args.email = config.get('email')
