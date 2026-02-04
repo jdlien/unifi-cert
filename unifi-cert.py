@@ -1272,9 +1272,16 @@ def main() -> int:
         ui.error('DNS provider is required. Use --dns-provider.')
         return 1
 
+    # Auto-detect credentials from default location if not specified
     if not args.dns_credentials:
-        ui.error('DNS credentials file is required. Use --dns-credentials.')
-        return 1
+        default_creds = os.path.expanduser(f'~/.secrets/certbot/{args.dns_provider}.ini')
+        if os.path.exists(default_creds):
+            ui.info(f'Using credentials from: {default_creds}')
+            args.dns_credentials = default_creds
+        else:
+            ui.error('DNS credentials file is required. Use --dns-credentials.')
+            ui.info(f'Tip: Create {default_creds} with your API token.')
+            return 1
 
     # Validate credentials
     valid, msg = validate_dns_credentials(args.dns_provider, args.dns_credentials)

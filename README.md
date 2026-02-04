@@ -9,42 +9,48 @@ A clean Python tool for managing Let's Encrypt SSL certificates on UniFi OS devi
 - **Fixes DNS credential bug** - Uses correct field names (`dns_digitalocean_token` not `DO_AUTH_TOKEN`)
 - **Syncs WebUI** - Updates PostgreSQL so the UniFi interface shows accurate cert info
 - **Auto-detects domain** - Reads CN from existing certificate, no need to specify `-d` when syncing
+- **Auto-detects credentials** - Finds `~/.secrets/certbot/{provider}.ini` automatically
 - **No dependencies** - Pure Python stdlib, works anywhere Python 3.8+ runs
 - **Remote installation** - Run from your workstation, install via SSH
 - **Curl-pipe friendly** - Single file, works with `curl | python3 -`
 
 ## Quick Start
 
-### One-Liner (Run on Router)
-
 SSH into your UniFi device and run:
 
 ```bash
-# First, create credentials file (one-time setup)
-mkdir -p ~/.secrets/certbot && cat > ~/.secrets/certbot/digitalocean.ini << 'EOF'
-dns_digitalocean_token = YOUR_TOKEN_HERE
-EOF
-chmod 600 ~/.secrets/certbot/digitalocean.ini
-
-# Then obtain and install certificate
-curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
-  -d your-domain.com \
-  -e you@example.com \
-  --dns-provider digitalocean \
-  --dns-credentials ~/.secrets/certbot/digitalocean.ini
+curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 -
 ```
+
+That's it. The interactive wizard will walk you through everything:
+- Domain name (auto-detected if you have an existing cert)
+- Email for Let's Encrypt
+- DNS provider selection
+- API credentials (creates the file for you if needed)
 
 ### Sync Existing Certificate to WebUI
 
 If you previously used GlennR's script (or have certs in EUS but UI shows wrong info):
 
 ```bash
-# Domain is auto-detected from the certificate - no -d needed!
 curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
   --install \
   --cert /data/eus_certificates/unifi-os.crt \
   --key /data/eus_certificates/unifi-os.key
 ```
+
+### Non-Interactive / Scripted Usage
+
+For automation, pass all options on the command line:
+
+```bash
+curl -sL https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py | python3 - \
+  -d your-domain.com \
+  -e you@example.com \
+  --dns-provider digitalocean
+```
+
+Credentials are auto-detected from `~/.secrets/certbot/{provider}.ini`.
 
 ### Remote Installation (From Workstation)
 
@@ -54,12 +60,6 @@ python3 unifi-cert.py --install \
   --key /path/to/privkey.pem \
   -d example.com \
   --host 192.168.1.1
-```
-
-### Interactive Mode
-
-```bash
-python3 unifi-cert.py
 ```
 
 ## DNS Credentials
