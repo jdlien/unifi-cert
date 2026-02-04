@@ -513,6 +513,8 @@ class UnifiPlatform:
                         device_type = 'UDM'
                     elif 'Cloud Key' in model:
                         device_type = 'CloudKey'
+                    elif 'NVR' in model or 'UNVR' in model:
+                        device_type = 'NVR'
             except IOError:
                 pass
         elif os.path.exists('/usr/lib/version'):
