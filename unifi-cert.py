@@ -10,6 +10,7 @@ License: MIT
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -481,6 +482,47 @@ def save_config(email: str = None, dns_provider: str = None) -> bool:
         return True
     except IOError:
         return False
+
+
+def save_provisioning_config(domain: str, email: str, dns_provider: str,
+                              dns_credentials: str) -> bool:
+    """Persist provisioning fields to PROVISIONING_CONFIG.
+
+    Consumed by cron-fired --renew (no CLI args) so the daily renewal can
+    self-configure. Stores the credentials *path*; secrets stay in the
+    credentials file under CREDENTIALS_DIR (mode 0600).
+    """
+    try:
+        os.makedirs(UNIFI_CERT_ROOT, mode=0o755, exist_ok=True)
+        with open(PROVISIONING_CONFIG, 'w', encoding='utf-8') as fh:
+            fh.write('# UniFi Certificate Manager provisioning config\n')
+            fh.write('# Auto-generated; consumed by --renew when called without flags\n')
+            fh.write(f'domain = {domain}\n')
+            fh.write(f'email = {email}\n')
+            fh.write(f'dns_provider = {dns_provider}\n')
+            fh.write(f'dns_credentials = {dns_credentials}\n')
+        os.chmod(PROVISIONING_CONFIG, 0o600)
+        return True
+    except OSError as e:
+        ui.error(f'Failed to save provisioning config: {e}')
+        return False
+
+
+def load_provisioning_config() -> dict:
+    """Read PROVISIONING_CONFIG (key = value lines). Returns {} if absent."""
+    config = {}
+    if not os.path.exists(PROVISIONING_CONFIG):
+        return config
+    try:
+        with open(PROVISIONING_CONFIG, 'r', encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return config
 
 
 # =============================================================================
@@ -1474,6 +1516,203 @@ def ensure_script_installed() -> str:
         ui.warning(f"Could not install script to {PERMANENT_SCRIPT_PATH}: {e}")
 
     return PERMANENT_SCRIPT_PATH
+
+
+# =============================================================================
+# SCHEDULE & SELF-HEAL - cron, boot script, lock, log rotation, renewal-due
+# =============================================================================
+
+CRON_FILE = '/etc/cron.d/unifi-cert'
+BOOT_SCRIPT_DIR = '/data/on_boot.d'
+BOOT_SCRIPT_PATH = f'{BOOT_SCRIPT_DIR}/15-unifi-cert.sh'
+
+# Daily renewal cron line. Offset 03:17 to avoid the on-the-hour cluster of
+# system cron jobs. Output appended to LOG_FILE so failures surface to --status.
+CRON_LINE = (
+    f'17 3 * * * root /usr/bin/python3 {PERMANENT_SCRIPT_PATH} --renew '
+    f'>> {LOG_FILE} 2>&1\n'
+)
+
+LOG_ROTATE_THRESHOLD = 1 * 1024 * 1024  # 1 MB triggers rotate
+LOG_ROTATE_KEEP = 100 * 1024            # keep last 100 KB
+
+
+def acquire_lock(timeout: float = 0.0):
+    """Acquire an exclusive flock on LOCK_FILE.
+
+    Serializes --renew vs --deploy-hook vs concurrent --self-heal so only
+    one ACME / install pipeline runs at a time. Returns the open file
+    handle on success; raises BlockingIOError when timeout=0 and the lock
+    is held. Pass timeout>0 to wait up to that many seconds.
+    """
+    os.makedirs(UNIFI_CERT_ROOT, mode=0o755, exist_ok=True)
+    fh = open(LOCK_FILE, 'w')
+    try:
+        if timeout <= 0:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.5)
+    except BlockingIOError:
+        fh.close()
+        raise
+    return fh
+
+
+def release_lock(fh) -> None:
+    """Release the flock and close the lock file handle."""
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
+def rotate_log() -> bool:
+    """Truncate LOG_FILE to the last LOG_ROTATE_KEEP bytes when oversized.
+
+    No-op if the log is missing or below LOG_ROTATE_THRESHOLD. Returns
+    True on success or graceful skip, False on filesystem error.
+    """
+    if not os.path.exists(LOG_FILE):
+        return True
+    try:
+        size = os.path.getsize(LOG_FILE)
+    except OSError:
+        return False
+    if size <= LOG_ROTATE_THRESHOLD:
+        return True
+    try:
+        with open(LOG_FILE, 'rb') as fh:
+            fh.seek(-LOG_ROTATE_KEEP, os.SEEK_END)
+            tail = fh.read()
+        # Drop partial first line so rotated log starts at a record boundary.
+        nl = tail.find(b'\n')
+        if 0 <= nl < len(tail) - 1:
+            tail = tail[nl + 1:]
+        with open(LOG_FILE, 'wb') as fh:
+            fh.write(tail)
+    except OSError:
+        return False
+    return True
+
+
+def is_renewal_due(domain: str, days: int = 30) -> bool:
+    """Return True if the cert for `domain` is missing or expires within `days`.
+
+    A missing or unparseable cert returns True so the renewal pipeline
+    runs and recovers rather than silently no-opping.
+    """
+    live_dir = certbot_live_dir(domain)
+    cert_path = os.path.join(live_dir, 'cert.pem')
+    if not os.path.exists(cert_path):
+        cert_path = os.path.join(live_dir, 'fullchain.pem')
+    if not os.path.exists(cert_path):
+        return True
+    try:
+        meta = CertMetadata.from_cert_file(cert_path)
+    except Exception:
+        return True
+    if not meta.valid_to:
+        return True
+    try:
+        expiry = datetime.strptime(meta.valid_to, '%Y-%m-%d %H:%M:%S+00')
+    except ValueError:
+        return True
+    remaining = expiry - datetime.utcnow()
+    return remaining.days < days
+
+
+def install_cron_schedule() -> bool:
+    """Write CRON_FILE with the daily --renew line. Idempotent overwrite."""
+    try:
+        os.makedirs(os.path.dirname(CRON_FILE), exist_ok=True)
+        with open(CRON_FILE, 'w', encoding='utf-8') as fh:
+            fh.write('# UniFi cert auto-renewal\n')
+            fh.write('# Auto-generated by unifi-cert.py self_heal()\n')
+            fh.write(CRON_LINE)
+        os.chmod(CRON_FILE, 0o644)
+        ui.success(f'Installed cron schedule: {CRON_FILE}')
+        return True
+    except OSError as e:
+        ui.error(f'Failed to install cron schedule: {e}')
+        return False
+
+
+def install_boot_script() -> bool:
+    """Best-effort: write BOOT_SCRIPT_PATH to re-assert state on every boot.
+
+    Skipped with a warning when /data/on_boot.d/ is absent (the case on
+    devices without unifi-utilities/on-boot-script — e.g., beehive). The
+    cron at /etc/cron.d/unifi-cert is the primary persistence mechanism;
+    the boot script is layer 3 of defense, not layer 4.
+    """
+    if not os.path.isdir(BOOT_SCRIPT_DIR):
+        ui.warning(
+            f'{BOOT_SCRIPT_DIR} not present; skipping boot script. '
+            'Install unifi-utilities/on-boot-script for firmware-wipe survival.'
+        )
+        return True
+
+    content = (
+        '#!/bin/sh\n'
+        '# UniFi cert boot-time self-heal\n'
+        '# Auto-generated by unifi-cert.py self_heal()\n'
+        f'/usr/bin/python3 {PERMANENT_SCRIPT_PATH} --self-heal '
+        f'>> {LOG_FILE} 2>&1\n'
+    )
+    try:
+        with open(BOOT_SCRIPT_PATH, 'w', encoding='utf-8') as fh:
+            fh.write(content)
+        os.chmod(BOOT_SCRIPT_PATH, 0o755)
+        ui.success(f'Installed boot script: {BOOT_SCRIPT_PATH}')
+        return True
+    except OSError as e:
+        ui.error(f'Failed to install boot script: {e}')
+        return False
+
+
+def self_heal(dns_provider: Optional[str] = None,
+              domain: Optional[str] = None) -> bool:
+    """Idempotent repair: ensure venv + script + cron + hook + boot.
+
+    NEVER runs ACME — safe to call from boot or before every renewal.
+    `dns_provider` and `domain` fall back to load_provisioning_config()
+    when not supplied (the cron-fired case).
+    """
+    if dns_provider is None or domain is None:
+        cfg = load_provisioning_config()
+        dns_provider = dns_provider or cfg.get('dns_provider')
+        domain = domain or cfg.get('domain')
+
+    ok = True
+
+    if dns_provider:
+        ok_b, msg = bootstrap_certbot(dns_provider)
+        if not ok_b:
+            ui.warning(f'self-heal: bootstrap deferred ({msg})')
+            ok = False
+    else:
+        ui.debug('self-heal: no dns_provider known; skipping bootstrap')
+
+    ensure_script_installed()
+    ok = install_cron_schedule() and ok
+    if domain:
+        ok = setup_renewal_hook(domain) and ok
+    install_boot_script()  # never blocks success — best-effort layer
+    return ok
 
 
 def setup_renewal_hook(domain: str, script_path: str = None) -> bool:

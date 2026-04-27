@@ -3390,3 +3390,326 @@ class TestRestartServices:
         services = [call.args[0][2] for call in mock_run.call_args_list
                     if call.args and call.args[0][:2] == ['systemctl', 'restart']]
         assert services == ['nginx', 'unifi-core', 'unifi']
+
+
+class TestLock:
+    """Tests for the fcntl.flock-based --renew / --deploy-hook lock."""
+
+    def test_acquire_and_release(self, tmp_path):
+        """Round-trip: acquire returns a fh; release closes it cleanly."""
+        lock_file = str(tmp_path / 'lock')
+        with patch.object(unifi_cert, 'LOCK_FILE', lock_file), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)):
+            fh = unifi_cert.acquire_lock()
+            assert fh is not None
+            assert not fh.closed
+            unifi_cert.release_lock(fh)
+            assert fh.closed
+
+    def test_concurrent_acquire_blocks(self, tmp_path):
+        """Second acquire with timeout=0 raises BlockingIOError."""
+        lock_file = str(tmp_path / 'lock')
+        with patch.object(unifi_cert, 'LOCK_FILE', lock_file), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)):
+            first = unifi_cert.acquire_lock()
+            try:
+                with pytest.raises(BlockingIOError):
+                    unifi_cert.acquire_lock(timeout=0)
+            finally:
+                unifi_cert.release_lock(first)
+
+    def test_release_after_first_lets_second_acquire(self, tmp_path):
+        """Releasing the first lock allows a fresh acquire to succeed."""
+        lock_file = str(tmp_path / 'lock')
+        with patch.object(unifi_cert, 'LOCK_FILE', lock_file), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)):
+            first = unifi_cert.acquire_lock()
+            unifi_cert.release_lock(first)
+            second = unifi_cert.acquire_lock()
+            unifi_cert.release_lock(second)
+
+    def test_release_lock_handles_none(self):
+        """release_lock(None) is a graceful no-op."""
+        unifi_cert.release_lock(None)
+
+
+class TestLogRotate:
+    """Tests for size-based log rotation."""
+
+    def test_rotate_log_missing_is_noop(self, tmp_path):
+        """No log → graceful True (nothing to do)."""
+        log = str(tmp_path / 'unifi-cert.log')
+        with patch.object(unifi_cert, 'LOG_FILE', log):
+            assert unifi_cert.rotate_log() is True
+
+    def test_rotate_log_small_is_noop(self, tmp_path):
+        """Log under threshold is left untouched."""
+        log = tmp_path / 'unifi-cert.log'
+        log.write_bytes(b'small\n' * 10)
+        with patch.object(unifi_cert, 'LOG_FILE', str(log)):
+            assert unifi_cert.rotate_log() is True
+        # Content untouched.
+        assert log.read_bytes() == b'small\n' * 10
+
+    def test_rotate_log_truncates_oversized(self, tmp_path):
+        """Log over threshold is truncated to roughly the keep-size."""
+        log = tmp_path / 'unifi-cert.log'
+        # 1.5 MB of distinguishable lines.
+        log.write_bytes(b'A' * (1500 * 1024))
+        with patch.object(unifi_cert, 'LOG_FILE', str(log)), \
+             patch.object(unifi_cert, 'LOG_ROTATE_THRESHOLD', 1024 * 1024), \
+             patch.object(unifi_cert, 'LOG_ROTATE_KEEP', 100 * 1024):
+            assert unifi_cert.rotate_log() is True
+        new_size = log.stat().st_size
+        assert new_size <= 100 * 1024
+        # Has content; we kept the tail, not zeroed out.
+        assert new_size > 0
+
+    def test_rotate_log_drops_partial_first_line(self, tmp_path):
+        """The first partial line is dropped so rotated log starts at a record boundary."""
+        log = tmp_path / 'unifi-cert.log'
+        # Lines AAA…\n then BBB…\n etc. Make it big.
+        chunk = (b'AAAAA\n' * 100 * 1024) + b'partial-trailing-line\nNEXTLINE\n'
+        log.write_bytes(chunk)
+        with patch.object(unifi_cert, 'LOG_FILE', str(log)), \
+             patch.object(unifi_cert, 'LOG_ROTATE_THRESHOLD', 1024), \
+             patch.object(unifi_cert, 'LOG_ROTATE_KEEP', 50):
+            assert unifi_cert.rotate_log() is True
+        # First line of rotated log should be intact (not partial).
+        rotated = log.read_bytes()
+        # Either starts with full AAAAA line or the NEXTLINE record.
+        assert rotated.startswith(b'AAAAA') or rotated.startswith(b'NEXTLINE')
+
+
+class TestRenewalDue:
+    """Tests for is_renewal_due()."""
+
+    def test_missing_cert_due(self, tmp_path):
+        """No cert at the expected path → due (recovery path)."""
+        with patch.object(unifi_cert, 'certbot_live_dir',
+                          return_value=str(tmp_path / 'live')):
+            assert unifi_cert.is_renewal_due('example.com') is True
+
+    def test_far_future_not_due(self, tmp_path):
+        """Cert valid 90d out, threshold 30d → not due."""
+        cert_path = tmp_path / 'cert.pem'
+        cert_path.write_text('fake')
+        future = (datetime.utcnow() + __import__('datetime').timedelta(days=90))
+        meta = MagicMock(valid_to=future.strftime('%Y-%m-%d %H:%M:%S+00'))
+        with patch.object(unifi_cert, 'certbot_live_dir', return_value=str(tmp_path)), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=meta):
+            assert unifi_cert.is_renewal_due('example.com', days=30) is False
+
+    def test_within_threshold_due(self, tmp_path):
+        """Cert valid 5d out, threshold 30d → due."""
+        cert_path = tmp_path / 'cert.pem'
+        cert_path.write_text('fake')
+        soon = (datetime.utcnow() + __import__('datetime').timedelta(days=5))
+        meta = MagicMock(valid_to=soon.strftime('%Y-%m-%d %H:%M:%S+00'))
+        with patch.object(unifi_cert, 'certbot_live_dir', return_value=str(tmp_path)), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=meta):
+            assert unifi_cert.is_renewal_due('example.com', days=30) is True
+
+    def test_unparseable_valid_to_due(self, tmp_path):
+        """Garbage valid_to → due (recovery path)."""
+        cert_path = tmp_path / 'cert.pem'
+        cert_path.write_text('fake')
+        meta = MagicMock(valid_to='garbage-date')
+        with patch.object(unifi_cert, 'certbot_live_dir', return_value=str(tmp_path)), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=meta):
+            assert unifi_cert.is_renewal_due('example.com') is True
+
+    def test_metadata_extraction_raises_due(self, tmp_path):
+        """If from_cert_file raises, treat as due."""
+        cert_path = tmp_path / 'cert.pem'
+        cert_path.write_text('fake')
+        with patch.object(unifi_cert, 'certbot_live_dir', return_value=str(tmp_path)), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file',
+                          side_effect=RuntimeError('openssl crashed')):
+            assert unifi_cert.is_renewal_due('example.com') is True
+
+    def test_falls_back_to_fullchain(self, tmp_path):
+        """When cert.pem missing but fullchain.pem present, parse it."""
+        (tmp_path / 'fullchain.pem').write_text('fake')
+        future = (datetime.utcnow() + __import__('datetime').timedelta(days=90))
+        meta = MagicMock(valid_to=future.strftime('%Y-%m-%d %H:%M:%S+00'))
+        with patch.object(unifi_cert, 'certbot_live_dir', return_value=str(tmp_path)), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=meta):
+            assert unifi_cert.is_renewal_due('example.com') is False
+
+
+class TestSchedule:
+    """Tests for install_cron_schedule() and install_boot_script()."""
+
+    def test_install_cron_schedule_writes_canonical_line(self, tmp_path):
+        """Cron file contains the daily --renew line and is mode 0644."""
+        cron = tmp_path / 'unifi-cert'
+        with patch.object(unifi_cert, 'CRON_FILE', str(cron)), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_cron_schedule() is True
+        content = cron.read_text()
+        assert '--renew' in content
+        assert '/data/scripts/unifi-cert.py' in content
+        assert (cron.stat().st_mode & 0o777) == 0o644
+
+    def test_install_cron_schedule_idempotent(self, tmp_path):
+        """Second invocation overwrites cleanly."""
+        cron = tmp_path / 'unifi-cert'
+        with patch.object(unifi_cert, 'CRON_FILE', str(cron)), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_cron_schedule() is True
+            first = cron.read_text()
+            assert unifi_cert.install_cron_schedule() is True
+            second = cron.read_text()
+        assert first == second
+
+    def test_install_cron_schedule_oserror_returns_false(self):
+        """Filesystem failure surfaces as False."""
+        with patch('os.makedirs', side_effect=OSError('readonly')), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_cron_schedule() is False
+
+    def test_install_boot_script_skipped_when_dir_absent(self, tmp_path):
+        """No /data/on_boot.d → graceful skip with a warning, returns True."""
+        absent = str(tmp_path / 'does-not-exist')
+        mock_ui = MagicMock()
+        with patch.object(unifi_cert, 'BOOT_SCRIPT_DIR', absent), \
+             patch.object(unifi_cert, 'BOOT_SCRIPT_PATH', f'{absent}/15-unifi-cert.sh'), \
+             patch.object(unifi_cert, 'ui', mock_ui):
+            assert unifi_cert.install_boot_script() is True
+        mock_ui.warning.assert_called()
+
+    def test_install_boot_script_writes_when_dir_exists(self, tmp_path):
+        """When /data/on_boot.d/ is present, write the boot script (executable)."""
+        boot_dir = tmp_path / 'on_boot.d'
+        boot_dir.mkdir()
+        boot_path = boot_dir / '15-unifi-cert.sh'
+        with patch.object(unifi_cert, 'BOOT_SCRIPT_DIR', str(boot_dir)), \
+             patch.object(unifi_cert, 'BOOT_SCRIPT_PATH', str(boot_path)), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_boot_script() is True
+        content = boot_path.read_text()
+        assert '--self-heal' in content
+        assert (boot_path.stat().st_mode & 0o777) == 0o755
+
+
+class TestSelfHeal:
+    """Tests for the self_heal() composition."""
+
+    def test_self_heal_runs_no_acme(self, tmp_path):
+        """self_heal() composes bootstrap + cron + hook + boot, never run_certbot."""
+        with patch.object(unifi_cert, 'bootstrap_certbot',
+                          return_value=(True, 'ok')) as boot, \
+             patch.object(unifi_cert, 'ensure_script_installed') as ens, \
+             patch.object(unifi_cert, 'install_cron_schedule', return_value=True) as cron, \
+             patch.object(unifi_cert, 'setup_renewal_hook', return_value=True) as hook, \
+             patch.object(unifi_cert, 'install_boot_script', return_value=True) as boot_s, \
+             patch.object(unifi_cert, 'run_certbot') as cb, \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.self_heal(dns_provider='digitalocean', domain='example.com')
+        assert ok is True
+        boot.assert_called_once_with('digitalocean')
+        ens.assert_called_once()
+        cron.assert_called_once()
+        hook.assert_called_once_with('example.com')
+        boot_s.assert_called_once()
+        cb.assert_not_called()
+
+    def test_self_heal_loads_provisioning_when_args_omitted(self, tmp_path):
+        """When dns_provider/domain omitted, fall back to load_provisioning_config()."""
+        cfg = {'dns_provider': 'cloudflare', 'domain': 'beehive.example.com'}
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'bootstrap_certbot',
+                          return_value=(True, 'ok')) as boot, \
+             patch.object(unifi_cert, 'ensure_script_installed'), \
+             patch.object(unifi_cert, 'install_cron_schedule', return_value=True), \
+             patch.object(unifi_cert, 'setup_renewal_hook', return_value=True) as hook, \
+             patch.object(unifi_cert, 'install_boot_script', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.self_heal() is True
+        boot.assert_called_once_with('cloudflare')
+        hook.assert_called_once_with('beehive.example.com')
+
+    def test_self_heal_skips_bootstrap_when_no_provider(self):
+        """No dns_provider known + no provisioning config → skip bootstrap, still install cron."""
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value={}), \
+             patch.object(unifi_cert, 'bootstrap_certbot') as boot, \
+             patch.object(unifi_cert, 'ensure_script_installed'), \
+             patch.object(unifi_cert, 'install_cron_schedule', return_value=True) as cron, \
+             patch.object(unifi_cert, 'setup_renewal_hook') as hook, \
+             patch.object(unifi_cert, 'install_boot_script', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.self_heal()
+        assert ok is True  # no domain → hook skipped, but cron still installed
+        boot.assert_not_called()
+        cron.assert_called_once()
+        hook.assert_not_called()
+
+    def test_self_heal_reports_failure_when_bootstrap_fails(self):
+        """Bootstrap failure → ok=False but cron + hook still attempted."""
+        with patch.object(unifi_cert, 'bootstrap_certbot',
+                          return_value=(False, 'apt unavailable')), \
+             patch.object(unifi_cert, 'ensure_script_installed'), \
+             patch.object(unifi_cert, 'install_cron_schedule', return_value=True) as cron, \
+             patch.object(unifi_cert, 'setup_renewal_hook', return_value=True), \
+             patch.object(unifi_cert, 'install_boot_script', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.self_heal(dns_provider='digitalocean', domain='example.com')
+        assert ok is False
+        cron.assert_called_once()
+
+
+class TestProvisioningConfig:
+    """Tests for save_provisioning_config() / load_provisioning_config()."""
+
+    def test_save_then_load_roundtrip(self, tmp_path):
+        """Round-trip persists all four fields."""
+        cfg = tmp_path / 'unifi-cert.conf'
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(cfg)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.save_provisioning_config(
+                domain='example.com',
+                email='admin@example.com',
+                dns_provider='digitalocean',
+                dns_credentials='/data/unifi-cert/credentials/digitalocean.ini',
+            )
+            assert ok is True
+            loaded = unifi_cert.load_provisioning_config()
+        assert loaded['domain'] == 'example.com'
+        assert loaded['email'] == 'admin@example.com'
+        assert loaded['dns_provider'] == 'digitalocean'
+        assert loaded['dns_credentials'] == '/data/unifi-cert/credentials/digitalocean.ini'
+
+    def test_save_provisioning_config_mode_0600(self, tmp_path):
+        """Saved config has mode 0600 (path only, but contains email)."""
+        cfg = tmp_path / 'unifi-cert.conf'
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(cfg)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(
+                'example.com', 'admin@example.com', 'digitalocean', '/x/y.ini'
+            )
+        assert (cfg.stat().st_mode & 0o777) == 0o600
+
+    def test_load_missing_returns_empty(self, tmp_path):
+        """Absent file → empty dict, no error."""
+        cfg = tmp_path / 'does-not-exist'
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(cfg)):
+            assert unifi_cert.load_provisioning_config() == {}
+
+    def test_load_ignores_comments_and_blanks(self, tmp_path):
+        """Comments and blank lines are skipped."""
+        cfg = tmp_path / 'unifi-cert.conf'
+        cfg.write_text('# comment\n\ndomain = a.com\n# another\nemail = a@b.com\n')
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(cfg)):
+            loaded = unifi_cert.load_provisioning_config()
+        assert loaded == {'domain': 'a.com', 'email': 'a@b.com'}
+
+    def test_save_provisioning_config_oserror_returns_false(self):
+        """Filesystem error surfaces as False."""
+        with patch('os.makedirs', side_effect=OSError('readonly')), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.save_provisioning_config(
+                'a.com', 'a@b.com', 'digitalocean', '/x/y.ini'
+            ) is False
