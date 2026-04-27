@@ -9,11 +9,16 @@ Inspired by [GlennR's UniFi Easy Encrypt](https://community.ui.com/questions/Uni
 - **Survives firmware wipes** - All state (certbot venv, Let's Encrypt lineages, provisioning config) lives under `/data/unifi-cert/` plus a self-heal pipeline that re-asserts cron / hook / venv on every boot
 - **One-shot migration from GlennR** - `--migrate-glennr` imports your existing provisioning, snapshots to a tarball, then uninstalls GlennR's footprint via an explicit allowlist
 - **Owns the renewal lifecycle** - daily cron-fired `--renew` actually runs ACME (the v1 `--renew` was sync-only and would silently let certs expire), with locking, log rotation, and a certbot post-renewal hook that keeps the WebUI in sync
-- **Simpler codebase** - ~3500 lines of Python (with 88% test coverage) vs ~6000 lines of bash, making it easier to maintain and debug
+- **Simpler codebase** - One Python file with 88% test coverage (vs ~6000 lines of bash), easier to maintain and debug
 - **Interactive wizard** - Just run it and answer prompts; no need to remember CLI flags
 
 ## Features
 
+- **Owns the renewal lifecycle** - daily cron-fired `--renew` runs ACME when due; `--deploy-hook` syncs renewed lineages to UniFi; `--self-heal` re-asserts cron / hook / venv idempotently (and on every boot, if `/data/on_boot.d/` is available)
+- **One-command GlennR migration** - `--migrate-glennr` snapshots GlennR's footprint, imports its provisioning, then uninstalls it via an explicit allowlist. `--dry-run` previews; `--force` skips per-path confirms
+- **Lifecycle verbs over `--host`** - `--status`, `--renew`, `--self-heal`, `--migrate-glennr`, `--ddns-update`, `--bootstrap`, `--setup-hook` all accept `--host <device>` so you can drive a UniFi box from your workstation. Script is SCPed only when local + remote sha256 differ
+- **Health check** - `--status` prints a one-shot read-only report: cert metadata + days remaining, certbot venv version, cron / hook / boot-script state, lock state, GlennR-residue scan, last 20 log lines
+- **DDNS auto-refresh** - `--ddns-update` keeps the cert hostname's A record fresh against your current public IP using the same DigitalOcean token as ACME. Cron runs it every 5 min; idempotent no-op when the record already matches
 - **Auto-detects domain** - Reads CN from existing certificate, no need to specify `-d` when syncing
 - **Auto-detects credentials** - Finds `~/.secrets/certbot/{provider}.ini` automatically
 - **Remembers preferences** - Saves email and DNS provider to `~/.secrets/certbot/config.ini`
@@ -37,6 +42,8 @@ That's it. The interactive wizard will walk you through everything:
 - DNS provider selection
 - API credentials (creates the file for you if needed)
 - **Automatic renewal hook** (keeps WebUI in sync after renewals)
+
+> **Coming from GlennR's `unifi-easy-encrypt.sh`?** Run `--migrate-glennr` instead — it snapshots GlennR's state to a tarball, imports its provisioning, and uninstalls the footprint via an explicit allowlist. See the [Migrating From GlennR](#migrating-from-glennrs-unifi-easy-encryptsh) section below.
 
 ### Sync Existing Certificate to WebUI
 
@@ -324,7 +331,21 @@ ssh root@192.168.1.1 'RENEWED_LINEAGE=/data/unifi-cert/letsencrypt/live/your-dom
 
 ## Troubleshooting
 
-### Verify Installation
+### Run `--status` First
+
+When something looks off, `--status` is almost always the first thing to run. It's a one-shot, read-only report covering everything the renewal pipeline depends on:
+
+```bash
+# Local
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --status
+
+# Or driven from your workstation
+python3 unifi-cert.py --status --host 192.168.1.1
+```
+
+Reports: provisioning config, cert metadata + days remaining, certbot venv version, cron + hook + boot script state, lock state, any GlennR residue still on the device, and the last 20 log lines.
+
+### Verify Installation Manually
 
 ```bash
 # Check what nginx is serving
@@ -334,7 +355,22 @@ echo | openssl s_client -connect 192.168.1.1:443 2>/dev/null | \
 # Check database
 ssh root@192.168.1.1 'psql -U unifi-core -d unifi-core -c \
   "SELECT name, valid_to FROM user_certificates"'
+
+# Tail the renewal log
+ssh root@192.168.1.1 tail -f /data/unifi-cert/unifi-cert.log
 ```
+
+### Cron / Hook / Venv Got Wiped (Firmware Update)
+
+If a UniFi OS firmware update wiped `/etc/cron.d/`, the certbot venv, or the renewal hook, run `--self-heal` to re-assert everything from the persistent state under `/data/unifi-cert/`:
+
+```bash
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --self-heal
+# or
+python3 unifi-cert.py --self-heal --host 192.168.1.1
+```
+
+`--self-heal` never runs ACME — safe to call any time.
 
 ### SSH Issues
 
@@ -348,8 +384,26 @@ ssh-copy-id root@192.168.1.1
 
 ### WebUI Still Shows Old Cert
 
+The cert files might be in place but PostgreSQL out of sync. Re-sync without re-issuing:
+
+```bash
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --install \
+  --cert /data/eus_certificates/unifi-os.crt \
+  --key /data/eus_certificates/unifi-os.key
+```
+
+If that doesn't help, restart unifi-core (~10–30s console downtime):
+
 ```bash
 ssh root@192.168.1.1 'systemctl restart unifi-core'
+```
+
+### Force a Renewal Pass
+
+```bash
+# Run the full pipeline (lock + self-heal + ACME-if-due + sync). Without --force,
+# this is also what cron fires daily; with --force, ACME runs even if not due.
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --renew --force
 ```
 
 ### NVR Devices
