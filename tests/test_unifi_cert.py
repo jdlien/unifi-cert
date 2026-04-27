@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, call, mock_open, patch
@@ -3482,13 +3483,15 @@ class TestSchedule:
     """Tests for install_cron_schedule() and install_boot_script()."""
 
     def test_install_cron_schedule_writes_canonical_line(self, tmp_path):
-        """Cron file contains the daily --renew line and is mode 0644."""
+        """Cron file contains daily --renew + 5-min --ddns-update lines, mode 0644."""
         cron = tmp_path / 'unifi-cert'
         with patch.object(unifi_cert, 'CRON_FILE', str(cron)), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert.install_cron_schedule() is True
         content = cron.read_text()
         assert '--renew' in content
+        assert '--ddns-update' in content
+        assert '*/5' in content  # DDNS cadence
         assert '/data/scripts/unifi-cert.py' in content
         assert (cron.stat().st_mode & 0o777) == 0o644
 
@@ -4576,5 +4579,338 @@ class TestMainMigrateGlennr:
              patch('sys.stdout.isatty', return_value=False), \
              patch.object(unifi_cert, 'ui'), \
              patch.object(unifi_cert, 'migrate_glennr', return_value=True):
+            result = unifi_cert.main()
+        assert result == 0
+
+
+class _FakeUrlOpen:
+    """Context-manager fake for urllib.request.urlopen.
+
+    Returns parsed JSON from `payload` (dict), with HTTP status `status`.
+    Records all requests for assertion.
+    """
+    def __init__(self):
+        self.requests = []
+        self._next = []
+
+    def queue(self, payload, status=200):
+        self._next.append((payload, status))
+
+    def __call__(self, req, timeout=None):
+        self.requests.append({
+            'method': req.get_method(),
+            'url': req.full_url,
+            'body': req.data.decode('utf-8') if req.data else None,
+            'headers': dict(req.header_items()),
+        })
+        if not self._next:
+            raise RuntimeError(f'No queued response for {req.get_method()} {req.full_url}')
+        payload, status = self._next.pop(0)
+        return _FakeResp(payload, status)
+
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status = status
+
+    def read(self):
+        if self._payload is None:
+            return b''
+        if isinstance(self._payload, bytes):
+            return self._payload
+        return json.dumps(self._payload).encode('utf-8')
+
+    def getcode(self):
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestDdnsExtractToken:
+    """Tests for _ddns_extract_token() against certbot credentials INI."""
+
+    def test_extract_digitalocean_token(self, tmp_path):
+        """Standard certbot INI: extracts dns_digitalocean_token value."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text(
+            '# Certbot DigitalOcean credentials\n'
+            'dns_digitalocean_token = dop_v1_abcdef0123456789\n'
+        )
+        assert unifi_cert._ddns_extract_token(str(creds)) == 'dop_v1_abcdef0123456789'
+
+    def test_unknown_provider_returns_none(self, tmp_path):
+        """Provider not in DNS_PROVIDERS → None."""
+        creds = tmp_path / 'x.ini'
+        creds.write_text('foo = bar\n')
+        assert unifi_cert._ddns_extract_token(str(creds), provider='nonsense') is None
+
+    def test_missing_field_returns_none(self, tmp_path):
+        """Credential file has the right shape but wrong field name → None."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('something_else = value\n')
+        assert unifi_cert._ddns_extract_token(str(creds)) is None
+
+    def test_missing_file_returns_none(self):
+        """Non-existent file → None (graceful)."""
+        assert unifi_cert._ddns_extract_token('/does/not/exist.ini') is None
+
+
+class TestDdnsResolveZone:
+    """Tests for _ddns_resolve_zone() — finding the right DigitalOcean zone."""
+
+    def test_subdomain_resolves_to_apex_zone(self):
+        """beehive.jdlien.com → zone='jdlien.com', host='beehive'."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domains': [{'name': 'jdlien.com'}, {'name': 'other.com'}]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            zone, host = unifi_cert._ddns_resolve_zone('TOKEN', 'beehive.jdlien.com')
+        assert zone == 'jdlien.com'
+        assert host == 'beehive'
+
+    def test_apex_returns_at_host(self):
+        """jdlien.com → zone='jdlien.com', host='@'."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domains': [{'name': 'jdlien.com'}]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            zone, host = unifi_cert._ddns_resolve_zone('T', 'jdlien.com')
+        assert zone == 'jdlien.com'
+        assert host == '@'
+
+    def test_multipart_tld_picks_longest_match(self):
+        """example.co.uk owned + co.uk also owned → longest suffix wins."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domains': [{'name': 'example.co.uk'}, {'name': 'co.uk'}]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            zone, host = unifi_cert._ddns_resolve_zone('T', 'foo.example.co.uk')
+        assert zone == 'example.co.uk'
+        assert host == 'foo'
+
+    def test_no_match_returns_none(self):
+        """Domain isn't owned by user → (None, None)."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domains': [{'name': 'other.com'}]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            zone, host = unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
+        assert zone is None
+        assert host is None
+
+    def test_network_error_returns_none(self):
+        """urlopen raising URLError → (None, None) with logged error."""
+        with patch('urllib.request.urlopen',
+                   side_effect=urllib.error.URLError('connection refused')), \
+             patch.object(unifi_cert, 'ui'):
+            zone, host = unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
+        assert zone is None
+        assert host is None
+
+
+class TestDdnsGetARecord:
+    """Tests for _ddns_get_a_record() and _ddns_put_a_record()."""
+
+    def test_get_a_record_returns_id_and_data(self):
+        """API returns one matching A record → (id, ip) tuple."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domain_records': [{'id': 12345, 'data': '1.2.3.4'}]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            rid, ip = unifi_cert._ddns_get_a_record('T', 'jdlien.com', 'beehive')
+        assert rid == 12345
+        assert ip == '1.2.3.4'
+        # URL includes type=A and the fully-qualified name.
+        assert 'type=A' in fake.requests[0]['url']
+        assert 'beehive.jdlien.com' in fake.requests[0]['url']
+
+    def test_get_a_record_apex_uses_zone_as_name(self):
+        """For host='@' the API name parameter is just the zone."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domain_records': []})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            unifi_cert._ddns_get_a_record('T', 'jdlien.com', '@')
+        url = fake.requests[0]['url']
+        assert 'name=jdlien.com' in url
+        assert 'name=@' not in url
+
+    def test_get_a_record_missing_returns_none(self):
+        """No matching record → (None, None)."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domain_records': []})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            rid, ip = unifi_cert._ddns_get_a_record('T', 'jdlien.com', 'beehive')
+        assert (rid, ip) == (None, None)
+
+    def test_put_a_record_sends_data_field(self):
+        """PUT body is JSON {'data': new_ip}, Authorization header set."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domain_record': {'id': 1, 'data': '5.6.7.8'}})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert._ddns_put_a_record('TOKEN', 'jdlien.com', 12345, '5.6.7.8')
+        assert ok is True
+        req = fake.requests[0]
+        assert req['method'] == 'PUT'
+        assert '/domains/jdlien.com/records/12345' in req['url']
+        assert json.loads(req['body']) == {'data': '5.6.7.8'}
+        # Header keys are case-insensitive in Request; urllib title-cases them.
+        auth = next((v for k, v in req['headers'].items() if k.lower() == 'authorization'), None)
+        assert auth == 'Bearer TOKEN'
+
+    def test_put_a_record_network_error_returns_false(self):
+        """urlopen raising → False, error logged."""
+        with patch('urllib.request.urlopen',
+                   side_effect=urllib.error.URLError('boom')), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert._ddns_put_a_record('T', 'jdlien.com', 1, '1.2.3.4') is False
+
+
+class TestDdnsUpdate:
+    """Orchestration tests for ddns_update()."""
+
+    def _provisioning(self, **overrides):
+        cfg = {
+            'domain': 'beehive.jdlien.com',
+            'email': 'a@b.com',
+            'dns_provider': 'digitalocean',
+            'dns_credentials': '/secrets/do.ini',
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_no_op_when_record_matches(self, tmp_path):
+        """Current public IP equals A-record value → no PUT, returns True."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = TOKEN\n')
+
+        with patch.object(unifi_cert, 'load_provisioning_config',
+                          return_value=self._provisioning(dns_credentials=str(creds))), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone',
+                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(12345, '1.2.3.4')), \
+             patch.object(unifi_cert, '_ddns_put_a_record') as put, \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.ddns_update()
+        assert ok is True
+        put.assert_not_called()
+
+    def test_patch_when_record_stale(self, tmp_path):
+        """A-record IP differs from current → PUT new IP, return True."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = TOKEN\n')
+
+        with patch.object(unifi_cert, 'load_provisioning_config',
+                          return_value=self._provisioning(dns_credentials=str(creds))), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='5.6.7.8'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone',
+                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(12345, '1.2.3.4')), \
+             patch.object(unifi_cert, '_ddns_put_a_record',
+                          return_value=True) as put, \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.ddns_update()
+        assert ok is True
+        put.assert_called_once_with('TOKEN', 'jdlien.com', 12345, '5.6.7.8')
+
+    def test_force_patches_even_when_match(self, tmp_path):
+        """force=True → PUT even when current IP equals record."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = TOKEN\n')
+
+        with patch.object(unifi_cert, 'load_provisioning_config',
+                          return_value=self._provisioning(dns_credentials=str(creds))), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone',
+                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(12345, '1.2.3.4')), \
+             patch.object(unifi_cert, '_ddns_put_a_record',
+                          return_value=True) as put, \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.ddns_update(force=True)
+        assert ok is True
+        put.assert_called_once()
+
+    def test_no_domain_errors(self):
+        """No domain in args or provisioning → False."""
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value={}), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ddns_update() is False
+
+    def test_non_digitalocean_provider_errors(self, tmp_path):
+        """provisioning dns_provider != digitalocean → False (v1 limitation)."""
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_api_token = T\n')
+        cfg = self._provisioning(dns_provider='cloudflare', dns_credentials=str(creds))
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ddns_update() is False
+
+    def test_missing_credentials_file_errors(self):
+        """dns_credentials path doesn't exist → False."""
+        cfg = self._provisioning(dns_credentials='/does/not/exist.ini')
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ddns_update() is False
+
+    def test_public_ip_lookup_failure_errors(self, tmp_path):
+        """get_public_ip returning None → False."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        with patch.object(unifi_cert, 'load_provisioning_config',
+                          return_value=self._provisioning(dns_credentials=str(creds))), \
+             patch.object(unifi_cert, 'get_public_ip', return_value=None), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ddns_update() is False
+
+    def test_record_not_found_errors(self, tmp_path):
+        """_ddns_get_a_record returning (None, None) → False."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        with patch.object(unifi_cert, 'load_provisioning_config',
+                          return_value=self._provisioning(dns_credentials=str(creds))), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone',
+                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(None, None)), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ddns_update() is False
+
+
+class TestMainDdnsUpdate:
+    """CLI plumbing tests for --ddns-update."""
+
+    def test_ddns_update_threaded_through(self):
+        """`--ddns-update` calls ddns_update() and exits 0 on success."""
+        with patch('sys.argv', ['unifi-cert', '--ddns-update']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'rotate_log'), \
+             patch.object(unifi_cert, 'ddns_update', return_value=True) as fn:
+            result = unifi_cert.main()
+        assert result == 0
+        fn.assert_called_once()
+
+    def test_ddns_update_failure_returns_1(self):
+        """ddns_update returning False → exit 1."""
+        with patch('sys.argv', ['unifi-cert', '--ddns-update']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'rotate_log'), \
+             patch.object(unifi_cert, 'ddns_update', return_value=False):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_ddns_update_no_domain_arg_works(self):
+        """--ddns-update without -d (cron case) doesn't trip 'Domain is required'."""
+        with patch('sys.argv', ['unifi-cert', '--ddns-update']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'rotate_log'), \
+             patch.object(unifi_cert, 'ddns_update', return_value=True):
             result = unifi_cert.main()
         assert result == 0
