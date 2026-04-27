@@ -84,6 +84,24 @@ UNIFI_PATHS = {
     'eus_dir': '/data/eus_certificates',
 }
 
+# UniFi Core (Node.js, port 443 nginx) override + nginx local-cert config:
+# GlennR's installer writes a YAML override at UNIFI_CORE_OVERRIDE that
+# repoints unifi-core's `ssl.crt` and `ssl.key` to /data/eus_certificates/.
+# On UniFi OS 5.x, unifi-core computes the active UUID cert path from
+# dirname(E.ssl.crt), so the override breaks WebUI cert lookup — port 443
+# falls back to a self-signed unifi.local cert. Removing the override lets
+# unifi-core resolve the active cert correctly via /data/unifi-core/config/.
+UNIFI_CORE_OVERRIDE = '/data/unifi-core/config/overrides/local.yml'
+UNIFI_CORE_LOCAL_CERTS_CONF = '/data/unifi-core/config/http/local-certs.conf'
+
+# UniFi Network (Java, port 8443) keystore. Despite the .keystore extension
+# this is a PKCS#12 file (verified on UDM Pro: magic bytes 30 82, openssl
+# pkcs12 reads it cleanly). We can replace it with `openssl pkcs12 -export`,
+# no JDK / keytool / pyjks required.
+UNIFI_NETWORK_KEYSTORE = '/usr/lib/unifi/data/keystore'
+UNIFI_NETWORK_KEYSTORE_PASS = 'aircontrolenterprise'  # well-known UniFi default
+UNIFI_NETWORK_KEYSTORE_ALIAS = 'unifi'
+
 # Persistent product root - everything the tool owns lives under /data so it
 # survives UniFi OS firmware updates (which wipe non-/data paths).
 UNIFI_CERT_ROOT = '/data/unifi-cert'
@@ -755,14 +773,38 @@ def install_certificate(
     elif skip_postgres:
         ui.info("Skipping PostgreSQL update (--skip-postgres)")
 
-    # Step 5: Restart services
+    # Step 5: Update UniFi Network (Java, port 8443) PKCS#12 keystore.
+    # Must happen before unifi service restart so the new keystore is read
+    # at startup. No-op if the device doesn't run the embedded Network
+    # controller (NVR / Cloud Key without Network app).
+    network_keystore_updated = install_unifi_network_keystore(
+        cert_path, key_path, dry_run=dry_run,
+    )
+
+    # Step 6: Remove GlennR's `ssl:` override at /data/unifi-core/config/
+    # overrides/local.yml. On UniFi OS 5.x, this override breaks unifi-core's
+    # active-cert lookup and causes port 443 to fall back to a self-signed
+    # `unifi.local` cert on every restart. Removing it lets unifi-core's
+    # startup wire nginx to the UUID cert correctly.
+    remove_glennr_ssl_override(dry_run=dry_run)
+
+    # Step 7: Restart services. Restart the Java `unifi` Network service only
+    # when its keystore was actually updated (avoids a needless ~30-60s blip
+    # on the Network UI for every renewal).
     if not skip_restart:
         ui.status("Restarting services...")
         if not dry_run:
-            restart_services()
+            restart_services(restart_unifi_network=network_keystore_updated)
             ui.success("Services restarted")
     else:
         ui.info("Skipping service restart (--skip-restart)")
+
+    # Step 8: After unifi-core's restart, explicitly point nginx
+    # local-certs.conf at the active UUID cert. unifi-core's own startup
+    # should do this once the override is gone, but writing it here makes
+    # renewals self-healing across future unifi-core internal changes.
+    if not skip_restart:
+        ensure_nginx_uses_active_cert(cert_id, dry_run=dry_run)
 
     return True
 
@@ -829,9 +871,211 @@ ON CONFLICT (id) DO UPDATE SET
         return False
 
 
-def restart_services() -> None:
-    """Restart UniFi services."""
+def remove_glennr_ssl_override(dry_run: bool = False) -> bool:
+    """
+    Remove GlennR's UniFi Core SSL override that repoints `ssl.crt`/`ssl.key`
+    to /data/eus_certificates/.
+
+    The override is conservative: only the ssl: stanza is removed, only when
+    it actually points at the EUS path. If the override file ends up empty
+    after removal, it's deleted. Other YAML keys in the override file are
+    preserved.
+    """
+    path = UNIFI_CORE_OVERRIDE
+    if not os.path.exists(path):
+        return True
+
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except IOError as e:
+        ui.warning(f"Could not read {path}: {e}")
+        return False
+
+    if '/data/eus_certificates/unifi-os.crt' not in content:
+        # Override exists but doesn't reference the EUS cert path — leave alone.
+        return True
+
+    if dry_run:
+        ui.info(f"Would remove GlennR UniFi Core SSL override: {path}")
+        return True
+
+    backup_file(path)
+
+    # Strip the ssl: top-level stanza and its crt/key children. Match either
+    # tabs or spaces for indentation; tolerate trailing whitespace; preserve
+    # any other top-level YAML keys present in the file.
+    remaining = re.sub(
+        r'(?ms)^ssl:\n(?:[ \t]+(?:crt|key):[^\n]*\n?)+',
+        '',
+        content,
+    ).strip()
+
+    try:
+        if remaining:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(remaining + '\n')
+        else:
+            os.unlink(path)
+    except IOError as e:
+        ui.warning(f"Could not write/remove {path}: {e}")
+        return False
+
+    ui.success(f"Removed GlennR UniFi Core SSL override")
+    return True
+
+
+def ensure_nginx_uses_active_cert(cert_id: str, dry_run: bool = False) -> bool:
+    """
+    Write `/data/unifi-core/config/http/local-certs.conf` so nginx serves the
+    active UUID cert on port 443.
+
+    With GlennR's override removed, unifi-core's startup writes this file via
+    its `cy()` path resolving the active cert from settings.yaml. We do an
+    explicit post-restart write as a belt-and-suspenders so renewals are
+    self-healing even if startup timing or unifi-core internals shift in a
+    future version.
+    """
+    cert = os.path.join(UNIFI_PATHS['config_dir'], f'{cert_id}.crt')
+    key = os.path.join(UNIFI_PATHS['config_dir'], f'{cert_id}.key')
+    content = f"\nssl_certificate     {cert};\nssl_certificate_key {key};\n"
+
+    if dry_run:
+        ui.info(f"Would point nginx local-certs.conf at {cert_id[:8]}...")
+        return True
+
+    try:
+        os.makedirs(os.path.dirname(UNIFI_CORE_LOCAL_CERTS_CONF), exist_ok=True)
+        with open(UNIFI_CORE_LOCAL_CERTS_CONF, 'w', encoding='utf-8') as f:
+            f.write(content)
+    except IOError as e:
+        ui.warning(f"Could not update {UNIFI_CORE_LOCAL_CERTS_CONF}: {e}")
+        return False
+
+    # Reload nginx so the new config takes effect without dropping connections.
+    try:
+        subprocess.run(['nginx', '-s', 'reload'], capture_output=True, check=False, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    ui.success(f"nginx local-certs.conf points at {cert_id[:8]}...")
+    return True
+
+
+def install_unifi_network_keystore(
+    cert_path: str, key_path: str, dry_run: bool = False,
+) -> bool:
+    """
+    Replace the UniFi Network (Java, port 8443) keystore with a PKCS#12
+    bundle of the new cert + key.
+
+    The keystore is an unsigned PKCS#12 (NOT JKS — verified by magic bytes
+    30 82 and `openssl pkcs12 -info`). Using `openssl pkcs12 -export`
+    avoids any JDK / keytool / pyjks dependency, which is critical because
+    apt-installed packages get wiped by UniFi OS firmware updates.
+
+    Returns True iff the keystore was actually written (caller uses this
+    to decide whether to restart the unifi service). Returns True on dry
+    run as well, but no file is touched.
+
+    No-op when /usr/lib/unifi/data/ doesn't exist (i.e., on a UDM device
+    that isn't running the embedded UniFi Network controller).
+    """
+    if not os.path.isdir('/usr/lib/unifi/data'):
+        return False
+
+    if dry_run:
+        ui.info(f"Would update UniFi Network keystore: {UNIFI_NETWORK_KEYSTORE}")
+        return True
+
+    # Backup existing keystore under /data/unifi-cert/backups/network-keystore/
+    # so a bad export is recoverable. Persistent location, not /tmp.
+    backup_dir = os.path.join(BACKUPS_DIR, 'network-keystore')
+    try:
+        os.makedirs(backup_dir, mode=0o755, exist_ok=True)
+    except OSError as e:
+        ui.warning(f"Could not create keystore backup dir: {e}")
+        # Continue anyway — backups are nice-to-have, not blocking.
+
+    if os.path.exists(UNIFI_NETWORK_KEYSTORE):
+        backup_path = os.path.join(
+            backup_dir,
+            f'keystore.{datetime.now().strftime("%Y%m%d%H%M%S")}',
+        )
+        try:
+            shutil.copy2(UNIFI_NETWORK_KEYSTORE, backup_path)
+        except IOError as e:
+            ui.warning(f"Could not back up existing keystore: {e}")
+
+    # Build the new PKCS#12. Write to a temp file in UNIFI_CERT_ROOT (same
+    # filesystem) so the final atomic move can't cross devices.
+    try:
+        os.makedirs(UNIFI_CERT_ROOT, mode=0o755, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=UNIFI_CERT_ROOT, prefix='keystore.', delete=False,
+        ) as tmp:
+            tmp_path = tmp.name
+    except OSError as e:
+        ui.warning(f"Could not create temp file for keystore: {e}")
+        return False
+
+    try:
+        result = subprocess.run([
+            'openssl', 'pkcs12', '-export',
+            '-inkey', key_path,
+            '-in', cert_path,
+            '-out', tmp_path,
+            '-name', UNIFI_NETWORK_KEYSTORE_ALIAS,
+            '-password', f'pass:{UNIFI_NETWORK_KEYSTORE_PASS}',
+            '-keypbe', 'AES-256-CBC',
+            '-certpbe', 'AES-256-CBC',
+            '-macalg', 'sha256',
+        ], capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        ui.warning(f"openssl pkcs12 -export errored: {e}")
+        return False
+
+    if result.returncode != 0:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        ui.warning(f"openssl pkcs12 -export failed: {result.stderr.strip()}")
+        return False
+
+    try:
+        shutil.move(tmp_path, UNIFI_NETWORK_KEYSTORE)
+        try:
+            shutil.chown(UNIFI_NETWORK_KEYSTORE, user='unifi', group='unifi')
+        except (LookupError, PermissionError):
+            # Owner group may not exist on some devices; not fatal.
+            pass
+        os.chmod(UNIFI_NETWORK_KEYSTORE, 0o644)
+    except (IOError, OSError) as e:
+        ui.warning(f"Could not install keystore at {UNIFI_NETWORK_KEYSTORE}: {e}")
+        return False
+
+    ui.success(f"Updated UniFi Network keystore: {UNIFI_NETWORK_KEYSTORE}")
+    return True
+
+
+def restart_services(restart_unifi_network: bool = False) -> None:
+    """Restart UniFi services.
+
+    Always restarts nginx and unifi-core (they pick up the new active cert
+    from settings.yaml + the http/local-certs.conf). Restarts the Java
+    `unifi` Network service only when its keystore was updated, since that
+    restart takes ~30-60s and would needlessly blip the Network UI on
+    every renewal that doesn't touch the keystore (e.g., remote-only
+    deploys or NVR devices).
+    """
     services = ['nginx', 'unifi-core']
+    if restart_unifi_network:
+        services.append('unifi')
     for service in services:
         try:
             subprocess.run(['systemctl', 'restart', service],

@@ -3161,3 +3161,232 @@ class TestCertbotBootstrap:
             result = unifi_cert.main()
         assert result == 0
         mock_boot.assert_called_once_with('digitalocean', force=True)
+
+
+# =============================================================================
+# UNIFI OS 5.x cert-deploy fixes (override removal, nginx config, Java keystore)
+# =============================================================================
+
+class TestRemoveGlennRSSLOverride:
+    """Tests for remove_glennr_ssl_override()."""
+
+    def test_no_override_file_is_no_op(self, temp_dir):
+        """Missing override file → success, no error."""
+        path = os.path.join(temp_dir, 'local.yml')
+        with patch.object(unifi_cert, 'UNIFI_CORE_OVERRIDE', path), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.remove_glennr_ssl_override() is True
+
+    def test_override_without_eus_path_left_alone(self, temp_dir):
+        """File exists but doesn't reference /data/eus_certificates → leave alone."""
+        path = os.path.join(temp_dir, 'local.yml')
+        with open(path, 'w') as f:
+            f.write("logging:\n  level: debug\n")
+        with patch.object(unifi_cert, 'UNIFI_CORE_OVERRIDE', path), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.remove_glennr_ssl_override() is True
+        # File should be untouched.
+        with open(path) as f:
+            assert f.read() == "logging:\n  level: debug\n"
+
+    def test_override_with_eus_path_stripped(self, temp_dir):
+        """The exact GlennR-installed override is removed; file deleted when empty."""
+        path = os.path.join(temp_dir, 'local.yml')
+        with open(path, 'w') as f:
+            f.write(
+                "# File created by EUS ( Easy UniFi Scripts ).\n"
+                "ssl:\n"
+                "  crt: '/data/eus_certificates/unifi-os.crt'\n"
+                "  key: '/data/eus_certificates/unifi-os.key'\n"
+            )
+        with patch.object(unifi_cert, 'UNIFI_CORE_OVERRIDE', path), \
+             patch.object(unifi_cert, 'backup_file'), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.remove_glennr_ssl_override() is True
+        # The ssl: stanza was the only meaningful content; comment is whitespace-stripped.
+        # File should be deleted (or contain only the surviving comment).
+        if os.path.exists(path):
+            with open(path) as f:
+                content = f.read()
+            assert 'ssl:' not in content
+            assert '/data/eus_certificates' not in content
+
+    def test_dry_run_does_not_modify_file(self, temp_dir):
+        """dry_run=True logs intent but leaves the override file untouched."""
+        path = os.path.join(temp_dir, 'local.yml')
+        original = ("ssl:\n"
+                    "  crt: '/data/eus_certificates/unifi-os.crt'\n"
+                    "  key: '/data/eus_certificates/unifi-os.key'\n")
+        with open(path, 'w') as f:
+            f.write(original)
+        with patch.object(unifi_cert, 'UNIFI_CORE_OVERRIDE', path), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.remove_glennr_ssl_override(dry_run=True) is True
+        with open(path) as f:
+            assert f.read() == original
+
+    def test_preserves_other_top_level_keys(self, temp_dir):
+        """Stripping ssl: doesn't touch sibling top-level YAML keys."""
+        path = os.path.join(temp_dir, 'local.yml')
+        with open(path, 'w') as f:
+            f.write(
+                "ssl:\n"
+                "  crt: '/data/eus_certificates/unifi-os.crt'\n"
+                "  key: '/data/eus_certificates/unifi-os.key'\n"
+                "logging:\n"
+                "  level: debug\n"
+            )
+        with patch.object(unifi_cert, 'UNIFI_CORE_OVERRIDE', path), \
+             patch.object(unifi_cert, 'backup_file'), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.remove_glennr_ssl_override() is True
+        with open(path) as f:
+            content = f.read()
+        assert 'ssl:' not in content
+        assert 'logging:' in content
+        assert 'level: debug' in content
+
+
+class TestEnsureNginxUsesActiveCert:
+    """Tests for ensure_nginx_uses_active_cert()."""
+
+    def test_writes_correct_cert_paths(self, temp_dir):
+        """The conf file lands with ssl_certificate / ssl_certificate_key for the UUID."""
+        conf = os.path.join(temp_dir, 'local-certs.conf')
+        # UNIFI_PATHS['config_dir'] is the real module constant ('/data/unifi-core/config').
+        with patch.object(unifi_cert, 'UNIFI_CORE_LOCAL_CERTS_CONF', conf), \
+             patch('subprocess.run'), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ensure_nginx_uses_active_cert('abc123-uuid') is True
+        with open(conf) as f:
+            content = f.read()
+        config_dir = unifi_cert.UNIFI_PATHS['config_dir']
+        assert f'ssl_certificate     {config_dir}/abc123-uuid.crt;' in content
+        assert f'ssl_certificate_key {config_dir}/abc123-uuid.key;' in content
+
+    def test_dry_run_does_not_write(self, temp_dir):
+        """dry_run skips file write and nginx reload."""
+        conf = os.path.join(temp_dir, 'local-certs.conf')
+        with patch.object(unifi_cert, 'UNIFI_CORE_LOCAL_CERTS_CONF', conf), \
+             patch('subprocess.run') as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ensure_nginx_uses_active_cert('abc', dry_run=True) is True
+        assert not os.path.exists(conf)
+        mock_run.assert_not_called()
+
+    def test_nginx_reload_failure_is_nonfatal(self, temp_dir):
+        """nginx -s reload failing shouldn't make the function return False."""
+        conf = os.path.join(temp_dir, 'local-certs.conf')
+        with patch.object(unifi_cert, 'UNIFI_CORE_LOCAL_CERTS_CONF', conf), \
+             patch('subprocess.run', side_effect=OSError('no nginx')), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.ensure_nginx_uses_active_cert('abc') is True
+
+
+class TestInstallUnifiNetworkKeystore:
+    """Tests for install_unifi_network_keystore()."""
+
+    def test_no_unifi_install_returns_false(self):
+        """Skip cleanly when /usr/lib/unifi/data is absent (NVR-style devices)."""
+        # Narrow-scope side_effect: only spoof the unifi-data check; leave
+        # everything else (incl. shutil.copy2's dst-is-dir check) un-patched.
+        real_isdir = os.path.isdir
+        def isdir_for_unifi(path):
+            if path == '/usr/lib/unifi/data':
+                return False
+            return real_isdir(path)
+        with patch('os.path.isdir', side_effect=isdir_for_unifi), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_unifi_network_keystore('/c.pem', '/k.pem') is False
+
+    def test_dry_run_does_not_invoke_openssl(self):
+        """dry_run reports intent and returns True without subprocess calls."""
+        real_isdir = os.path.isdir
+        def isdir_for_unifi(path):
+            if path == '/usr/lib/unifi/data':
+                return True
+            return real_isdir(path)
+        with patch('os.path.isdir', side_effect=isdir_for_unifi), \
+             patch('subprocess.run') as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_unifi_network_keystore('/c.pem', '/k.pem', dry_run=True) is True
+        mock_run.assert_not_called()
+
+    def test_openssl_failure_returns_false_no_keystore_change(self, temp_dir):
+        """When openssl pkcs12 -export fails, the keystore is not replaced."""
+        keystore = os.path.join(temp_dir, 'keystore')
+        with open(keystore, 'wb') as f:
+            f.write(b'OLD KEYSTORE')
+        result = MagicMock(returncode=1, stderr='boom')
+        real_isdir = os.path.isdir
+        def isdir_for_unifi(path):
+            if path == '/usr/lib/unifi/data':
+                return True
+            return real_isdir(path)
+        with patch('os.path.isdir', side_effect=isdir_for_unifi), \
+             patch.object(unifi_cert, 'UNIFI_NETWORK_KEYSTORE', keystore), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', temp_dir), \
+             patch.object(unifi_cert, 'BACKUPS_DIR', os.path.join(temp_dir, 'backups')), \
+             patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_unifi_network_keystore('/c.pem', '/k.pem') is False
+        with open(keystore, 'rb') as f:
+            assert f.read() == b'OLD KEYSTORE'
+
+    def test_happy_path_replaces_keystore(self, temp_dir):
+        """openssl succeeds → keystore atomically replaced + backup created."""
+        keystore = os.path.join(temp_dir, 'keystore')
+        with open(keystore, 'wb') as f:
+            f.write(b'OLD KEYSTORE')
+        backups = os.path.join(temp_dir, 'backups')
+        # Simulate openssl pkcs12 -export success by writing a fake .p12 file
+        # at the temp output path during the subprocess.run call.
+        def fake_run(cmd, *args, **kwargs):
+            if cmd[0] == 'openssl':
+                out_idx = cmd.index('-out') + 1
+                with open(cmd[out_idx], 'wb') as f:
+                    f.write(b'NEW PKCS12')
+            return MagicMock(returncode=0, stderr='')
+
+        real_isdir = os.path.isdir
+        def isdir_for_unifi(path):
+            if path == '/usr/lib/unifi/data':
+                return True
+            return real_isdir(path)
+
+        with patch('os.path.isdir', side_effect=isdir_for_unifi), \
+             patch.object(unifi_cert, 'UNIFI_NETWORK_KEYSTORE', keystore), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', temp_dir), \
+             patch.object(unifi_cert, 'BACKUPS_DIR', backups), \
+             patch('subprocess.run', side_effect=fake_run), \
+             patch('shutil.chown'), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_unifi_network_keystore('/c.pem', '/k.pem') is True
+        with open(keystore, 'rb') as f:
+            assert f.read() == b'NEW PKCS12'
+        backup_dir = os.path.join(backups, 'network-keystore')
+        assert os.path.isdir(backup_dir)
+        backups_present = os.listdir(backup_dir)
+        assert any(name.startswith('keystore.') for name in backups_present)
+
+
+class TestRestartServices:
+    """Tests for the restart_services() service-list logic."""
+
+    def test_default_restarts_nginx_and_unifi_core_only(self):
+        """Default call (no keystore change) doesn't restart the Java unifi service."""
+        with patch('subprocess.run') as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.restart_services()
+        services = [call.args[0][2] for call in mock_run.call_args_list
+                    if call.args and call.args[0][:2] == ['systemctl', 'restart']]
+        assert services == ['nginx', 'unifi-core']
+
+    def test_restart_unifi_network_appends_unifi(self):
+        """restart_unifi_network=True appends `unifi` to the restart list."""
+        with patch('subprocess.run') as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.restart_services(restart_unifi_network=True)
+        services = [call.args[0][2] for call in mock_run.call_args_list
+                    if call.args and call.args[0][:2] == ['systemctl', 'restart']]
+        assert services == ['nginx', 'unifi-core', 'unifi']
