@@ -2272,43 +2272,9 @@ class TestMain:
             result = unifi_cert.main()
         assert result == 0
 
-    def test_main_renew_success(self):
-        """Test main --renew syncs renewed certificate."""
-        mock_platform = unifi_cert.UnifiPlatform(
-            device_type='UDM',
-            core_version='4.0.6',
-            has_eus_certs=True,
-            has_postgres=True,
-            active_cert_id='uuid',
-        )
-
-        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
-             patch('sys.stdout.isatty', return_value=False), \
-             patch('os.path.exists', return_value=True), \
-             patch.object(unifi_cert, 'ui'), \
-             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=mock_platform), \
-             patch.object(unifi_cert, 'install_certificate', return_value=True):
-            result = unifi_cert.main()
-        assert result == 0
-
-    def test_main_renew_cert_not_found(self):
-        """Test main --renew fails when cert not found."""
-        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
-             patch('sys.stdout.isatty', return_value=False), \
-             patch('os.path.exists', return_value=False), \
-             patch.object(unifi_cert, 'ui'):
-            result = unifi_cert.main()
-        assert result == 1
-
-    def test_main_renew_no_platform(self):
-        """Test main --renew fails when not on UniFi device."""
-        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
-             patch('sys.stdout.isatty', return_value=False), \
-             patch('os.path.exists', return_value=True), \
-             patch.object(unifi_cert, 'ui'), \
-             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=None):
-            result = unifi_cert.main()
-        assert result == 1
+    # --renew handler tests live in TestRenew below — the new semantics
+    # (lock + self-heal + ACME-if-due + sync) need explicit fixtures rather
+    # than the legacy "fullchain exists → install_certificate" assumption.
 
 
 class TestInteractiveMode:
@@ -2735,34 +2701,8 @@ class TestRemoteInstallationFailures:
 class TestMainEdgeCases:
     """Tests for main function edge cases."""
 
-    def test_main_renew_key_not_found(self, temp_dir):
-        """Test --renew when key file is missing."""
-        cert_path = os.path.join(temp_dir, 'fullchain.pem')
-        with open(cert_path, 'w') as f:
-            f.write('cert')
-
-        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
-             patch.object(unifi_cert, 'ui'), \
-             patch('os.path.exists', side_effect=lambda p: 'fullchain' in p):
-            result = unifi_cert.main()
-
-        assert result == 1
-
-    def test_main_renew_install_failure(self):
-        """Test --renew when installation fails."""
-        mock_platform = MagicMock()
-        mock_platform.active_cert_id = 'uuid-123'
-        mock_platform.has_eus_certs = True
-        mock_platform.has_postgres = True
-
-        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
-             patch.object(unifi_cert, 'ui'), \
-             patch('os.path.exists', return_value=True), \
-             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=mock_platform), \
-             patch.object(unifi_cert, 'install_certificate', return_value=False):
-            result = unifi_cert.main()
-
-        assert result == 1
+    # Legacy --renew failure-path tests removed — superseded by TestRenew
+    # which exercises the new lock + self-heal + ACME-if-due pipeline.
 
     def test_main_certbot_missing_credentials_file(self):
         """Test certbot path when credentials file doesn't exist."""
@@ -3713,3 +3653,318 @@ class TestProvisioningConfig:
             assert unifi_cert.save_provisioning_config(
                 'a.com', 'a@b.com', 'digitalocean', '/x/y.ini'
             ) is False
+
+
+class TestRenew:
+    """Tests for the new --renew main() handler.
+
+    The pipeline: rotate_log → load_provisioning_config (when CLI args
+    missing) → acquire_lock → self_heal → if is_renewal_due() or --force
+    → run_certbot → install_certificate.
+    """
+
+    def _renew_env(self, tmp_path):
+        """Common patches: redirect persistent paths into tmp_path."""
+        return {
+            'UNIFI_CERT_ROOT': str(tmp_path),
+            'LOCK_FILE': str(tmp_path / 'lock'),
+            'LOG_FILE': str(tmp_path / 'log'),
+            'PROVISIONING_CONFIG': str(tmp_path / 'unifi-cert.conf'),
+        }
+
+    def test_renew_runs_acme_when_due(self, tmp_path):
+        """When cert is due, --renew calls run_certbot then install_certificate."""
+        platform = MagicMock()
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', [
+                'unifi-cert', '--renew', '-d', 'example.com',
+                '-e', 'a@b.com',
+                '--dns-provider', 'digitalocean',
+                '--dns-credentials', '/x/y.ini']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=True), \
+             patch.object(unifi_cert, 'run_certbot',
+                          return_value=(True, '/x/cert.pem', '/x/key.pem')) as cb, \
+             patch.object(unifi_cert, 'install_certificate',
+                          return_value=True) as inst, \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=platform):
+            result = unifi_cert.main()
+        assert result == 0
+        cb.assert_called_once()
+        inst.assert_called_once()
+
+    def test_renew_skips_acme_when_not_due(self, tmp_path):
+        """When cert is not due, --renew exits 0 without calling certbot."""
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com',
+                               '-e', 'a@b.com', '--dns-provider', 'digitalocean',
+                               '--dns-credentials', '/x/y.ini']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=False), \
+             patch.object(unifi_cert, 'run_certbot') as cb, \
+             patch.object(unifi_cert, 'install_certificate') as inst:
+            result = unifi_cert.main()
+        assert result == 0
+        cb.assert_not_called()
+        inst.assert_not_called()
+
+    def test_renew_force_bypasses_due_check(self, tmp_path):
+        """--force makes --renew run certbot even when not due."""
+        platform = MagicMock()
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com',
+                               '-e', 'a@b.com', '--dns-provider', 'digitalocean',
+                               '--dns-credentials', '/x/y.ini', '--force']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=False), \
+             patch.object(unifi_cert, 'run_certbot',
+                          return_value=(True, '/x/cert.pem', '/x/key.pem')) as cb, \
+             patch.object(unifi_cert, 'install_certificate', return_value=True), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=platform):
+            result = unifi_cert.main()
+        assert result == 0
+        cb.assert_called_once()
+
+    def test_renew_loads_provisioning_config_when_args_missing(self, tmp_path):
+        """Cron-fired --renew (no flags) pulls from /data/unifi-cert/unifi-cert.conf."""
+        cfg = tmp_path / 'unifi-cert.conf'
+        cfg.write_text(
+            'domain = example.com\n'
+            'email = a@b.com\n'
+            'dns_provider = digitalocean\n'
+            'dns_credentials = /data/unifi-cert/credentials/digitalocean.ini\n'
+        )
+        platform = MagicMock()
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=True), \
+             patch.object(unifi_cert, 'run_certbot',
+                          return_value=(True, '/x/cert.pem', '/x/key.pem')) as cb, \
+             patch.object(unifi_cert, 'install_certificate', return_value=True), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=platform):
+            result = unifi_cert.main()
+        assert result == 0
+        # Args read from provisioning config got threaded through.
+        args, kwargs = cb.call_args
+        assert args[0] == 'example.com'
+        assert args[1] == 'a@b.com'
+        assert args[2] == 'digitalocean'
+
+    def test_renew_no_domain_anywhere_errors(self, tmp_path, capsys):
+        """No -d AND no provisioning config → exit 1 with provisioning-config hint."""
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env):
+            result = unifi_cert.main()
+        assert result == 1
+        # Hint references provisioning config so the user knows where to look.
+        err = capsys.readouterr().err
+        assert 'unifi-cert.conf' in err
+
+    def test_renew_due_but_missing_creds_errors(self, tmp_path):
+        """Cert is due but no email/dns_provider/credentials → exit 1."""
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=True):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_renew_certbot_failure_propagates(self, tmp_path):
+        """run_certbot returning False → exit 1."""
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com',
+                               '-e', 'a@b.com', '--dns-provider', 'digitalocean',
+                               '--dns-credentials', '/x/y.ini']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=True), \
+             patch.object(unifi_cert, 'run_certbot',
+                          return_value=(False, '', '')):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_renew_install_failure_propagates(self, tmp_path):
+        """install_certificate returning False → exit 1."""
+        platform = MagicMock()
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com',
+                               '-e', 'a@b.com', '--dns-provider', 'digitalocean',
+                               '--dns-credentials', '/x/y.ini']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=True), \
+             patch.object(unifi_cert, 'run_certbot',
+                          return_value=(True, '/x/cert.pem', '/x/key.pem')), \
+             patch.object(unifi_cert, 'install_certificate', return_value=False), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=platform):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_renew_lock_held_aborts(self, tmp_path):
+        """Concurrent --renew while another holds the lock → exit 1."""
+        env = self._renew_env(tmp_path)
+        # Hold the lock from this process first.
+        with patch.multiple(unifi_cert, **env):
+            held = unifi_cert.acquire_lock()
+            try:
+                with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com',
+                                       '-e', 'a@b.com',
+                                       '--dns-provider', 'digitalocean',
+                                       '--dns-credentials', '/x/y.ini']), \
+                     patch('sys.stdout.isatty', return_value=False), \
+                     patch.object(unifi_cert, 'ui'):
+                    result = unifi_cert.main()
+                assert result == 1
+            finally:
+                unifi_cert.release_lock(held)
+
+    def test_renew_dry_run_returns_after_certbot(self, tmp_path):
+        """--dry-run runs certbot in dry-run but never reaches install_certificate."""
+        env = self._renew_env(tmp_path)
+        with patch('sys.argv', ['unifi-cert', '--renew', '-d', 'example.com',
+                               '-e', 'a@b.com', '--dns-provider', 'digitalocean',
+                               '--dns-credentials', '/x/y.ini', '--dry-run']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.multiple(unifi_cert, **env), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=True), \
+             patch.object(unifi_cert, 'run_certbot',
+                          return_value=(True, '', '')) as cb, \
+             patch.object(unifi_cert, 'install_certificate') as inst:
+            result = unifi_cert.main()
+        assert result == 0
+        cb.assert_called_once()
+        inst.assert_not_called()
+
+
+class TestDeployHook:
+    """Tests for the --deploy-hook entry point."""
+
+    def test_deploy_hook_requires_lineage(self, tmp_path):
+        """No $RENEWED_LINEAGE in env → exit 1."""
+        with patch('sys.argv', ['unifi-cert', '--deploy-hook']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.dict(os.environ, {}, clear=False), \
+             patch.object(unifi_cert, 'ui'):
+            os.environ.pop('RENEWED_LINEAGE', None)
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_deploy_hook_syncs_lineage(self, tmp_path):
+        """With $RENEWED_LINEAGE pointing at a complete lineage, sync it."""
+        lineage = tmp_path / 'live' / 'example.com'
+        lineage.mkdir(parents=True)
+        (lineage / 'fullchain.pem').write_text('cert')
+        (lineage / 'privkey.pem').write_text('key')
+
+        platform = MagicMock()
+        with patch('sys.argv', ['unifi-cert', '--deploy-hook']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.dict(os.environ, {'RENEWED_LINEAGE': str(lineage)}), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'LOCK_FILE', str(tmp_path / 'lock')), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'install_certificate', return_value=True) as inst, \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=platform):
+            result = unifi_cert.main()
+        assert result == 0
+        # Domain extracted from lineage basename.
+        args, kwargs = inst.call_args
+        assert args[2] == 'example.com'
+
+    def test_deploy_hook_incomplete_lineage_errors(self, tmp_path):
+        """Lineage missing privkey → exit 1, install_certificate not called."""
+        lineage = tmp_path / 'live' / 'example.com'
+        lineage.mkdir(parents=True)
+        (lineage / 'fullchain.pem').write_text('cert')  # privkey missing
+
+        with patch('sys.argv', ['unifi-cert', '--deploy-hook']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.dict(os.environ, {'RENEWED_LINEAGE': str(lineage)}), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'LOCK_FILE', str(tmp_path / 'lock')), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'install_certificate') as inst:
+            result = unifi_cert.main()
+        assert result == 1
+        inst.assert_not_called()
+
+    def test_deploy_hook_no_acme_no_bootstrap(self, tmp_path):
+        """--deploy-hook never calls run_certbot or bootstrap_certbot."""
+        lineage = tmp_path / 'live' / 'example.com'
+        lineage.mkdir(parents=True)
+        (lineage / 'fullchain.pem').write_text('cert')
+        (lineage / 'privkey.pem').write_text('key')
+
+        platform = MagicMock()
+        with patch('sys.argv', ['unifi-cert', '--deploy-hook']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.dict(os.environ, {'RENEWED_LINEAGE': str(lineage)}), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'LOCK_FILE', str(tmp_path / 'lock')), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_certbot') as cb, \
+             patch.object(unifi_cert, 'bootstrap_certbot') as boot, \
+             patch.object(unifi_cert, 'install_certificate', return_value=True), \
+             patch.object(unifi_cert.UnifiPlatform, 'detect', return_value=platform):
+            unifi_cert.main()
+        cb.assert_not_called()
+        boot.assert_not_called()
+
+
+class TestSelfHealCli:
+    """Tests for the --self-heal CLI entry."""
+
+    def test_self_heal_invokes_self_heal(self, tmp_path):
+        """--self-heal calls self_heal() and exits 0 on success."""
+        with patch('sys.argv', ['unifi-cert', '--self-heal',
+                               '--dns-provider', 'digitalocean',
+                               '-d', 'example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True) as sh:
+            result = unifi_cert.main()
+        assert result == 0
+        sh.assert_called_once_with(dns_provider='digitalocean', domain='example.com')
+
+    def test_self_heal_no_args_works(self, tmp_path):
+        """--self-heal with no -d / no --dns-provider still runs (uses provisioning)."""
+        with patch('sys.argv', ['unifi-cert', '--self-heal']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=True) as sh:
+            result = unifi_cert.main()
+        assert result == 0
+        sh.assert_called_once_with(dns_provider=None, domain=None)
+
+    def test_self_heal_failure_returns_1(self):
+        """self_heal() returning False → exit 1."""
+        with patch('sys.argv', ['unifi-cert', '--self-heal']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'self_heal', return_value=False):
+            result = unifi_cert.main()
+        assert result == 1

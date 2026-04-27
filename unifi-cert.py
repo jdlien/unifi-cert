@@ -2015,12 +2015,23 @@ Examples:
 
     # Renewal options
     parser.add_argument('--renew', action='store_true',
-                       help='Renew existing certificate')
+                       help='Renew existing certificate (cron entry point: '
+                            'lock + self-heal + ACME-if-due + sync)')
+    parser.add_argument('--deploy-hook', action='store_true',
+                       help='certbot deploy-hook entry point. Reads '
+                            '$RENEWED_LINEAGE and syncs that lineage only. '
+                            'No ACME, no bootstrap.')
+    parser.add_argument('--self-heal', action='store_true',
+                       help='Idempotent repair: ensure venv + cron + hook + '
+                            'boot script. Never runs ACME.')
     parser.add_argument('--setup-hook', action='store_true',
                        help='Set up certbot renewal hook only')
     parser.add_argument('--bootstrap', action='store_true',
                        help='Build/repair the persistent certbot venv at '
                             '/data/unifi-cert/certbot-venv and exit')
+    parser.add_argument('--enable-hook-autoupdate', action='store_true',
+                       help='Re-enable the renewal hook GitHub auto-update path '
+                            '(default off). Requires a baked-in SHA-256 pin.')
 
     # Operation modifiers
     parser.add_argument('--dry-run', action='store_true',
@@ -2151,13 +2162,20 @@ def main() -> int:
 
     ui.header('UniFi Certificate Manager')
 
+    # Automation verbs run non-interactively even on a TTY — cron, certbot
+    # deploy-hooks, and on_boot.d invoke us, never a human.
+    automation_verb = (
+        args.renew or args.deploy_hook or args.self_heal or args.bootstrap
+    )
+
     # Determine if we should run interactive mode
     # Run interactive if: TTY available (check stdout since stdin may be pipe from curl),
-    # not --install, not --setup-hook, and missing required args for certbot
+    # not --install, not --setup-hook, not an automation verb, and missing args.
     needs_interactive = (
         sys.stdout.isatty() and
         not args.install and
         not args.setup_hook and
+        not automation_verb and
         (not args.domain or not args.email or not args.dns_provider)
     )
 
@@ -2173,7 +2191,7 @@ def main() -> int:
         args.host = config.get('host')
 
     # Auto-detect domain from existing certificate if not specified
-    if not args.domain and not args.setup_hook:
+    if not args.domain and not args.setup_hook and not automation_verb:
         # For --install with a cert file, try to detect from that cert
         if args.install and args.cert and os.path.exists(args.cert):
             detected = detect_domain_from_cert(args.cert)
@@ -2187,8 +2205,9 @@ def main() -> int:
                 ui.info(f'Auto-detected domain from existing certificate: {detected}')
                 args.domain = detected
 
-    # Validate required args (after auto-detection attempt)
-    if not args.domain and not args.setup_hook and not args.bootstrap:
+    # Validate required args (after auto-detection attempt). Automation verbs
+    # are exempt — they pull state from PROVISIONING_CONFIG / $RENEWED_LINEAGE.
+    if not args.domain and not args.setup_hook and not automation_verb:
         ui.error('Domain is required. Use -d/--domain or run interactively.')
         ui.info('Tip: If a certificate is already installed, the domain can be auto-detected.')
         return 1
@@ -2216,36 +2235,121 @@ def main() -> int:
             return 0
         return 1
 
-    # Handle renewal (called by certbot post-renewal hook)
-    if args.renew:
-        cert_path = f'/etc/letsencrypt/live/{args.domain}/fullchain.pem'
-        key_path = f'/etc/letsencrypt/live/{args.domain}/privkey.pem'
-
-        if not os.path.exists(cert_path):
-            ui.error(f'Certificate not found: {cert_path}')
+    # certbot deploy-hook entry point. Reads $RENEWED_LINEAGE (set by certbot
+    # in renewal-hook env) and syncs that lineage to the UniFi platform. No
+    # ACME, no bootstrap. Acquires the same lock as --renew so concurrent
+    # invocations serialize cleanly.
+    if args.deploy_hook:
+        lineage = os.environ.get('RENEWED_LINEAGE', '').rstrip('/')
+        if not lineage:
+            ui.error('--deploy-hook requires $RENEWED_LINEAGE in env (set by certbot).')
             return 1
-        if not os.path.exists(key_path):
-            ui.error(f'Key not found: {key_path}')
+        cert_path = os.path.join(lineage, 'fullchain.pem')
+        key_path = os.path.join(lineage, 'privkey.pem')
+        if not os.path.exists(cert_path) or not os.path.exists(key_path):
+            ui.error(f'Lineage incomplete at {lineage} (missing fullchain or privkey)')
             return 1
-
-        ui.status(f'Syncing renewed certificate for {args.domain}...')
-
+        domain = args.domain or os.path.basename(lineage)
         platform = UnifiPlatform.detect()
         if not platform:
             ui.error('Not running on a UniFi device.')
             return 1
-
-        success = install_certificate(
-            cert_path, key_path, args.domain, platform,
-            skip_postgres=args.skip_postgres,
-            skip_restart=args.skip_restart,
-            dry_run=args.dry_run,
-        )
-
+        try:
+            lock_fh = acquire_lock(timeout=30)
+        except BlockingIOError:
+            ui.error('Another --renew or --deploy-hook is running; refusing to overlap.')
+            return 1
+        try:
+            success = install_certificate(
+                cert_path, key_path, domain, platform,
+                skip_postgres=args.skip_postgres,
+                skip_restart=args.skip_restart,
+                dry_run=args.dry_run,
+            )
+        finally:
+            release_lock(lock_fh)
         if success:
-            ui.success(f'Renewed certificate for {args.domain} synced to UniFi')
+            ui.success(f'Deploy-hook synced renewed cert for {domain}')
             return 0
         return 1
+
+    # Self-heal entry point. Idempotent repair: ensure venv + cron + hook +
+    # boot script are present. Never runs ACME — safe to call from boot or
+    # any other automation context.
+    if args.self_heal:
+        ok = self_heal(dns_provider=args.dns_provider, domain=args.domain)
+        return 0 if ok else 1
+
+    # Renewal entry point (cron-fired). Pipeline:
+    #   rotate_log → load_provisioning_config (when CLI args missing) →
+    #   acquire_lock → self_heal → if is_renewal_due() or --force → run_certbot
+    #   → install_certificate. The lock prevents overlap with --deploy-hook
+    #   if a foreign certbot triggers our post-hook mid-renewal.
+    if args.renew:
+        rotate_log()
+
+        cfg = load_provisioning_config()
+        domain = args.domain or cfg.get('domain')
+        email = args.email or cfg.get('email')
+        dns_provider = args.dns_provider or cfg.get('dns_provider')
+        dns_credentials = args.dns_credentials or cfg.get('dns_credentials')
+
+        if not domain:
+            ui.error('No domain available. Provide -d/--domain or run obtain-new '
+                     'first to seed /data/unifi-cert/unifi-cert.conf.')
+            return 1
+
+        try:
+            lock_fh = acquire_lock(timeout=0)
+        except BlockingIOError:
+            ui.error('Another --renew or --deploy-hook is running; refusing to overlap.')
+            return 1
+
+        try:
+            # Self-heal first so cron + venv + hook are correct even when
+            # this firing decides not to call certbot.
+            self_heal(dns_provider=dns_provider, domain=domain)
+
+            if not (args.force or is_renewal_due(domain)):
+                ui.info(f'Certificate for {domain} is not yet due for renewal; '
+                        'skipping ACME.')
+                return 0
+
+            if not (email and dns_provider and dns_credentials):
+                ui.error('--renew requires email + dns_provider + dns_credentials, '
+                         'either via flags or saved in '
+                         '/data/unifi-cert/unifi-cert.conf.')
+                return 1
+
+            success, cert_path, key_path = run_certbot(
+                domain, email, dns_provider, dns_credentials,
+                propagation=args.propagation,
+                dry_run=args.dry_run,
+                force=args.force,
+            )
+            if not success:
+                return 1
+            if args.dry_run:
+                ui.success('Dry-run renewal completed successfully')
+                return 0
+
+            platform = UnifiPlatform.detect()
+            if not platform:
+                ui.error('Not running on a UniFi device.')
+                return 1
+
+            success = install_certificate(
+                cert_path, key_path, domain, platform,
+                skip_postgres=args.skip_postgres,
+                skip_restart=args.skip_restart,
+                dry_run=args.dry_run,
+            )
+            if success:
+                ui.success(f'Renewed certificate for {domain} synced to UniFi')
+                return 0
+            return 1
+        finally:
+            release_lock(lock_fh)
 
     # Install existing certificate
     if args.install:
@@ -2357,12 +2461,25 @@ def main() -> int:
             return 0
 
     if success:
-        # Install script to permanent location and set up renewal hook
+        # Install script to permanent location, set up renewal hook + cron,
+        # and persist provisioning config so cron-fired --renew can self-configure.
         ensure_script_installed()
         if setup_renewal_hook(args.domain):
             ui.info('Renewal hook installed - UI will stay in sync after renewals')
         else:
             ui.warning('Could not set up renewal hook. Run --setup-hook manually.')
+
+        # Local installs (no --host) get the cron schedule + persisted provisioning
+        # config. Remote installs run from a workstation; the device-side schedule
+        # gets installed during --renew/--self-heal on the device itself.
+        if not args.host:
+            install_cron_schedule()
+            save_provisioning_config(
+                domain=args.domain,
+                email=args.email,
+                dns_provider=args.dns_provider,
+                dns_credentials=args.dns_credentials,
+            )
 
         ui.header('Complete')
         ui.success(f'Certificate for {args.domain} obtained and installed!')
