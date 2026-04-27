@@ -1537,6 +1537,33 @@ class TestCertbot:
         assert result == permanent_path
         assert os.path.exists(permanent_path)
 
+    def test_ensure_script_installed_no_copy_when_already_at_permanent_path(self, temp_dir):
+        """Regression: when __file__ already IS PERMANENT_SCRIPT_PATH, no copy or curl.
+
+        The pre-fix `'__file__' in dir()` guard checked function locals,
+        not module globals, so __file__ was never visible — every call
+        fell through to the curl-from-GitHub branch. That clobbered
+        newly-deployed local scripts (most painfully during --self-heal
+        right after a SCP push, replacing our latest code with
+        main-branch HEAD). The fix: look up __file__ directly with a
+        NameError fallback, and early-return when current_path matches
+        PERMANENT_SCRIPT_PATH.
+        """
+        permanent_path = os.path.join(temp_dir, 'unifi-cert.py')
+        with open(permanent_path, 'w') as f:
+            f.write('# already deployed\n')
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'PERMANENT_SCRIPT_PATH', permanent_path), \
+             patch('os.path.abspath', return_value=permanent_path), \
+             patch('shutil.copy2') as cp, \
+             patch('subprocess.run') as run:
+            result = unifi_cert.ensure_script_installed()
+
+        assert result == permanent_path
+        cp.assert_not_called()  # no copy
+        run.assert_not_called()  # no curl
+
 
 # =============================================================================
 # REMOTE SSH OPERATIONS TESTS

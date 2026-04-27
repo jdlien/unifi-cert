@@ -1941,9 +1941,24 @@ def ensure_script_installed() -> str:
     """
     script_dir = os.path.dirname(PERMANENT_SCRIPT_PATH)
 
-    # If we're already running from the permanent location, we're good
-    current_path = os.path.abspath(__file__) if '__file__' in dir() else None
-    if current_path and os.path.exists(current_path) and os.path.samefile(current_path, PERMANENT_SCRIPT_PATH):
+    # If we're already running from the permanent location, we're good.
+    # `'__file__' in dir()` was a stale guard — dir() inside a function
+    # returns local names, so __file__ (a module-level attribute) was
+    # never visible and current_path was always None. That made every
+    # --self-heal call re-download main-branch HEAD from GitHub,
+    # silently clobbering newer locally-deployed scripts. We now look
+    # up __file__ directly and only fall back to download when it's
+    # genuinely undefined (curl-pipe / `python3 -` from stdin).
+    current_path: Optional[str]
+    try:
+        current_path = os.path.abspath(__file__)
+    except NameError:
+        current_path = None
+
+    if (current_path
+            and os.path.exists(current_path)
+            and os.path.exists(PERMANENT_SCRIPT_PATH)
+            and os.path.samefile(current_path, PERMANENT_SCRIPT_PATH)):
         return PERMANENT_SCRIPT_PATH
 
     # Create directory if needed
