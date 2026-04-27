@@ -4068,3 +4068,513 @@ class TestHookAutoupdate:
                           return_value=True) as hook:
             unifi_cert.main()
         assert hook.call_args.kwargs.get('enable_autoupdate') is False
+
+
+class TestGlennRInventory:
+    """Tests for inventory_glennr() — read-only probe of GlennR state."""
+
+    def _stage_renewal_conf(self, tmp_path, domain, email='admin@example.com',
+                             dns='digitalocean', creds='/root/.secrets/do.ini'):
+        """Helper: create a fake /etc/letsencrypt/renewal/<domain>.conf file."""
+        renewal_dir = tmp_path / 'letsencrypt' / 'renewal'
+        renewal_dir.mkdir(parents=True)
+        conf = renewal_dir / f'{domain}.conf'
+        conf.write_text(
+            f'# managed by certbot\n'
+            f'cert = /etc/letsencrypt/live/{domain}/cert.pem\n'
+            f'archive_dir = /etc/letsencrypt/archive/{domain}\n'
+            f'\n'
+            f'[renewalparams]\n'
+            f'authenticator = dns-{dns}\n'
+            f'email = {email}\n'
+            f'dns_{dns}_credentials = {creds}\n'
+        )
+        return tmp_path / 'letsencrypt'
+
+    def test_empty_disk_returns_empty_inventory(self, tmp_path):
+        """No GlennR footprint → all fields None and detected_paths == []."""
+        with patch('os.path.isdir', return_value=False), \
+             patch('os.path.isfile', return_value=False), \
+             patch('glob.glob', return_value=[]):
+            inv = unifi_cert.inventory_glennr()
+        assert inv.domain is None
+        assert inv.dns_provider is None
+        assert inv.detected_paths == []
+
+    def test_renewal_conf_extraction(self, tmp_path, monkeypatch):
+        """Renewal conf yields domain + email + dns_provider + credentials path."""
+        le_root = self._stage_renewal_conf(tmp_path, 'example.com')
+
+        # Patch the renewal_dir lookup to point at our staged tree.
+        real_isdir = os.path.isdir
+        real_listdir = os.listdir
+        real_open = open
+
+        def fake_isdir(p):
+            if p == '/etc/letsencrypt/renewal':
+                return True
+            return real_isdir(p)
+
+        def fake_listdir(p):
+            if p == '/etc/letsencrypt/renewal':
+                return real_listdir(le_root / 'renewal')
+            return real_listdir(p)
+
+        def fake_open(p, *a, **kw):
+            if isinstance(p, str) and p.startswith('/etc/letsencrypt/renewal/'):
+                return real_open(le_root / 'renewal' / os.path.basename(p), *a, **kw)
+            return real_open(p, *a, **kw)
+
+        with patch('os.path.isdir', side_effect=fake_isdir), \
+             patch('os.listdir', side_effect=fake_listdir), \
+             patch('builtins.open', side_effect=fake_open), \
+             patch('os.path.exists', return_value=False), \
+             patch('os.path.isfile', return_value=False), \
+             patch('glob.glob', return_value=[]):
+            inv = unifi_cert.inventory_glennr()
+        assert inv.domain == 'example.com'
+        assert inv.email == 'admin@example.com'
+        assert inv.dns_provider == 'digitalocean'
+        assert inv.dns_credentials_path == '/root/.secrets/do.ini'
+
+    def test_detected_dirs(self):
+        """Existing GlennR dirs are added to detected_paths with kind='dir'."""
+        def fake_isdir(p):
+            return p in ('/srv/EUS', '/usr/lib/EUS', '/root/EUS')
+
+        with patch('os.path.isdir', side_effect=fake_isdir), \
+             patch('os.path.isfile', return_value=False), \
+             patch('os.path.exists', return_value=False), \
+             patch('glob.glob', return_value=[]):
+            inv = unifi_cert.inventory_glennr()
+        kinds = {(p, k) for (p, k, _) in inv.detected_paths}
+        assert ('/srv/EUS', 'dir') in kinds
+        assert ('/usr/lib/EUS', 'dir') in kinds
+        assert ('/root/EUS', 'dir') in kinds
+
+    def test_detected_crons_and_hooks(self):
+        """Cron files + EUS_*.sh hooks are detected via allowlist + globs."""
+        def fake_isfile(p):
+            return p in (
+                '/etc/cron.d/eus_script',
+                '/etc/cron.d/eus_certbot',
+                '/etc/letsencrypt/renewal-hooks/post/EUS_postsync.sh',
+            )
+
+        def fake_glob(pattern):
+            if pattern == '/etc/letsencrypt/renewal-hooks/post/EUS_*.sh':
+                return ['/etc/letsencrypt/renewal-hooks/post/EUS_postsync.sh']
+            return []
+
+        with patch('os.path.isdir', return_value=False), \
+             patch('os.path.isfile', side_effect=fake_isfile), \
+             patch('os.path.exists', return_value=False), \
+             patch('glob.glob', side_effect=fake_glob):
+            inv = unifi_cert.inventory_glennr()
+        kinds = {(p, k) for (p, k, _) in inv.detected_paths}
+        assert ('/etc/cron.d/eus_script', 'cron') in kinds
+        assert ('/etc/cron.d/eus_certbot', 'cron') in kinds
+        assert ('/etc/letsencrypt/renewal-hooks/post/EUS_postsync.sh', 'hook') in kinds
+
+    def test_generic_certbot_cron_only_when_apt_content(self, tmp_path):
+        """/etc/cron.d/certbot only added when content invokes apt-installed certbot."""
+        cron_path = '/etc/cron.d/certbot'
+
+        def fake_isfile(p):
+            return p == cron_path
+
+        # Case A: apt-style content → DETECTED.
+        apt_content = ('SHELL=/bin/sh\n0 */12 * * * root test -x /usr/bin/certbot && '
+                       '/usr/bin/certbot -q renew\n')
+        with patch('os.path.isdir', return_value=False), \
+             patch('os.path.isfile', side_effect=fake_isfile), \
+             patch('os.path.exists', return_value=False), \
+             patch('glob.glob', return_value=[]), \
+             patch('builtins.open', mock_open(read_data=apt_content)):
+            inv = unifi_cert.inventory_glennr()
+        assert any(p == cron_path for (p, _, _) in inv.detected_paths)
+
+        # Case B: user-authored content (no /usr/bin/certbot) → NOT detected.
+        user_content = '0 3 * * * root /home/me/my-cert-tool.sh\n'
+        with patch('os.path.isdir', return_value=False), \
+             patch('os.path.isfile', side_effect=fake_isfile), \
+             patch('os.path.exists', return_value=False), \
+             patch('glob.glob', return_value=[]), \
+             patch('builtins.open', mock_open(read_data=user_content)):
+            inv = unifi_cert.inventory_glennr()
+        assert not any(p == cron_path for (p, _, _) in inv.detected_paths)
+
+    def test_apt_sources_detection(self):
+        """All four glennr-install-script.* apt sources are detected."""
+        sources = (
+            '/etc/apt/sources.list.d/glennr-install-script.list',
+            '/etc/apt/sources.list.d/glennr-install-script.sources',
+            '/etc/apt/sources.list.d/glennr-install-script-unmet.list',
+            '/etc/apt/sources.list.d/glennr-install-script-unmet.sources',
+        )
+
+        def fake_isfile(p):
+            return p in sources
+
+        with patch('os.path.isdir', return_value=False), \
+             patch('os.path.isfile', side_effect=fake_isfile), \
+             patch('os.path.exists', return_value=False), \
+             patch('glob.glob', return_value=[]):
+            inv = unifi_cert.inventory_glennr()
+        detected = {p for (p, _, _) in inv.detected_paths}
+        for src in sources:
+            assert src in detected
+
+
+class TestImportProvisioning:
+    """Tests for import_provisioning_from_glennr()."""
+
+    def test_refuses_without_minimum_fields(self, tmp_path):
+        """Inventory missing domain or dns_provider → False, no save."""
+        inv = unifi_cert.GlennRInventory(domain=None, dns_provider='digitalocean')
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'save_provisioning_config') as save:
+            assert unifi_cert.import_provisioning_from_glennr(inv) is False
+        save.assert_not_called()
+
+    def test_copies_credentials_to_persistent_root(self, tmp_path):
+        """Existing credentials file is copied into CREDENTIALS_DIR with mode 0600."""
+        creds_src = tmp_path / 'do.ini'
+        creds_src.write_text('dns_digitalocean_token = secret\n')
+        creds_src.chmod(0o600)
+        creds_dir = tmp_path / 'credentials'
+        inv = unifi_cert.GlennRInventory(
+            domain='example.com', email='a@b.com',
+            dns_provider='digitalocean', dns_credentials_path=str(creds_src),
+        )
+        with patch.object(unifi_cert, 'CREDENTIALS_DIR', str(creds_dir)), \
+             patch.object(unifi_cert, 'save_provisioning_config',
+                          return_value=True) as save, \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.import_provisioning_from_glennr(inv)
+        assert ok is True
+        new_creds = creds_dir / 'digitalocean.ini'
+        assert new_creds.exists()
+        assert (new_creds.stat().st_mode & 0o777) == 0o600
+        # save_provisioning_config receives the NEW path, not the old one.
+        assert save.call_args.kwargs['dns_credentials'] == str(new_creds)
+
+    def test_missing_creds_path_warns_but_saves(self, tmp_path):
+        """Credentials path that doesn't exist → warn, save with original path."""
+        inv = unifi_cert.GlennRInventory(
+            domain='example.com', dns_provider='digitalocean',
+            dns_credentials_path='/does/not/exist.ini',
+        )
+        mock_ui = MagicMock()
+        with patch.object(unifi_cert, 'ui', mock_ui), \
+             patch.object(unifi_cert, 'save_provisioning_config',
+                          return_value=True) as save:
+            ok = unifi_cert.import_provisioning_from_glennr(inv)
+        assert ok is True
+        mock_ui.warning.assert_called()
+        # Falls back to the original (non-existent) path.
+        assert save.call_args.kwargs['dns_credentials'] == '/does/not/exist.ini'
+
+
+class TestSnapshotGlennr:
+    """Tests for snapshot_glennr() tarball creation."""
+
+    def test_snapshot_includes_detected_and_etc_letsencrypt(self, tmp_path):
+        """Tarball includes every detected path plus /etc/letsencrypt when present."""
+        inv = unifi_cert.GlennRInventory(detected_paths=[
+            ('/srv/EUS', 'dir', ''),
+            ('/etc/cron.d/eus_script', 'cron', ''),
+        ])
+        backups = tmp_path / 'backups'
+
+        def fake_exists(p):
+            return p in ('/srv/EUS', '/etc/cron.d/eus_script')
+
+        def fake_isdir(p):
+            return p == '/etc/letsencrypt'
+
+        result = MagicMock(returncode=0, stderr='')
+        with patch.object(unifi_cert, 'BACKUPS_DIR', str(backups)), \
+             patch('os.path.exists', side_effect=fake_exists), \
+             patch('os.path.isdir', side_effect=fake_isdir), \
+             patch('subprocess.run', return_value=result) as run, \
+             patch.object(unifi_cert, 'ui'):
+            tarball = unifi_cert.snapshot_glennr(inv, timestamp='20260427T000000Z')
+        assert tarball is not None
+        cmd = run.call_args.args[0]
+        assert cmd[:3] == ['tar', 'czf', tarball]
+        assert '/srv/EUS' in cmd
+        assert '/etc/cron.d/eus_script' in cmd
+        assert '/etc/letsencrypt' in cmd
+
+    def test_snapshot_empty_returns_none(self):
+        """No detected paths and no /etc/letsencrypt → None + warning, no tar call."""
+        inv = unifi_cert.GlennRInventory(detected_paths=[])
+        with patch('os.path.exists', return_value=False), \
+             patch('os.path.isdir', return_value=False), \
+             patch('subprocess.run') as run, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.snapshot_glennr(inv) is None
+        run.assert_not_called()
+
+    def test_snapshot_tar_failure_returns_none(self):
+        """tar exit non-zero → None, error logged."""
+        inv = unifi_cert.GlennRInventory(detected_paths=[('/srv/EUS', 'dir', '')])
+        result = MagicMock(returncode=2, stderr='tar: permission denied')
+        with patch('os.path.exists', return_value=True), \
+             patch('os.path.isdir', return_value=False), \
+             patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.snapshot_glennr(inv) is None
+
+
+class TestRsyncLeState:
+    """Tests for _rsync_etc_letsencrypt()."""
+
+    def test_skips_when_etc_letsencrypt_absent(self):
+        """No /etc/letsencrypt → True (graceful skip), no rsync call."""
+        with patch('os.path.isdir', return_value=False), \
+             patch('subprocess.run') as run, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert._rsync_etc_letsencrypt() is True
+        run.assert_not_called()
+
+    def test_passes_archive_and_hardlink_flags(self, tmp_path):
+        """rsync invoked with -aH plus trailing-slash source for contents-only copy."""
+        result = MagicMock(returncode=0, stderr='')
+        with patch('os.path.isdir', return_value=True), \
+             patch('os.makedirs'), \
+             patch('subprocess.run', return_value=result) as run, \
+             patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert._rsync_etc_letsencrypt() is True
+        cmd = run.call_args.args[0]
+        assert cmd[:2] == ['rsync', '-aH']
+        assert cmd[2] == '/etc/letsencrypt/'
+        assert cmd[3].endswith('/')
+
+    def test_rsync_failure_returns_false(self):
+        """rsync exit non-zero → False so caller can abort before deletion."""
+        result = MagicMock(returncode=23, stderr='rsync: protocol error')
+        with patch('os.path.isdir', return_value=True), \
+             patch('os.makedirs'), \
+             patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert._rsync_etc_letsencrypt() is False
+
+
+class TestMigrateUninstall:
+    """Tests for _remove_glennr_path() per-path confirm logic."""
+
+    def test_force_skips_confirm_and_removes(self, tmp_path):
+        """force=True bypasses ui.confirm and proceeds to remove."""
+        target = tmp_path / 'eus_script'
+        target.write_text('cron content')
+        mock_ui = MagicMock()
+        with patch.object(unifi_cert, 'ui', mock_ui):
+            ok = unifi_cert._remove_glennr_path(str(target), 'cron', force=True)
+        assert ok is True
+        assert not target.exists()
+        mock_ui.confirm.assert_not_called()
+
+    def test_dir_removed_via_rmtree(self, tmp_path):
+        """kind='dir' uses shutil.rmtree (deletes nested files)."""
+        target = tmp_path / 'EUS'
+        target.mkdir()
+        (target / 'inside.txt').write_text('x')
+        with patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert._remove_glennr_path(str(target), 'dir', force=True)
+        assert ok is True
+        assert not target.exists()
+
+    def test_decline_confirm_skips(self, tmp_path):
+        """User declines confirm → file preserved, returns True (graceful)."""
+        target = tmp_path / 'thing'
+        target.write_text('keep me')
+        mock_ui = MagicMock()
+        mock_ui.confirm.return_value = False
+        with patch.object(unifi_cert, 'ui', mock_ui):
+            ok = unifi_cert._remove_glennr_path(str(target), 'file', force=False)
+        assert ok is True
+        assert target.exists()
+
+
+class TestMigrateGlennr:
+    """Orchestration tests for migrate_glennr()."""
+
+    def _empty_inv(self):
+        return unifi_cert.GlennRInventory(detected_paths=[])
+
+    def _full_inv(self):
+        return unifi_cert.GlennRInventory(
+            domain='example.com', email='a@b.com',
+            dns_provider='digitalocean',
+            dns_credentials_path='/root/.secrets/do.ini',
+            glennr_version='8.4.2',
+            detected_paths=[
+                ('/srv/EUS', 'dir', 'GlennR data directory'),
+                ('/etc/cron.d/eus_script', 'cron', 'GlennR cron job'),
+            ],
+        )
+
+    def test_no_footprint_short_circuits(self):
+        """Empty inventory + no /etc/letsencrypt → True, nothing destructive runs."""
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=self._empty_inv()), \
+             patch('os.path.isdir', return_value=False), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr') as imp, \
+             patch.object(unifi_cert, 'snapshot_glennr') as snap, \
+             patch.object(unifi_cert, '_remove_glennr_path') as rm, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.migrate_glennr() is True
+        imp.assert_not_called()
+        snap.assert_not_called()
+        rm.assert_not_called()
+
+    def test_dry_run_lists_no_destructive(self):
+        """--dry-run logs planned actions but never imports / snapshots / removes."""
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=self._full_inv()), \
+             patch('os.path.isdir', return_value=True), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr') as imp, \
+             patch.object(unifi_cert, 'snapshot_glennr') as snap, \
+             patch.object(unifi_cert, '_rsync_etc_letsencrypt') as rsync, \
+             patch.object(unifi_cert, '_remove_glennr_path') as rm, \
+             patch.object(unifi_cert, 'self_heal') as sh, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.migrate_glennr(dry_run=True) is True
+        imp.assert_not_called()
+        snap.assert_not_called()
+        rsync.assert_not_called()
+        rm.assert_not_called()
+        sh.assert_not_called()
+
+    def test_happy_path_calls_phases_in_order(self, tmp_path):
+        """Real run threads inventory → import → snapshot → rsync → uninstall → self-heal."""
+        inv = self._full_inv()
+        ordering = []
+
+        with patch.object(unifi_cert, 'inventory_glennr', return_value=inv), \
+             patch('os.path.isdir', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr',
+                          side_effect=lambda *a, **k: ordering.append('import') or True), \
+             patch.object(unifi_cert, 'snapshot_glennr',
+                          side_effect=lambda *a, **k: ordering.append('snapshot') or '/x/snap.tgz'), \
+             patch.object(unifi_cert, '_rsync_etc_letsencrypt',
+                          side_effect=lambda: ordering.append('rsync') or True), \
+             patch.object(unifi_cert, '_remove_glennr_path',
+                          side_effect=lambda *a, **k: ordering.append(f'rm:{a[0]}') or True), \
+             patch.object(unifi_cert, 'self_heal',
+                          side_effect=lambda **k: ordering.append('self_heal') or True), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.migrate_glennr(force=True) is True
+
+        # Order matters: import must precede snapshot, snapshot must precede rsync,
+        # rsync must precede any rm, self_heal is last.
+        assert ordering.index('import') < ordering.index('snapshot')
+        assert ordering.index('snapshot') < ordering.index('rsync')
+        rm_indices = [i for i, x in enumerate(ordering) if x.startswith('rm:')]
+        assert all(ordering.index('rsync') < i for i in rm_indices)
+        assert ordering[-1] == 'self_heal'
+
+    def test_import_failure_aborts_before_snapshot(self):
+        """import_provisioning_from_glennr returning False → no snapshot, no rm."""
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=self._full_inv()), \
+             patch('os.path.isdir', return_value=True), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr',
+                          return_value=False), \
+             patch.object(unifi_cert, 'snapshot_glennr') as snap, \
+             patch.object(unifi_cert, '_rsync_etc_letsencrypt') as rsync, \
+             patch.object(unifi_cert, '_remove_glennr_path') as rm, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.migrate_glennr(force=True) is False
+        snap.assert_not_called()
+        rsync.assert_not_called()
+        rm.assert_not_called()
+
+    def test_snapshot_failure_aborts_before_rsync(self):
+        """snapshot_glennr() returning None → no rsync, no rm — preserves /etc/letsencrypt."""
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=self._full_inv()), \
+             patch('os.path.isdir', return_value=True), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr',
+                          return_value=True), \
+             patch.object(unifi_cert, 'snapshot_glennr', return_value=None), \
+             patch.object(unifi_cert, '_rsync_etc_letsencrypt') as rsync, \
+             patch.object(unifi_cert, '_remove_glennr_path') as rm, \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.migrate_glennr(force=True) is False
+        rsync.assert_not_called()
+        rm.assert_not_called()
+
+    def test_post_rsync_lineage_missing_skips_letsencrypt_deletion(self):
+        """Migrated lineage missing fullchain.pem → /etc/letsencrypt/ is preserved."""
+        inv = self._full_inv()
+        rm_calls = []
+
+        def fake_exists(p):
+            # New live path is missing → trigger safety net.
+            if 'live/example.com/fullchain.pem' in p:
+                return False
+            return True
+
+        with patch.object(unifi_cert, 'inventory_glennr', return_value=inv), \
+             patch('os.path.isdir', return_value=True), \
+             patch('os.path.exists', side_effect=fake_exists), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr',
+                          return_value=True), \
+             patch.object(unifi_cert, 'snapshot_glennr', return_value='/x/s.tgz'), \
+             patch.object(unifi_cert, '_rsync_etc_letsencrypt', return_value=True), \
+             patch.object(unifi_cert, '_remove_glennr_path',
+                          side_effect=lambda *a, **k: rm_calls.append(a[0]) or True), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.migrate_glennr(force=True) is True
+
+        # Allowlisted paths still removed, but /etc/letsencrypt is preserved.
+        assert '/srv/EUS' in rm_calls
+        assert '/etc/letsencrypt' not in rm_calls
+
+
+class TestMainMigrateGlennr:
+    """CLI integration tests for --migrate-glennr."""
+
+    def test_migrate_glennr_dry_run_threaded_through(self):
+        """`--migrate-glennr --dry-run` calls migrate_glennr(dry_run=True)."""
+        with patch('sys.argv', ['unifi-cert', '--migrate-glennr', '--dry-run']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'migrate_glennr', return_value=True) as mg:
+            result = unifi_cert.main()
+        assert result == 0
+        mg.assert_called_once_with(dry_run=True, force=False)
+
+    def test_migrate_glennr_force_threaded_through(self):
+        """`--migrate-glennr --force` calls migrate_glennr(force=True)."""
+        with patch('sys.argv', ['unifi-cert', '--migrate-glennr', '--force']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'migrate_glennr', return_value=True) as mg:
+            result = unifi_cert.main()
+        assert result == 0
+        mg.assert_called_once_with(dry_run=False, force=True)
+
+    def test_migrate_glennr_failure_returns_1(self):
+        """migrate_glennr returning False → exit 1."""
+        with patch('sys.argv', ['unifi-cert', '--migrate-glennr', '--force']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'migrate_glennr', return_value=False):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_migrate_glennr_runs_without_domain_arg(self):
+        """--migrate-glennr (automation verb) must not trip 'Domain is required'."""
+        with patch('sys.argv', ['unifi-cert', '--migrate-glennr', '--dry-run']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'migrate_glennr', return_value=True):
+            result = unifi_cert.main()
+        assert result == 0

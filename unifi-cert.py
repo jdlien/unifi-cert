@@ -11,6 +11,7 @@ License: MIT
 
 import argparse
 import fcntl
+import glob
 import json
 import os
 import re
@@ -21,7 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -670,6 +671,367 @@ class UnifiPlatform:
             has_postgres=has_postgres,
             active_cert_id=active_cert_id,
         )
+
+
+# =============================================================================
+# GLENNR MIGRATION - import provisioning + uninstall the unifi-easy-encrypt.sh footprint
+# =============================================================================
+#
+# GlennR's installer scatters state across /srv/EUS/, /usr/lib/EUS/, /root/EUS/,
+# six different cron files in /etc/cron.d/, EUS_*.sh hooks under
+# /etc/letsencrypt/renewal-hooks/, and apt sources at
+# /etc/apt/sources.list.d/glennr-install-script*.{list,sources}. Migration is:
+# inventory → import provisioning → snapshot → rsync /etc/letsencrypt/ →
+# allowlisted uninstall → bootstrap + schedule + hook. The allowlist is
+# explicit and ordered — no escaping globs.
+
+GLENNR_REMOVABLE_DIRS = (
+    '/srv/EUS',
+    '/usr/lib/EUS',
+    '/root/EUS',
+)
+
+GLENNR_REMOVABLE_FILE_GLOBS = (
+    '/root/unifi-easy-encrypt.sh',
+    '/root/unifi-easy-encrypt.sh.tmp',
+    '/root/unifi-easy-encrypt-*.sh',
+)
+
+GLENNR_REMOVABLE_CRONS = (
+    '/etc/cron.d/eus_script',
+    '/etc/cron.d/eus_script_uc_ck',
+    '/etc/cron.d/eus_lets_encrypt_retry',
+    '/etc/cron.d/eus_certbot',
+)
+GLENNR_REMOVABLE_CRON_GLOBS = (
+    '/etc/cron.d/eus_certificate_migration_*',
+)
+
+# Generic name shared with apt's certbot package — only remove if the file
+# content actually invokes /usr/bin/certbot (the apt-installed cron). A
+# user-authored /etc/cron.d/certbot might predate this tool.
+GLENNR_REMOVABLE_CRON_GENERIC = '/etc/cron.d/certbot'
+
+GLENNR_REMOVABLE_HOOK_GLOBS = (
+    '/etc/letsencrypt/renewal-hooks/pre/EUS_*.sh',
+    '/etc/letsencrypt/renewal-hooks/post/EUS_*.sh',
+)
+
+GLENNR_REMOVABLE_APT_SOURCES = (
+    '/etc/apt/sources.list.d/glennr-install-script.list',
+    '/etc/apt/sources.list.d/glennr-install-script.sources',
+    '/etc/apt/sources.list.d/glennr-install-script-unmet.list',
+    '/etc/apt/sources.list.d/glennr-install-script-unmet.sources',
+)
+
+
+@dataclass
+class GlennRInventory:
+    """Result of inventory_glennr() — provisioning hints + removal targets."""
+    domain: Optional[str] = None
+    email: Optional[str] = None
+    dns_provider: Optional[str] = None
+    dns_credentials_path: Optional[str] = None
+    glennr_version: Optional[str] = None
+    # list of (absolute_path, kind, reason) tuples; kind ∈ {'dir','file','cron','hook','apt-source'}
+    detected_paths: list = field(default_factory=list)
+
+
+def _cron_d_certbot_invokes_glennr(path: str) -> bool:
+    """Return True iff /etc/cron.d/certbot runs the apt-installed certbot binary.
+
+    The path is generic (apt installs `certbot` package with its own cron
+    file). We only delete when the file content matches the apt-cron shape,
+    so a user's hand-rolled /etc/cron.d/certbot is preserved.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            content = fh.read()
+    except OSError:
+        return False
+    return '/usr/bin/certbot' in content or 'certbot -q renew' in content
+
+
+def inventory_glennr() -> GlennRInventory:
+    """Read-only probe of GlennR state on the current device.
+
+    Reads /etc/letsencrypt/renewal/*.conf for domain / dns provider /
+    credentials path (the most reliable provisioning source). Probes
+    /root/unifi-easy-encrypt.sh for the GlennR script version. Builds the
+    list of removable paths matching the allowlist. Performs no writes.
+    """
+    inv = GlennRInventory()
+
+    # Renewal config: certbot's own record of the lineage.
+    renewal_dir = '/etc/letsencrypt/renewal'
+    if os.path.isdir(renewal_dir):
+        for conf_name in sorted(os.listdir(renewal_dir)):
+            if not conf_name.endswith('.conf'):
+                continue
+            domain = conf_name[:-len('.conf')]
+            inv.domain = inv.domain or domain
+            try:
+                with open(os.path.join(renewal_dir, conf_name), 'r', encoding='utf-8') as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            m = re.search(r'^\s*email\s*=\s*(\S+)', content, re.MULTILINE)
+            if m and not inv.email:
+                inv.email = m.group(1)
+            m = re.search(r'authenticator\s*=\s*dns-([a-z0-9]+)', content)
+            if m and not inv.dns_provider:
+                inv.dns_provider = m.group(1)
+            m = re.search(r'dns_[a-z0-9]+_credentials\s*=\s*(\S+)', content)
+            if m and not inv.dns_credentials_path:
+                inv.dns_credentials_path = m.group(1)
+            # Stop after the first lineage so we don't mix providers across domains.
+            break
+
+    # GlennR script version (best-effort; not load-bearing).
+    for candidate in ('/root/unifi-easy-encrypt.sh',
+                      '/root/EUS/unifi-easy-encrypt.sh'):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, 'r', encoding='utf-8') as fh:
+                head = fh.read(8192)
+        except OSError:
+            continue
+        m = re.search(r'script_version=["\']?([0-9.]+)', head)
+        if m:
+            inv.glennr_version = m.group(1)
+        break
+
+    # Build the removable-paths list.
+    detected = []
+    for d in GLENNR_REMOVABLE_DIRS:
+        if os.path.isdir(d):
+            detected.append((d, 'dir', 'GlennR data directory'))
+    for pattern in GLENNR_REMOVABLE_FILE_GLOBS:
+        for path in sorted(glob.glob(pattern)):
+            if os.path.isfile(path):
+                detected.append((path, 'file', 'GlennR script'))
+    for cron in GLENNR_REMOVABLE_CRONS:
+        if os.path.isfile(cron):
+            detected.append((cron, 'cron', 'GlennR cron job'))
+    for pattern in GLENNR_REMOVABLE_CRON_GLOBS:
+        for path in sorted(glob.glob(pattern)):
+            if os.path.isfile(path):
+                detected.append((path, 'cron', 'GlennR cron job (auto-generated)'))
+    if (os.path.isfile(GLENNR_REMOVABLE_CRON_GENERIC)
+            and _cron_d_certbot_invokes_glennr(GLENNR_REMOVABLE_CRON_GENERIC)):
+        detected.append((
+            GLENNR_REMOVABLE_CRON_GENERIC, 'cron',
+            'apt-installed certbot cron (replaced by /etc/cron.d/unifi-cert)',
+        ))
+    for pattern in GLENNR_REMOVABLE_HOOK_GLOBS:
+        for path in sorted(glob.glob(pattern)):
+            if os.path.isfile(path):
+                detected.append((path, 'hook', 'GlennR renewal hook'))
+    for src in GLENNR_REMOVABLE_APT_SOURCES:
+        if os.path.isfile(src):
+            detected.append((src, 'apt-source', 'GlennR apt source'))
+
+    inv.detected_paths = detected
+    return inv
+
+
+def import_provisioning_from_glennr(inv: GlennRInventory) -> bool:
+    """Persist GlennR-derived provisioning under /data/unifi-cert/.
+
+    Writes unifi-cert.conf with the inventory fields and copies the DNS
+    credentials file (if accessible) to /data/unifi-cert/credentials/.
+    Refuses when the inventory lacks domain + dns_provider — those are the
+    minimum required for cron-fired --renew to work.
+    """
+    if not (inv.domain and inv.dns_provider):
+        ui.error('Inventory incomplete: cannot import without domain + dns_provider.')
+        return False
+
+    new_creds_path = os.path.join(CREDENTIALS_DIR, f'{inv.dns_provider}.ini')
+    if inv.dns_credentials_path and os.path.exists(inv.dns_credentials_path):
+        try:
+            os.makedirs(CREDENTIALS_DIR, mode=0o700, exist_ok=True)
+            shutil.copy(inv.dns_credentials_path, new_creds_path)
+            os.chmod(new_creds_path, 0o600)
+            ui.success(f'Copied credentials to {new_creds_path}')
+        except OSError as e:
+            ui.error(f'Failed to copy credentials: {e}')
+            return False
+    elif inv.dns_credentials_path:
+        ui.warning(
+            f'Credentials path {inv.dns_credentials_path} does not exist; '
+            'config will reference it but credentials must be restored manually.'
+        )
+        new_creds_path = inv.dns_credentials_path
+
+    return save_provisioning_config(
+        domain=inv.domain,
+        email=inv.email or '',
+        dns_provider=inv.dns_provider,
+        dns_credentials=new_creds_path,
+    )
+
+
+def snapshot_glennr(inv: GlennRInventory,
+                     timestamp: Optional[str] = None) -> Optional[str]:
+    """Tar everything that would be removed plus /etc/letsencrypt/ into BACKUPS_DIR.
+
+    Recovery is `tar xzf <tarball>` from /. Returns the tarball path on
+    success, None on failure (no removals should follow a snapshot failure).
+    """
+    timestamp = timestamp or datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    try:
+        os.makedirs(BACKUPS_DIR, mode=0o755, exist_ok=True)
+    except OSError as e:
+        ui.error(f'Failed to create backups dir: {e}')
+        return None
+    tarball = os.path.join(BACKUPS_DIR, f'{timestamp}.tar.gz')
+
+    paths = [p for (p, _, _) in inv.detected_paths if os.path.exists(p)]
+    if os.path.isdir('/etc/letsencrypt'):
+        paths.append('/etc/letsencrypt')
+    if not paths:
+        ui.warning('No GlennR paths to snapshot.')
+        return None
+
+    cmd = ['tar', 'czf', tarball, *paths]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.error(f'tar errored: {e}')
+        return None
+    if result.returncode != 0:
+        ui.error(f'tar failed: {result.stderr.strip()}')
+        return None
+    ui.success(f'Snapshot: {tarball}')
+    return tarball
+
+
+def _rsync_etc_letsencrypt() -> bool:
+    """rsync /etc/letsencrypt/ → /data/unifi-cert/letsencrypt/ preserving symlinks.
+
+    Trailing slash on the source means contents-only; we don't end up with
+    a nested letsencrypt/letsencrypt/ subtree. -aH preserves perms, links,
+    times, and hardlinks (live/ is a symlink farm into archive/).
+    """
+    src = '/etc/letsencrypt/'
+    dst = CERTBOT_CONFIG_DIR + '/'
+    if not os.path.isdir(src):
+        ui.warning(f'{src} not present; nothing to migrate.')
+        return True
+    try:
+        os.makedirs(CERTBOT_CONFIG_DIR, mode=0o755, exist_ok=True)
+    except OSError as e:
+        ui.error(f'Failed to create {CERTBOT_CONFIG_DIR}: {e}')
+        return False
+    cmd = ['rsync', '-aH', src, dst]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.error(f'rsync errored: {e}')
+        return False
+    if result.returncode != 0:
+        ui.error(f'rsync failed: {result.stderr.strip()}')
+        return False
+    ui.success(f'Migrated /etc/letsencrypt/ → {CERTBOT_CONFIG_DIR}/')
+    return True
+
+
+def _remove_glennr_path(path: str, kind: str, force: bool) -> bool:
+    """Remove a single GlennR path with per-path confirmation unless --force.
+
+    Returns True on success or graceful skip; False on filesystem error.
+    """
+    if not force:
+        if not ui.confirm(f'Remove {kind} {path}?', default=False):
+            ui.info(f'Skipped {path}')
+            return True
+    try:
+        if kind == 'dir':
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    except OSError as e:
+        ui.error(f'Failed to remove {path}: {e}')
+        return False
+    ui.success(f'Removed {path}')
+    return True
+
+
+def migrate_glennr(dry_run: bool = False, force: bool = False) -> bool:
+    """Full GlennR-to-unifi-cert migration.
+
+    Order: inventory → import provisioning → snapshot → rsync LE state →
+    allowlisted uninstall → self_heal (bootstrap + cron + hook + boot).
+    --dry-run lists planned actions and performs nothing destructive.
+    --force skips the per-path confirmation prompts.
+    """
+    ui.header('GlennR migration')
+
+    inv = inventory_glennr()
+
+    has_le = os.path.isdir('/etc/letsencrypt')
+    if not inv.detected_paths and not has_le:
+        ui.info('No GlennR footprint detected; nothing to migrate.')
+        return True
+
+    ui.info(f'Domain:         {inv.domain or "(unknown)"}')
+    ui.info(f'Email:          {inv.email or "(unknown)"}')
+    ui.info(f'DNS provider:   {inv.dns_provider or "(unknown)"}')
+    ui.info(f'GlennR version: {inv.glennr_version or "(unknown)"}')
+    ui.info(f'Removable GlennR paths: {len(inv.detected_paths)}')
+
+    if dry_run:
+        for path, kind, reason in inv.detected_paths:
+            ui.info(f'  [dry-run] {kind:11s} {path}  ({reason})')
+        if has_le:
+            ui.info(f'  [dry-run] would rsync /etc/letsencrypt/ → {CERTBOT_CONFIG_DIR}/')
+            ui.info(f'  [dry-run] would remove /etc/letsencrypt/ after verification')
+        ui.info(f'  [dry-run] would import provisioning to {PROVISIONING_CONFIG}')
+        ui.info(f'  [dry-run] would snapshot to {BACKUPS_DIR}/<timestamp>.tar.gz')
+        ui.info(f'  [dry-run] would run --self-heal (bootstrap + cron + hook + boot)')
+        return True
+
+    # 1. Import provisioning first — if this fails the rest is pointless.
+    if not import_provisioning_from_glennr(inv):
+        ui.error('Failed to import provisioning from GlennR; aborting.')
+        return False
+
+    # 2. Snapshot — must happen before any deletion.
+    timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    if snapshot_glennr(inv, timestamp) is None:
+        ui.error('Snapshot failed; aborting before any destructive change.')
+        return False
+
+    # 3. Migrate LE state to the persistent root.
+    if has_le and not _rsync_etc_letsencrypt():
+        ui.error('LE state migration failed; aborting before deletion.')
+        return False
+
+    # 4. Verify the new path has the lineage before we delete the old one.
+    skip_le_dir_deletion = False
+    if has_le and inv.domain:
+        new_fullchain = os.path.join(CERTBOT_CONFIG_DIR, 'live', inv.domain, 'fullchain.pem')
+        if not os.path.exists(new_fullchain):
+            ui.warning(
+                f'Migrated lineage missing {new_fullchain}; '
+                'will skip /etc/letsencrypt/ deletion as a safety net.'
+            )
+            skip_le_dir_deletion = True
+
+    # 5. Per-path uninstall (allowlisted, with confirms unless --force).
+    for path, kind, _ in inv.detected_paths:
+        _remove_glennr_path(path, kind, force=force)
+
+    if has_le and not skip_le_dir_deletion:
+        _remove_glennr_path('/etc/letsencrypt', 'dir', force=force)
+
+    # 6. Bootstrap + schedule + hook + boot via self_heal().
+    self_heal(dns_provider=inv.dns_provider, domain=inv.domain)
+
+    ui.success('GlennR migration complete.')
+    return True
 
 
 # =============================================================================
@@ -2080,6 +2442,11 @@ Examples:
     parser.add_argument('--enable-hook-autoupdate', action='store_true',
                        help='Re-enable the renewal hook GitHub auto-update path '
                             '(default off). Requires a baked-in SHA-256 pin.')
+    parser.add_argument('--migrate-glennr', action='store_true',
+                       help='Import GlennR provisioning, snapshot, rsync '
+                            '/etc/letsencrypt → /data/unifi-cert/letsencrypt, '
+                            'and uninstall GlennR\'s footprint. Use --dry-run '
+                            'to preview, --force to skip per-path confirms.')
 
     # Operation modifiers
     parser.add_argument('--dry-run', action='store_true',
@@ -2214,6 +2581,7 @@ def main() -> int:
     # deploy-hooks, and on_boot.d invoke us, never a human.
     automation_verb = (
         args.renew or args.deploy_hook or args.self_heal or args.bootstrap
+        or args.migrate_glennr
     )
 
     # Determine if we should run interactive mode
@@ -2327,6 +2695,13 @@ def main() -> int:
     # any other automation context.
     if args.self_heal:
         ok = self_heal(dns_provider=args.dns_provider, domain=args.domain)
+        return 0 if ok else 1
+
+    # GlennR migration. Inventory → import provisioning → snapshot → rsync LE
+    # state → allowlisted uninstall → self-heal. --dry-run lists planned
+    # actions; --force skips per-path confirms.
+    if args.migrate_glennr:
+        ok = migrate_glennr(dry_run=args.dry_run, force=args.force)
         return 0 if ok else 1
 
     # Renewal entry point (cron-fired). Pipeline:
