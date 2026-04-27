@@ -127,8 +127,17 @@ Installation Options:
   --host HOST                Remote UniFi device IP/hostname
 
 Renewal Options:
-  --renew                    Renew existing certificate
+  --renew                    Cron entry point. Acquires lock, runs self-heal,
+                             checks expiry, runs ACME if due, syncs to UniFi.
+  --deploy-hook              certbot post-renewal hook entry. Reads
+                             $RENEWED_LINEAGE and syncs that lineage only.
+  --self-heal                Idempotent repair: ensure venv + cron + hook +
+                             boot script. Never runs ACME.
   --setup-hook               Set up certbot renewal hook
+  --bootstrap                Build/repair the persistent certbot venv at
+                             /data/unifi-cert/certbot-venv
+  --enable-hook-autoupdate   Re-enable the renewal hook GitHub auto-update
+                             path (default off; requires SHA-256 pin)
 
 Modifiers:
   --dry-run                  Test without making changes
@@ -168,23 +177,34 @@ UniFi OS stores certificates in two places that must stay synchronized:
 
 ### Automatic Renewal
 
-When you obtain a certificate using this tool, it automatically installs a renewal hook at `/etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh`. This ensures that when certbot auto-renews your certificate (typically 30 days before expiry), the new cert is automatically synced to both the EUS paths and PostgreSQL, keeping the WebUI in sync.
+When you obtain a certificate locally with this tool, it sets up the full renewal pipeline:
 
-The renewal hook:
-- Attempts to download the latest script from GitHub (self-updating)
-- Falls back to existing script if download fails (resilient to network issues)
-- Saves to `/data/scripts/unifi-cert.py` (persistent across firmware updates)
-- Syncs the renewed cert to UniFi
+- **Daily cron** at `/etc/cron.d/unifi-cert` runs `unifi-cert.py --renew` once a day. `--renew` acquires a lock, self-heals (rebuilds venv / cron / hook if anything was wiped by a firmware update), checks expiry, and only calls Let's Encrypt when the cert is within 30 days of expiry.
+- **certbot post-renewal hook** at `/etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh` runs `unifi-cert.py --deploy-hook` whenever certbot itself renews a lineage. The hook reads `$RENEWED_LINEAGE` from certbot's environment and syncs that lineage to the EUS paths and PostgreSQL.
+- **Persistent product root** at `/data/unifi-cert/` holds everything that needs to survive UniFi OS firmware updates: certbot venv (`certbot-venv/`), Let's Encrypt state (`letsencrypt/`), wheel cache (`wheels/`), provisioning config (`unifi-cert.conf`), credentials (`credentials/`), and the renewal log (`unifi-cert.log`).
+- **Provisioning config** at `/data/unifi-cert/unifi-cert.conf` records domain, email, DNS provider, and credentials path so cron-fired `--renew` (no flags) can self-configure.
 
-Certbot's renewal runs automatically via systemd timer. You can verify the hook:
+The hook does **not** download a fresh copy of the script from GitHub on every renewal. That auto-update behavior is opt-in via `--setup-hook --enable-hook-autoupdate` and requires a SHA-256 pin baked into `unifi-cert.py`; the hook then verifies the download against the pin before atomic-replacing the script. By default the hook simply runs the locally installed script.
+
+Verify the install:
 
 ```bash
-cat /etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh
+ssh root@192.168.1.1 cat /etc/cron.d/unifi-cert
+ssh root@192.168.1.1 cat /etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh
+ssh root@192.168.1.1 ls /data/unifi-cert/
 ```
 
-To manually test renewal sync:
+Force a renewal pass without waiting for the next day:
+
 ```bash
-/data/scripts/unifi-cert.py --renew -d your-domain.com
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --renew --force
+```
+
+Or just the post-renewal sync (no ACME) for an existing lineage:
+
+```bash
+ssh root@192.168.1.1 'RENEWED_LINEAGE=/data/unifi-cert/letsencrypt/live/your-domain.com \
+  /data/scripts/unifi-cert.py --deploy-hook'
 ```
 
 ## Supported Devices

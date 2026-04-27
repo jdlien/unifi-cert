@@ -21,19 +21,53 @@ This tool replaces GlennR's 6000-line `unifi-easy-encrypt.sh` bash script with a
 ## Architecture
 
 ```
-unifi-cert.py (~1300 lines)
-├── CONFIGURATION      - DNS providers, paths, constants
-├── UI LAYER           - ANSI colors, spinners, prompts
-├── CERTIFICATE META   - OpenSSL metadata extraction
-├── IP LOOKUP          - Multi-provider fallback (unused currently, for future)
-├── DNS CREDENTIALS    - Validation and creation
-├── UNIFI PLATFORM     - Device detection
-├── CERT INSTALLATION  - Local installation logic
-├── POSTGRESQL         - Database updates for WebUI sync
-├── CERTBOT            - Let's Encrypt integration
-├── REMOTE SSH         - SSH/SCP operations
-└── CLI & MAIN         - Argument parsing, interactive mode
+unifi-cert.py (~2500 lines)
+├── CONFIGURATION         - DNS providers, paths, constants (incl. UNIFI_CERT_ROOT)
+├── UI LAYER              - ANSI colors, spinners, prompts
+├── CERTIFICATE META      - OpenSSL metadata extraction
+├── IP LOOKUP             - Multi-provider fallback (unused currently, for future)
+├── CONFIG FILE           - User prefs + provisioning config (/data/unifi-cert/unifi-cert.conf)
+├── DNS CREDENTIALS       - Validation and creation
+├── UNIFI PLATFORM        - Device detection
+├── CERT INSTALLATION     - Local installation logic (incl. UniFi OS 5.x keystore + override)
+├── CERTBOT               - Let's Encrypt integration
+├── CERTBOT BOOTSTRAP     - Persistent venv + apt prereqs (firmware-wipe survival)
+├── SCHEDULE & SELF-HEAL  - cron, boot script, lock, log rotation, renewal-due, self_heal()
+├── REMOTE SSH            - SSH/SCP operations
+└── CLI & MAIN            - Argument parsing, interactive mode, verb dispatch
 ```
+
+## Persistent Root
+
+Everything that needs to survive UniFi OS firmware updates lives under `/data/unifi-cert/`:
+
+```
+/data/unifi-cert/
+├── unifi-cert.conf      # provisioning config (domain, email, dns provider, creds path)
+├── unifi-cert.log       # main log (rotated >1 MB, keep last 100 KB)
+├── unifi-cert.lock      # fcntl.flock — serializes --renew vs --deploy-hook
+├── credentials/         # DNS provider credentials (mode 0600)
+├── letsencrypt/         # certbot --config-dir (accounts, archive, live, renewal)
+├── certbot-venv/        # python -m venv target; CERTBOT_BIN points here
+├── wheels/              # pip-cached wheels for offline rebuild
+├── work/                # certbot --work-dir
+├── logs/                # certbot --logs-dir
+└── backups/<ts>/        # GlennR snapshots (Step 5)
+```
+
+The script itself stays at `/data/scripts/unifi-cert.py` — that path is referenced by cron and the renewal hook.
+
+## Verbs (mutually exclusive)
+
+| Verb | Purpose |
+|---|---|
+| (default, no flags) | obtain-new: bootstrap → certbot → install → cron + hook + provisioning save |
+| `--renew` | cron entry. lock → load provisioning → self_heal → ACME-if-due → install |
+| `--deploy-hook` | certbot post-renewal entry. Reads `$RENEWED_LINEAGE`, syncs that lineage. No ACME. |
+| `--self-heal` | idempotent repair (venv + cron + hook + boot). Never runs ACME. |
+| `--install` | install an existing cert/key pair (local or `--host`) |
+| `--setup-hook` | rewrite the renewal hook (use `--enable-hook-autoupdate` for opt-in autoupdate) |
+| `--bootstrap` | build/repair `/data/unifi-cert/certbot-venv` and exit |
 
 ## UniFi Certificate Paths
 
