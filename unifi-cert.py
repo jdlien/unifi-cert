@@ -12,9 +12,11 @@ License: MIT
 import argparse
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2358,6 +2360,231 @@ fi
 
 
 # =============================================================================
+# STATUS - human-readable health report
+# =============================================================================
+#
+# print_status() composes existing helpers (CertMetadata, certbot venv version,
+# cron / hook / boot-script presence, inventory_glennr(), log tail, lock state)
+# into a one-shot report for "is this device set up correctly?". When --host is
+# passed, the verb is dispatched to the remote device via _dispatch_remote_verb
+# and the output is forwarded back. The local code path is the canonical
+# implementation; the remote path is just SCP+SSH around the same code.
+
+RENEWAL_HOOK_PATH = '/etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh'
+STATUS_LOG_TAIL_LINES = 20
+
+
+def _format_cert_block(meta: 'CertMetadata', source_label: str,
+                        domain: Optional[str]) -> None:
+    """Emit cert metadata + days-remaining + renewal-due as a UI table."""
+    days_remaining = ''
+    try:
+        if meta.valid_to:
+            expiry = datetime.strptime(meta.valid_to, '%Y-%m-%d %H:%M:%S+00')
+            delta = expiry - datetime.utcnow()
+            days_remaining = f'{delta.days} days'
+    except ValueError:
+        days_remaining = '(unparseable)'
+
+    rows = [
+        ('Source', source_label),
+        ('CN', meta.cn or '(unknown)'),
+        ('Issuer', meta.issuer_o or '(unknown)'),
+        ('Valid from', meta.valid_from or '(unknown)'),
+        ('Valid to', meta.valid_to or '(unknown)'),
+        ('Remaining', days_remaining or '(unknown)'),
+        ('SANs', ', '.join(meta.sans) if meta.sans else '(none)'),
+    ]
+    ui.table(rows)
+    if domain:
+        try:
+            due = is_renewal_due(domain)
+            if due:
+                ui.warning(f'Renewal due for {domain} (within 30 days)')
+            else:
+                ui.success(f'Renewal not yet due for {domain}')
+        except Exception as e:
+            ui.debug(f'is_renewal_due() raised: {e}')
+
+
+def _print_certificate_section(domain: Optional[str]) -> bool:
+    """Print certificate metadata block. Returns True if a cert was found."""
+    candidates: list[tuple[str, str]] = []
+    if domain:
+        candidates.append((
+            f'lineage ({CERTBOT_CONFIG_DIR}/live/{domain}/fullchain.pem)',
+            os.path.join(certbot_live_dir(domain), 'fullchain.pem'),
+        ))
+    candidates.append(('EUS cert', UNIFI_PATHS['eus_cert']))
+
+    for label, path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            meta = CertMetadata.from_cert_file(path)
+        except Exception as e:
+            ui.warning(f'Could not parse {path}: {e}')
+            continue
+        _format_cert_block(meta, label, domain)
+        return True
+
+    ui.warning('No certificate found at expected paths')
+    for _, path in candidates:
+        ui.info(f'  tried: {path}')
+    return False
+
+
+def _print_certbot_section() -> None:
+    """Report certbot venv presence + reported version."""
+    if not os.path.exists(CERTBOT_BIN):
+        ui.warning(f'Certbot venv missing: {CERTBOT_BIN}')
+        return
+    try:
+        result = subprocess.run(
+            [CERTBOT_BIN, '--version'],
+            capture_output=True, text=True, timeout=10,
+        )
+        version = (result.stdout or result.stderr).strip() or '(no output)'
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.warning(f'Certbot venv at {CERTBOT_BIN} but failed to run: {e}')
+        return
+    ui.success(f'Certbot venv: {CERTBOT_BIN}')
+    ui.info(f'  {version}')
+
+
+def _print_schedule_section() -> None:
+    """Cron file, renewal hook, on_boot.d boot script."""
+    if os.path.exists(CRON_FILE):
+        ui.success(f'Cron: {CRON_FILE}')
+        try:
+            with open(CRON_FILE, 'r', encoding='utf-8') as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith('#'):
+                        ui.info(f'  {stripped}')
+        except OSError as e:
+            ui.warning(f'Could not read cron file: {e}')
+    else:
+        ui.warning(f'Cron missing: {CRON_FILE}')
+
+    if os.path.exists(RENEWAL_HOOK_PATH):
+        ui.success(f'Renewal hook: {RENEWAL_HOOK_PATH}')
+    else:
+        ui.warning(f'Renewal hook missing: {RENEWAL_HOOK_PATH}')
+
+    if os.path.exists(BOOT_SCRIPT_PATH):
+        ui.success(f'Boot script: {BOOT_SCRIPT_PATH}')
+    elif os.path.isdir(BOOT_SCRIPT_DIR):
+        ui.warning(f'Boot script missing: {BOOT_SCRIPT_PATH}')
+    else:
+        ui.info(f'Boot script: skipped ({BOOT_SCRIPT_DIR} not present)')
+
+
+def _print_lock_section() -> None:
+    """Lock file mtime + held/idle state."""
+    if not os.path.exists(LOCK_FILE):
+        ui.info('Lock file: not present (no renewal has acquired it)')
+        return
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(LOCK_FILE)).isoformat(
+            timespec='seconds'
+        )
+    except OSError:
+        mtime = '(unknown)'
+    held = False
+    try:
+        fh = acquire_lock(timeout=0)
+    except BlockingIOError:
+        held = True
+    else:
+        release_lock(fh)
+    state = 'HELD (renewal in progress)' if held else 'idle'
+    ui.info(f'Lock file: {LOCK_FILE} ({state}, mtime {mtime})')
+
+
+def _print_glennr_section() -> None:
+    """GlennR residue scan via inventory_glennr()."""
+    inv = inventory_glennr()
+    if not inv.detected_paths:
+        ui.success('No GlennR residue detected')
+        return
+    ui.warning(f'{len(inv.detected_paths)} GlennR path(s) still present:')
+    for path, kind, _ in inv.detected_paths:
+        ui.info(f'  {kind:11s} {path}')
+    ui.info('Run --migrate-glennr to import provisioning + clean up.')
+
+
+def _print_log_tail_section() -> None:
+    """Last STATUS_LOG_TAIL_LINES of LOG_FILE."""
+    if not os.path.exists(LOG_FILE):
+        ui.info(f'No log file at {LOG_FILE} yet')
+        return
+    try:
+        with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as fh:
+            lines = fh.readlines()
+    except OSError as e:
+        ui.warning(f'Could not read log: {e}')
+        return
+    if not lines:
+        ui.info(f'{LOG_FILE} is empty')
+        return
+    tail = lines[-STATUS_LOG_TAIL_LINES:]
+    ui.info(f'{LOG_FILE} (last {len(tail)} lines):')
+    for line in tail:
+        print(f'    {line.rstrip()}')
+
+
+def print_status(host: Optional[str] = None,
+                  args: Optional[argparse.Namespace] = None) -> int:
+    """Print a human-readable status report.
+
+    Local mode (host=None): inspect the current device's cert state, certbot
+    venv, cron/hook/boot script, lock state, GlennR residue, and log tail.
+    Remote mode (host=...): SCP the script to the device if needed and
+    SSH-execute `--status` there, forwarding stdout back to the caller.
+    """
+    if host:
+        if args is None:
+            args = argparse.Namespace(
+                domain=None, email=None, dns_provider=None, dns_credentials=None,
+                dry_run=False, force=False, verbose=False, no_color=False,
+                propagation=60,
+            )
+        return dispatch_remote_verb('--status', host, args)
+
+    ui.header('UniFi Certificate Status')
+
+    cfg = load_provisioning_config()
+    domain = cfg.get('domain') or detect_domain_from_cert()
+    ui.table([
+        ('Domain', cfg.get('domain') or '(unset)'),
+        ('Email', cfg.get('email') or '(unset)'),
+        ('DNS provider', cfg.get('dns_provider') or '(unset)'),
+        ('DNS credentials', cfg.get('dns_credentials') or '(unset)'),
+        ('Provisioning config', PROVISIONING_CONFIG
+            if os.path.exists(PROVISIONING_CONFIG) else '(missing)'),
+    ])
+
+    ui.header('Certificate')
+    _print_certificate_section(domain)
+
+    ui.header('Certbot')
+    _print_certbot_section()
+
+    ui.header('Schedule & hooks')
+    _print_schedule_section()
+    _print_lock_section()
+
+    ui.header('GlennR residue')
+    _print_glennr_section()
+
+    ui.header('Log tail')
+    _print_log_tail_section()
+
+    return 0
+
+
+# =============================================================================
 # REMOTE SSH OPERATIONS
 # =============================================================================
 
@@ -2386,6 +2613,172 @@ def scp_file(local_path: str, host: str, remote_path: str) -> bool:
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
+
+
+# Verbs supported via --host. --install is intentionally absent — it has its
+# own remote path (install_certificate_remote) that streams cert+key by SCP.
+REMOTE_DISPATCH_VERBS = (
+    '--status', '--renew', '--self-heal', '--migrate-glennr',
+    '--ddns-update', '--bootstrap', '--setup-hook',
+)
+
+
+def _local_script_path() -> Optional[str]:
+    """Return absolute path to the running script, or None when curl-piped.
+
+    Pipe-from-stdin invocations have no real __file__ to upload, so remote
+    dispatch refuses to run rather than silently using a stale device-side
+    copy.
+    """
+    if '__file__' not in globals():
+        return None
+    candidate = os.path.abspath(__file__)
+    if not os.path.isfile(candidate):
+        return None
+    return candidate
+
+
+def _file_sha256(path: str) -> str:
+    """Hex SHA-256 of a file, or '' on read error."""
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as fh:
+            for chunk in iter(lambda: fh.read(65536), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ''
+
+
+def ensure_remote_script(host: str, local_path: Optional[str] = None) -> bool:
+    """SCP the local script to PERMANENT_SCRIPT_PATH on host when sha differs.
+
+    Compares the local sha256 against the remote sha256. If they match, no
+    upload is needed. Creates the parent directory and chmod's 0755 after
+    upload. Returns False if no usable local script exists, the SSH probe
+    fails, or the SCP fails.
+    """
+    if local_path is None:
+        local_path = _local_script_path()
+    if not local_path:
+        ui.error('Cannot determine local script path (was the script piped from stdin?). '
+                 'Clone the repo and run from a checked-out unifi-cert.py.')
+        return False
+
+    local_sha = _file_sha256(local_path)
+    if not local_sha:
+        ui.error(f'Could not hash local script: {local_path}')
+        return False
+
+    success, output = run_remote(
+        host,
+        f'sha256sum {shlex.quote(PERMANENT_SCRIPT_PATH)} 2>/dev/null',
+        timeout=15,
+    )
+    remote_sha = ''
+    if success and output:
+        parts = output.strip().split()
+        if parts:
+            remote_sha = parts[0]
+
+    if remote_sha == local_sha:
+        ui.debug(f'Remote script up-to-date on {host} (sha256 {local_sha[:12]}…)')
+        return True
+
+    ui.status(f'Deploying script to {host}:{PERMANENT_SCRIPT_PATH}')
+    mkdir_ok, _ = run_remote(
+        host,
+        f'mkdir -p {shlex.quote(os.path.dirname(PERMANENT_SCRIPT_PATH))}',
+        timeout=10,
+    )
+    if not mkdir_ok:
+        ui.error(f'Could not create remote script dir on {host}')
+        return False
+    if not scp_file(local_path, host, PERMANENT_SCRIPT_PATH):
+        ui.error(f'SCP to {host}:{PERMANENT_SCRIPT_PATH} failed')
+        return False
+    chmod_ok, _ = run_remote(host, f'chmod 0755 {shlex.quote(PERMANENT_SCRIPT_PATH)}',
+                              timeout=10)
+    if not chmod_ok:
+        ui.warning(f'Uploaded script but chmod failed on {host}')
+    ui.success(f'Deployed (sha256 {local_sha[:12]}…)')
+    return True
+
+
+def _build_remote_command(verb: str, args: argparse.Namespace) -> str:
+    """Build the shell command string sent over SSH for a remote verb.
+
+    Forwards the curated set of args that make sense across verbs. String-
+    valued flags are shlex-quoted; flag-only switches pass-through. The
+    --no-color flag is always appended so remote stdout is plain text.
+    """
+    parts: list[str] = ['/usr/bin/python3', PERMANENT_SCRIPT_PATH, verb]
+
+    string_flags = (
+        ('-d', getattr(args, 'domain', None)),
+        ('-e', getattr(args, 'email', None)),
+        ('--dns-provider', getattr(args, 'dns_provider', None)),
+        ('--dns-credentials', getattr(args, 'dns_credentials', None)),
+    )
+    for flag, value in string_flags:
+        if value:
+            parts.extend([flag, str(value)])
+
+    bool_flags = (
+        ('--dry-run', getattr(args, 'dry_run', False)),
+        ('--force', getattr(args, 'force', False)),
+        ('--skip-postgres', getattr(args, 'skip_postgres', False)),
+        ('--skip-restart', getattr(args, 'skip_restart', False)),
+        ('-v', getattr(args, 'verbose', False)),
+    )
+    for flag, value in bool_flags:
+        if value:
+            parts.append(flag)
+
+    # Always strip ANSI on the remote so we forward plain text.
+    parts.append('--no-color')
+
+    return ' '.join(shlex.quote(p) for p in parts)
+
+
+def dispatch_remote_verb(verb: str, host: str, args: argparse.Namespace,
+                          timeout: int = 600) -> int:
+    """SCP-then-SSH a verb to a remote UniFi device.
+
+    Refuses --migrate-glennr without --dry-run/--force (no TTY for prompts).
+    Returns the verb's exit status (0 on success, 1 on failure).
+    """
+    if verb not in REMOTE_DISPATCH_VERBS:
+        ui.error(f'Verb not supported for remote dispatch: {verb}')
+        return 1
+
+    if verb == '--migrate-glennr' and not (
+        getattr(args, 'dry_run', False) or getattr(args, 'force', False)
+    ):
+        ui.error(
+            'Remote --migrate-glennr requires --dry-run or --force '
+            '(SSH session has no TTY for confirmation prompts).'
+        )
+        return 1
+
+    # SSH sanity probe before bothering with hashing/upload.
+    success, _ = run_remote(host, 'true', timeout=10)
+    if not success:
+        ui.error(f'Cannot SSH to {host} (is the host up and your key authorized?)')
+        return 1
+
+    if not ensure_remote_script(host):
+        return 1
+
+    cmd = _build_remote_command(verb, args)
+    ui.status(f'Running on {host}: {verb}')
+    success, output = run_remote(host, cmd, timeout=timeout)
+    if output:
+        # Forward remote output verbatim. Strip a trailing newline so we
+        # don't double up with print()'s own newline.
+        sys.stdout.write(output if output.endswith('\n') else output + '\n')
+        sys.stdout.flush()
+    return 0 if success else 1
 
 
 def install_certificate_remote(
@@ -2634,6 +3027,10 @@ Examples:
     parser.add_argument('--ddns-update', action='store_true',
                        help='Refresh the cert hostname A record at the DNS '
                             'provider to current public IP. DigitalOcean only.')
+    parser.add_argument('--status', action='store_true',
+                       help='Print a health report (cert, certbot venv, cron, '
+                            'hook, GlennR residue, log tail). Combine with '
+                            '--host to inspect a remote device.')
 
     # Operation modifiers
     parser.add_argument('--dry-run', action='store_true',
@@ -2763,6 +3160,33 @@ def main() -> int:
     ui = UI(color=not args.no_color, verbose=args.verbose)
 
     ui.header('UniFi Certificate Manager')
+
+    # Remote dispatch short-circuit. Verbs in REMOTE_DISPATCH_VERBS combined
+    # with --host SCP the script to the device (when sha differs) and SSH-
+    # execute the verb there, then forward stdout back. --install has its
+    # own remote path and is intentionally excluded.
+    if args.host:
+        remote_verb = None
+        if args.status:
+            remote_verb = '--status'
+        elif args.renew:
+            remote_verb = '--renew'
+        elif args.self_heal:
+            remote_verb = '--self-heal'
+        elif args.migrate_glennr:
+            remote_verb = '--migrate-glennr'
+        elif args.ddns_update:
+            remote_verb = '--ddns-update'
+        elif args.bootstrap:
+            remote_verb = '--bootstrap'
+        elif args.setup_hook:
+            remote_verb = '--setup-hook'
+        if remote_verb:
+            return dispatch_remote_verb(remote_verb, args.host, args)
+
+    # Status report (local). Compose existing helpers — no side effects.
+    if args.status:
+        return print_status()
 
     # Automation verbs run non-interactively even on a TTY — cron, certbot
     # deploy-hooks, and on_boot.d invoke us, never a human.

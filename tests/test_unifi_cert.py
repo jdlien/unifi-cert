@@ -13,6 +13,7 @@ Tests are organized by module/functionality matching the structure in unifi-cert
 10. CLI & Main
 """
 
+import argparse
 import importlib.util
 import json
 import os
@@ -4914,3 +4915,421 @@ class TestMainDdnsUpdate:
              patch.object(unifi_cert, 'ddns_update', return_value=True):
             result = unifi_cert.main()
         assert result == 0
+
+
+# =============================================================================
+# STATUS REPORT
+# =============================================================================
+
+@pytest.fixture
+def status_paths(tmp_path):
+    """Patch all status-relevant module paths into tmp_path subdirs.
+
+    Lets print_status() probe a controlled filesystem so individual states
+    (empty / healthy / GlennR-residue) can be set up by writing into the
+    tmp paths the test owns.
+    """
+    cert_root = tmp_path / 'unifi-cert'
+    cert_root.mkdir()
+    eus_dir = tmp_path / 'eus_certificates'
+    eus_dir.mkdir()
+    cron_dir = tmp_path / 'cron.d'
+    cron_dir.mkdir()
+    hook_dir = tmp_path / 'renewal-hooks' / 'post'
+    hook_dir.mkdir(parents=True)
+
+    overrides = {
+        'UNIFI_CERT_ROOT': str(cert_root),
+        'CERTBOT_BIN': str(cert_root / 'certbot-venv' / 'bin' / 'certbot'),
+        'CERTBOT_CONFIG_DIR': str(cert_root / 'letsencrypt'),
+        'CRON_FILE': str(cron_dir / 'unifi-cert'),
+        'RENEWAL_HOOK_PATH': str(hook_dir / 'unifi-cert-hook.sh'),
+        'BOOT_SCRIPT_DIR': str(tmp_path / 'on_boot.d'),
+        'BOOT_SCRIPT_PATH': str(tmp_path / 'on_boot.d' / '15-unifi-cert.sh'),
+        'LOCK_FILE': str(cert_root / 'unifi-cert.lock'),
+        'LOG_FILE': str(cert_root / 'unifi-cert.log'),
+        'PROVISIONING_CONFIG': str(cert_root / 'unifi-cert.conf'),
+    }
+
+    unifi_paths = dict(unifi_cert.UNIFI_PATHS)
+    unifi_paths['eus_cert'] = str(eus_dir / 'unifi-os.crt')
+    unifi_paths['eus_key'] = str(eus_dir / 'unifi-os.key')
+
+    with patch.multiple(unifi_cert, **overrides), \
+         patch.object(unifi_cert, 'UNIFI_PATHS', unifi_paths):
+        yield {**overrides, 'UNIFI_PATHS': unifi_paths,
+               'tmp_path': tmp_path, 'cert_root': cert_root}
+
+
+class TestPrintStatus:
+    """Tests for print_status() local mode."""
+
+    def test_empty_device_reports_all_missing(self, status_paths, capsys):
+        """Nothing set up → certbot/cron/hook/log all flagged missing."""
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=unifi_cert.GlennRInventory()), \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            rc = unifi_cert.print_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert 'No certificate found' in out
+        assert 'Certbot venv missing' in out
+        assert 'Cron missing' in out
+        assert 'Renewal hook missing' in out
+        assert 'No GlennR residue' in out
+        assert 'No log file' in out
+
+    def test_glennr_residue_reported(self, status_paths, capsys):
+        """When inventory finds paths, --status warns and lists them."""
+        inv = unifi_cert.GlennRInventory()
+        inv.detected_paths = [
+            ('/srv/EUS', 'dir', 'GlennR data directory'),
+            ('/etc/cron.d/eus_script', 'cron', 'GlennR cron job'),
+        ]
+        with patch.object(unifi_cert, 'inventory_glennr', return_value=inv), \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            rc = unifi_cert.print_status()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert '2 GlennR path(s) still present' in out
+        assert '/srv/EUS' in out
+        assert '/etc/cron.d/eus_script' in out
+        assert '--migrate-glennr' in out
+
+    def test_healthy_device_shows_cert_and_schedule(self, status_paths, capsys):
+        """Cert + cron + hook present → success indicators all populated."""
+        # Provisioning config
+        with open(status_paths['PROVISIONING_CONFIG'], 'w') as fh:
+            fh.write(
+                'domain=example.com\n'
+                'email=admin@example.com\n'
+                'dns_provider=digitalocean\n'
+                'dns_credentials=/data/unifi-cert/credentials/digitalocean.ini\n'
+            )
+        # EUS cert file (content irrelevant; we mock CertMetadata.from_cert_file)
+        with open(status_paths['UNIFI_PATHS']['eus_cert'], 'w') as fh:
+            fh.write('-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n')
+        # Cron + hook + log file
+        with open(status_paths['CRON_FILE'], 'w') as fh:
+            fh.write('# UniFi cert auto-renewal + DDNS\n')
+            fh.write('17 3 * * * root /usr/bin/python3 /data/scripts/unifi-cert.py --renew\n')
+        with open(status_paths['RENEWAL_HOOK_PATH'], 'w') as fh:
+            fh.write('#!/bin/bash\n# unifi-cert hook\n')
+        with open(status_paths['LOG_FILE'], 'w') as fh:
+            fh.write('2026-04-27 00:00:00 INFO renewal complete\n')
+        # Certbot venv
+        certbot_bin = status_paths['CERTBOT_BIN']
+        os.makedirs(os.path.dirname(certbot_bin), exist_ok=True)
+        with open(certbot_bin, 'w') as fh:
+            fh.write('#!/bin/sh\necho "certbot 2.10.0"\n')
+        os.chmod(certbot_bin, 0o755)
+
+        # Synthetic CertMetadata: still in the future so renewal is not due.
+        future = (datetime.utcnow().replace(microsecond=0)).strftime(
+            '%Y-%m-%d %H:%M:%S+00')
+        future = '2099-01-01 00:00:00+00'
+        meta = unifi_cert.CertMetadata(
+            cn='example.com', issuer_c='US', issuer_o="Let's Encrypt",
+            issuer_cn='R3', sans=['example.com'],
+            valid_from='2026-01-01 00:00:00+00', valid_to=future,
+            serial='ABCD', fingerprint='AA:BB',
+        )
+
+        def fake_subprocess_run(cmd, *args, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = 'certbot 2.10.0'
+            result.stderr = ''
+            return result
+
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=unifi_cert.GlennRInventory()), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file',
+                          return_value=meta), \
+             patch.object(unifi_cert, 'is_renewal_due', return_value=False), \
+             patch('subprocess.run', side_effect=fake_subprocess_run), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            rc = unifi_cert.print_status()
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert 'example.com' in out
+        assert "Let's Encrypt" in out
+        assert 'Renewal not yet due' in out
+        assert 'certbot 2.10.0' in out
+        assert 'Cron: ' in out
+        assert 'Renewal hook: ' in out
+        assert 'No GlennR residue' in out
+        assert 'renewal complete' in out  # log tail
+
+    def test_remote_dispatches_via_ssh(self, status_paths):
+        """print_status(host=X) skips local probing and calls dispatch_remote_verb."""
+        with patch.object(unifi_cert, 'dispatch_remote_verb',
+                          return_value=0) as disp, \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            rc = unifi_cert.print_status(host='beehive.example.com')
+        assert rc == 0
+        disp.assert_called_once()
+        assert disp.call_args.args[0] == '--status'
+        assert disp.call_args.args[1] == 'beehive.example.com'
+
+    def test_lock_held_state_detected(self, status_paths, capsys):
+        """When the lock is held by another process, --status reports HELD."""
+        # Create a held lock by acquiring it in this process.
+        lock_fh = unifi_cert.acquire_lock(timeout=0)
+        try:
+            with patch.object(unifi_cert, 'inventory_glennr',
+                              return_value=unifi_cert.GlennRInventory()), \
+                 patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
+                 patch.object(unifi_cert, 'ui',
+                              new=unifi_cert.UI(color=False, verbose=False)):
+                unifi_cert.print_status()
+            out = capsys.readouterr().out
+            assert 'HELD' in out
+        finally:
+            unifi_cert.release_lock(lock_fh)
+
+
+class TestRemoteVerbs:
+    """Tests for dispatch_remote_verb() and ensure_remote_script()."""
+
+    def test_unsupported_verb_refused(self):
+        """Verbs outside REMOTE_DISPATCH_VERBS return 1 with an error."""
+        args = argparse.Namespace(domain=None, email=None, dns_provider=None,
+                                  dns_credentials=None, dry_run=False, force=False,
+                                  verbose=False, no_color=False, skip_postgres=False,
+                                  skip_restart=False)
+        with patch.object(unifi_cert, 'ui'):
+            rc = unifi_cert.dispatch_remote_verb('--install', '192.168.1.1', args)
+        assert rc == 1
+
+    def test_migrate_glennr_without_dry_or_force_refused(self):
+        """Remote --migrate-glennr w/o --dry-run/--force refuses (no TTY)."""
+        args = argparse.Namespace(domain=None, email=None, dns_provider=None,
+                                  dns_credentials=None, dry_run=False, force=False,
+                                  verbose=False, no_color=False, skip_postgres=False,
+                                  skip_restart=False)
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote') as rr:
+            rc = unifi_cert.dispatch_remote_verb('--migrate-glennr', 'h', args)
+        assert rc == 1
+        # We should refuse before even probing SSH.
+        rr.assert_not_called()
+
+    def test_migrate_glennr_with_force_proceeds(self):
+        """--migrate-glennr --force passes the dispatch gate."""
+        args = argparse.Namespace(domain='example.com', email=None,
+                                  dns_provider=None, dns_credentials=None,
+                                  dry_run=False, force=True, verbose=False,
+                                  no_color=False, skip_postgres=False,
+                                  skip_restart=False)
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote',
+                          return_value=(True, '')) as rr, \
+             patch.object(unifi_cert, 'ensure_remote_script', return_value=True):
+            rc = unifi_cert.dispatch_remote_verb('--migrate-glennr', 'h', args)
+        assert rc == 0
+        # 'true' probe + the verb command itself = at least 2 calls.
+        assert rr.call_count >= 2
+
+    def test_ssh_probe_failure_returns_1(self):
+        """If `ssh root@host true` fails, no upload is attempted."""
+        args = argparse.Namespace(domain=None, email=None, dns_provider=None,
+                                  dns_credentials=None, dry_run=False, force=False,
+                                  verbose=False, no_color=False, skip_postgres=False,
+                                  skip_restart=False)
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote',
+                          return_value=(False, '')), \
+             patch.object(unifi_cert, 'ensure_remote_script') as ers:
+            rc = unifi_cert.dispatch_remote_verb('--status', 'h', args)
+        assert rc == 1
+        ers.assert_not_called()
+
+    def test_dispatch_runs_verb_and_forwards_output(self, capsys):
+        """Verb command is run via SSH and its stdout is forwarded to caller."""
+        args = argparse.Namespace(domain=None, email=None, dns_provider=None,
+                                  dns_credentials=None, dry_run=False, force=False,
+                                  verbose=False, no_color=False, skip_postgres=False,
+                                  skip_restart=False)
+        captured_cmd = {}
+
+        def fake_run_remote(host, cmd, timeout=30):
+            if cmd == 'true':
+                return True, ''
+            captured_cmd['cmd'] = cmd
+            return True, 'remote status output\n'
+
+        with patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)), \
+             patch.object(unifi_cert, 'run_remote', side_effect=fake_run_remote), \
+             patch.object(unifi_cert, 'ensure_remote_script', return_value=True):
+            rc = unifi_cert.dispatch_remote_verb('--status', 'beehive', args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert 'remote status output' in out
+        assert '--status' in captured_cmd['cmd']
+        assert '--no-color' in captured_cmd['cmd']
+        assert unifi_cert.PERMANENT_SCRIPT_PATH in captured_cmd['cmd']
+
+    def test_build_remote_command_forwards_string_flags(self):
+        """domain/email/dns_provider/dns_credentials are passed through as flags."""
+        args = argparse.Namespace(
+            domain='example.com', email='admin@example.com',
+            dns_provider='digitalocean',
+            dns_credentials='/root/.secrets/certbot/digitalocean.ini',
+            dry_run=False, force=False, verbose=False, no_color=False,
+            skip_postgres=False, skip_restart=False,
+        )
+        cmd = unifi_cert._build_remote_command('--ddns-update', args)
+        assert '--ddns-update' in cmd
+        assert "-d example.com" in cmd
+        assert '-e admin@example.com' in cmd
+        assert '--dns-provider digitalocean' in cmd
+        assert '/root/.secrets/certbot/digitalocean.ini' in cmd
+        assert '--no-color' in cmd
+
+    def test_build_remote_command_forwards_bool_flags(self):
+        """dry_run / force / verbose translate to flag-only switches."""
+        args = argparse.Namespace(
+            domain=None, email=None, dns_provider=None, dns_credentials=None,
+            dry_run=True, force=True, verbose=True, no_color=False,
+            skip_postgres=True, skip_restart=False,
+        )
+        cmd = unifi_cert._build_remote_command('--migrate-glennr', args)
+        assert '--dry-run' in cmd
+        assert '--force' in cmd
+        assert ' -v' in cmd
+        assert '--skip-postgres' in cmd
+        assert '--skip-restart' not in cmd
+
+
+class TestEnsureRemoteScript:
+    """Tests for ensure_remote_script() — sha256 compare + SCP gating."""
+
+    def test_skips_upload_when_sha_matches(self, tmp_path):
+        """Same sha → no scp_file call, returns True."""
+        local = tmp_path / 'unifi-cert.py'
+        local.write_text('print("hi")')
+        local_sha = unifi_cert._file_sha256(str(local))
+
+        def fake_run_remote(host, cmd, timeout=30):
+            if 'sha256sum' in cmd:
+                return True, f'{local_sha}  {unifi_cert.PERMANENT_SCRIPT_PATH}\n'
+            return True, ''
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote', side_effect=fake_run_remote), \
+             patch.object(unifi_cert, 'scp_file') as scp:
+            ok = unifi_cert.ensure_remote_script('h', local_path=str(local))
+        assert ok is True
+        scp.assert_not_called()
+
+    def test_uploads_when_sha_differs(self, tmp_path):
+        """Sha mismatch → mkdir + scp + chmod via run_remote/scp_file."""
+        local = tmp_path / 'unifi-cert.py'
+        local.write_text('print("hi")')
+
+        calls = []
+
+        def fake_run_remote(host, cmd, timeout=30):
+            calls.append(cmd)
+            if 'sha256sum' in cmd:
+                return True, 'deadbeef  somepath\n'  # mismatched
+            return True, ''
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote', side_effect=fake_run_remote), \
+             patch.object(unifi_cert, 'scp_file', return_value=True) as scp:
+            ok = unifi_cert.ensure_remote_script('h', local_path=str(local))
+        assert ok is True
+        scp.assert_called_once()
+        assert any('mkdir -p' in c for c in calls)
+        assert any('chmod' in c for c in calls)
+
+    def test_no_local_script_returns_false(self):
+        """When _local_script_path() returns None (curl-pipe), refuse."""
+        with patch.object(unifi_cert, '_local_script_path', return_value=None), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.ensure_remote_script('h')
+        assert ok is False
+
+    def test_scp_failure_returns_false(self, tmp_path):
+        """SCP returning False → False from ensure_remote_script."""
+        local = tmp_path / 'unifi-cert.py'
+        local.write_text('print("hi")')
+
+        def fake_run_remote(host, cmd, timeout=30):
+            if 'sha256sum' in cmd:
+                return True, 'deadbeef  x\n'
+            return True, ''
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'run_remote', side_effect=fake_run_remote), \
+             patch.object(unifi_cert, 'scp_file', return_value=False):
+            ok = unifi_cert.ensure_remote_script('h', local_path=str(local))
+        assert ok is False
+
+
+class TestMainStatusCli:
+    """Tests for the --status CLI dispatch and --host short-circuit."""
+
+    def test_status_local(self):
+        """`--status` with no --host calls print_status() locally."""
+        with patch('sys.argv', ['unifi-cert', '--status']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'print_status', return_value=0) as ps:
+            rc = unifi_cert.main()
+        assert rc == 0
+        ps.assert_called_once_with()
+
+    def test_status_remote_dispatches(self):
+        """`--status --host X` short-circuits to dispatch_remote_verb."""
+        with patch('sys.argv', ['unifi-cert', '--status',
+                                '--host', 'beehive.example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'dispatch_remote_verb',
+                          return_value=0) as disp:
+            rc = unifi_cert.main()
+        assert rc == 0
+        disp.assert_called_once()
+        assert disp.call_args.args[0] == '--status'
+        assert disp.call_args.args[1] == 'beehive.example.com'
+
+    def test_renew_with_host_dispatches_remotely(self):
+        """`--renew --host X` runs the verb on the remote, not locally."""
+        with patch('sys.argv', ['unifi-cert', '--renew',
+                                '--host', 'beehive.example.com',
+                                '-d', 'example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'dispatch_remote_verb',
+                          return_value=0) as disp, \
+             patch.object(unifi_cert, 'rotate_log') as rot:
+            rc = unifi_cert.main()
+        assert rc == 0
+        disp.assert_called_once()
+        # We should NOT have started the local renew pipeline.
+        rot.assert_not_called()
+
+    def test_self_heal_with_host_dispatches_remotely(self):
+        """`--self-heal --host X` dispatches; local self_heal() is not called."""
+        with patch('sys.argv', ['unifi-cert', '--self-heal',
+                                '--host', 'beehive']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'dispatch_remote_verb',
+                          return_value=0) as disp, \
+             patch.object(unifi_cert, 'self_heal') as sh:
+            rc = unifi_cert.main()
+        assert rc == 0
+        disp.assert_called_once()
+        sh.assert_not_called()
