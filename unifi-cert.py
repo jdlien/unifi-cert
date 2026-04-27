@@ -756,13 +756,56 @@ def _cron_d_certbot_invokes_glennr(path: str) -> bool:
     return '/usr/bin/certbot' in content or 'certbot -q renew' in content
 
 
+def _email_from_v1_prefs() -> Optional[str]:
+    """Read email from the v1 user-prefs file at ~/.secrets/certbot/config.ini.
+
+    The pre-2.0 interactive flow saved preferences here; users upgrading
+    from v1 (or from GlennR through v1) will have it populated.
+    """
+    if not os.path.exists(CONFIG_FILE):
+        return None
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as fh:
+            for line in fh:
+                m = re.match(r'\s*email\s*=\s*(\S+)', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def _email_from_certbot_accounts() -> Optional[str]:
+    """Read email from certbot's ACME account registration JSON.
+
+    Certbot stores `mailto:` contacts under
+    /etc/letsencrypt/accounts/<server>/directory/<acct>/regr.json. This is
+    the canonical record of the email used when the account was created.
+    """
+    pattern = '/etc/letsencrypt/accounts/*/*/*/regr.json'
+    for path in sorted(glob.glob(pattern)):
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        contacts = data.get('body', {}).get('contact') or []
+        for c in contacts:
+            if isinstance(c, str) and c.startswith('mailto:'):
+                return c[len('mailto:'):]
+    return None
+
+
 def inventory_glennr() -> GlennRInventory:
     """Read-only probe of GlennR state on the current device.
 
     Reads /etc/letsencrypt/renewal/*.conf for domain / dns provider /
-    credentials path (the most reliable provisioning source). Probes
-    /root/unifi-easy-encrypt.sh for the GlennR script version. Builds the
-    list of removable paths matching the allowlist. Performs no writes.
+    credentials path (the most reliable provisioning source). For email
+    (which certbot rarely persists in renewal/<domain>.conf), falls back
+    through the v1 user-prefs file and certbot's accounts/regr.json.
+    Probes /root/unifi-easy-encrypt.sh for the GlennR script version.
+    Builds the list of removable paths matching the allowlist. Performs
+    no writes.
     """
     inv = GlennRInventory()
 
@@ -790,6 +833,10 @@ def inventory_glennr() -> GlennRInventory:
                 inv.dns_credentials_path = m.group(1)
             # Stop after the first lineage so we don't mix providers across domains.
             break
+
+    # Email fallbacks — certbot's renewal conf rarely has it.
+    if not inv.email:
+        inv.email = _email_from_v1_prefs() or _email_from_certbot_accounts()
 
     # GlennR script version (best-effort; not load-bearing).
     for candidate in ('/root/unifi-easy-encrypt.sh',
@@ -982,17 +1029,37 @@ def _remove_glennr_path(path: str, kind: str, force: bool) -> bool:
     return True
 
 
-def migrate_glennr(dry_run: bool = False, force: bool = False) -> bool:
+def migrate_glennr(dry_run: bool = False, force: bool = False,
+                    domain_override: Optional[str] = None,
+                    email_override: Optional[str] = None,
+                    dns_provider_override: Optional[str] = None,
+                    dns_credentials_override: Optional[str] = None) -> bool:
     """Full GlennR-to-unifi-cert migration.
 
-    Order: inventory → import provisioning → snapshot → rsync LE state →
-    allowlisted uninstall → self_heal (bootstrap + cron + hook + boot).
+    Order: inventory → apply CLI overrides → import provisioning →
+    snapshot → rsync LE state → allowlisted uninstall → self_heal
+    (bootstrap + cron + hook + boot).
+
+    The `*_override` arguments are layered on top of the inventory so
+    callers can fill gaps the inventory missed (most commonly email,
+    which certbot doesn't persist in renewal/<domain>.conf). Overrides
+    win when set; otherwise the inventory value is kept.
+
     --dry-run lists planned actions and performs nothing destructive.
     --force skips the per-path confirmation prompts.
     """
     ui.header('GlennR migration')
 
     inv = inventory_glennr()
+
+    if domain_override:
+        inv.domain = domain_override
+    if email_override:
+        inv.email = email_override
+    if dns_provider_override:
+        inv.dns_provider = dns_provider_override
+    if dns_credentials_override:
+        inv.dns_credentials_path = dns_credentials_override
 
     has_le = os.path.isdir('/etc/letsencrypt')
     if not inv.detected_paths and not has_le:
@@ -3259,8 +3326,20 @@ def _handle_self_heal(args: argparse.Namespace) -> int:
 
 
 def _handle_migrate_glennr(args: argparse.Namespace) -> int:
-    """`--migrate-glennr`: import GlennR provisioning + uninstall its footprint."""
-    ok = migrate_glennr(dry_run=args.dry_run, force=args.force)
+    """`--migrate-glennr`: import GlennR provisioning + uninstall its footprint.
+
+    CLI flags (-d / -e / --dns-provider / --dns-credentials) override the
+    inventory's discovered values. Useful when the inventory can't find a
+    field (most often email, since certbot rarely persists it).
+    """
+    ok = migrate_glennr(
+        dry_run=args.dry_run,
+        force=args.force,
+        domain_override=args.domain,
+        email_override=args.email,
+        dns_provider_override=args.dns_provider,
+        dns_credentials_override=args.dns_credentials,
+    )
     return 0 if ok else 1
 
 

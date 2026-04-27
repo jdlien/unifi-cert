@@ -4230,6 +4230,112 @@ class TestGlennRInventory:
             assert src in detected
 
 
+class TestEmailFallbacks:
+    """Tests for the v1-prefs and certbot-accounts email fallbacks.
+
+    Certbot rarely writes `email = ...` into renewal/<domain>.conf, so
+    the inventory needs secondary sources or it ships an incomplete
+    provisioning config to migration.
+    """
+
+    def test_email_from_v1_prefs_file(self, tmp_path):
+        """~/.secrets/certbot/config.ini email is picked up when present."""
+        prefs = tmp_path / 'config.ini'
+        prefs.write_text(
+            '# UniFi Certificate Manager config\n'
+            'email = jd@jdlien.com\n'
+            'dns_provider = digitalocean\n'
+        )
+        with patch.object(unifi_cert, 'CONFIG_FILE', str(prefs)):
+            assert unifi_cert._email_from_v1_prefs() == 'jd@jdlien.com'
+
+    def test_email_from_v1_prefs_missing_file(self, tmp_path):
+        """Absent prefs file → None (no exception)."""
+        with patch.object(unifi_cert, 'CONFIG_FILE', str(tmp_path / 'nope.ini')):
+            assert unifi_cert._email_from_v1_prefs() is None
+
+    def test_email_from_certbot_accounts(self, tmp_path):
+        """ACME registration JSON's mailto: contact is extracted."""
+        regr = tmp_path / 'regr.json'
+        regr.write_text(json.dumps({
+            'body': {'contact': ['mailto:jd@jdlien.com'], 'status': 'valid'},
+        }))
+        with patch('glob.glob', return_value=[str(regr)]):
+            assert unifi_cert._email_from_certbot_accounts() == 'jd@jdlien.com'
+
+    def test_email_from_certbot_accounts_no_mailto(self, tmp_path):
+        """regr.json with non-mailto contacts (or empty) → None."""
+        regr = tmp_path / 'regr.json'
+        regr.write_text(json.dumps({'body': {'contact': []}}))
+        with patch('glob.glob', return_value=[str(regr)]):
+            assert unifi_cert._email_from_certbot_accounts() is None
+
+    def test_inventory_falls_back_to_v1_prefs_when_renewal_lacks_email(self):
+        """Real-world case (beehive): renewal conf has no email but v1 prefs do."""
+        with patch('os.path.isdir', return_value=False), \
+             patch('glob.glob', return_value=[]), \
+             patch('os.path.isfile', return_value=False), \
+             patch('os.path.exists', return_value=False), \
+             patch.object(unifi_cert, '_email_from_v1_prefs',
+                          return_value='jd@jdlien.com') as v1, \
+             patch.object(unifi_cert, '_email_from_certbot_accounts') as acct:
+            inv = unifi_cert.inventory_glennr()
+        assert inv.email == 'jd@jdlien.com'
+        v1.assert_called_once()
+        acct.assert_not_called()  # short-circuit when v1 prefs returned a value
+
+
+class TestMigrateGlennrOverrides:
+    """Tests for migrate_glennr CLI overrides on top of inventory."""
+
+    def test_overrides_layer_on_inventory(self):
+        """email_override fills a gap inventory missed; other fields kept."""
+        inv = unifi_cert.GlennRInventory(
+            domain='example.com', dns_provider='digitalocean',
+            dns_credentials_path='/root/.secrets/digitalocean.ini',
+            email=None,
+        )
+        # Need at least one detected path or migrate_glennr early-returns.
+        inv.detected_paths = [('/srv/EUS', 'dir', 'GlennR data directory')]
+        captured_inv = []
+
+        def fake_import(inv_arg):
+            captured_inv.append(inv_arg)
+            return True
+
+        with patch.object(unifi_cert, 'inventory_glennr', return_value=inv), \
+             patch('os.path.isdir', return_value=False), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr',
+                          side_effect=fake_import), \
+             patch.object(unifi_cert, 'snapshot_glennr', return_value='/x.tgz'), \
+             patch.object(unifi_cert, '_remove_glennr_path', return_value=True), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.migrate_glennr(force=True,
+                                           email_override='jd@jdlien.com')
+        assert ok is True
+        assert captured_inv[0].email == 'jd@jdlien.com'
+        # Original fields not touched.
+        assert captured_inv[0].domain == 'example.com'
+        assert captured_inv[0].dns_provider == 'digitalocean'
+
+    def test_handle_migrate_glennr_threads_args(self):
+        """_handle_migrate_glennr forwards args.domain/email/etc as overrides."""
+        ns = argparse.Namespace(
+            dry_run=False, force=True, domain='override.example',
+            email='admin@override.example', dns_provider='cloudflare',
+            dns_credentials='/path/to/cf.ini',
+        )
+        with patch.object(unifi_cert, 'migrate_glennr',
+                          return_value=True) as mg:
+            unifi_cert._handle_migrate_glennr(ns)
+        kw = mg.call_args.kwargs
+        assert kw['domain_override'] == 'override.example'
+        assert kw['email_override'] == 'admin@override.example'
+        assert kw['dns_provider_override'] == 'cloudflare'
+        assert kw['dns_credentials_override'] == '/path/to/cf.ini'
+
+
 class TestImportProvisioning:
     """Tests for import_provisioning_from_glennr()."""
 
@@ -4594,7 +4700,9 @@ class TestMainMigrateGlennr:
              patch.object(unifi_cert, 'migrate_glennr', return_value=True) as mg:
             result = unifi_cert.main()
         assert result == 0
-        mg.assert_called_once_with(dry_run=True, force=False)
+        kw = mg.call_args.kwargs
+        assert kw['dry_run'] is True
+        assert kw['force'] is False
 
     def test_migrate_glennr_force_threaded_through(self):
         """`--migrate-glennr --force` calls migrate_glennr(force=True)."""
@@ -4604,7 +4712,9 @@ class TestMainMigrateGlennr:
              patch.object(unifi_cert, 'migrate_glennr', return_value=True) as mg:
             result = unifi_cert.main()
         assert result == 0
-        mg.assert_called_once_with(dry_run=False, force=True)
+        kw = mg.call_args.kwargs
+        assert kw['dry_run'] is False
+        assert kw['force'] is True
 
     def test_migrate_glennr_failure_returns_1(self):
         """migrate_glennr returning False → exit 1."""
