@@ -3169,7 +3169,8 @@ def interactive_mode() -> dict:
     # Load saved preferences
     saved_config = load_config()
 
-    ui.header('UniFi Certificate Manager')
+    # main() already printed the program header before dispatching here;
+    # don't duplicate it.
     print()
 
     # Try to auto-detect domain from existing certificate
