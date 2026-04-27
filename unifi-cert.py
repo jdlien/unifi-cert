@@ -912,24 +912,43 @@ def snapshot_glennr(inv: GlennRInventory,
     return tarball
 
 
-def _rsync_etc_letsencrypt() -> bool:
+def _rsync_etc_letsencrypt(domain: Optional[str] = None) -> bool:
     """rsync /etc/letsencrypt/ → /data/unifi-cert/letsencrypt/ preserving symlinks.
 
     Trailing slash on the source means contents-only; we don't end up with
     a nested letsencrypt/letsencrypt/ subtree. -aH preserves perms, links,
     times, and hardlinks (live/ is a symlink farm into archive/).
+
+    Idempotency guard: if the destination already has fullchain.pem for
+    `domain`, the new tool already owns a working lineage. Skipping the
+    rsync prevents stale GlennR archive files (often older but bigger
+    than the new lineage's files, since GlennR predates ECDSA defaults)
+    from clobbering the working cert. `-u` (--update) is the second
+    safety net for partial-state cases where the dest lineage is missing
+    only some files.
     """
     src = '/etc/letsencrypt/'
     dst = CERTBOT_CONFIG_DIR + '/'
     if not os.path.isdir(src):
         ui.warning(f'{src} not present; nothing to migrate.')
         return True
+
+    if domain:
+        dest_fullchain = os.path.join(dst, 'live', domain, 'fullchain.pem')
+        if os.path.exists(dest_fullchain):
+            ui.info(
+                f'{dest_fullchain} already exists; skipping rsync to preserve '
+                'the newer lineage. (Re-obtain via certbot if you want to '
+                'replace it.)'
+            )
+            return True
+
     try:
         os.makedirs(CERTBOT_CONFIG_DIR, mode=0o755, exist_ok=True)
     except OSError as e:
         ui.error(f'Failed to create {CERTBOT_CONFIG_DIR}: {e}')
         return False
-    cmd = ['rsync', '-aH', src, dst]
+    cmd = ['rsync', '-aHu', src, dst]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     except (subprocess.TimeoutExpired, OSError) as e:
@@ -990,7 +1009,17 @@ def migrate_glennr(dry_run: bool = False, force: bool = False) -> bool:
         for path, kind, reason in inv.detected_paths:
             ui.info(f'  [dry-run] {kind:11s} {path}  ({reason})')
         if has_le:
-            ui.info(f'  [dry-run] would rsync /etc/letsencrypt/ → {CERTBOT_CONFIG_DIR}/')
+            dest_fullchain = (
+                os.path.join(CERTBOT_CONFIG_DIR, 'live', inv.domain, 'fullchain.pem')
+                if inv.domain else None
+            )
+            if dest_fullchain and os.path.exists(dest_fullchain):
+                ui.info(
+                    f'  [dry-run] {dest_fullchain} already exists; rsync would '
+                    'be SKIPPED to preserve the newer lineage'
+                )
+            else:
+                ui.info(f'  [dry-run] would rsync /etc/letsencrypt/ → {CERTBOT_CONFIG_DIR}/')
             ui.info(f'  [dry-run] would remove /etc/letsencrypt/ after verification')
         ui.info(f'  [dry-run] would import provisioning to {PROVISIONING_CONFIG}')
         ui.info(f'  [dry-run] would snapshot to {BACKUPS_DIR}/<timestamp>.tar.gz')
@@ -1009,7 +1038,7 @@ def migrate_glennr(dry_run: bool = False, force: bool = False) -> bool:
         return False
 
     # 3. Migrate LE state to the persistent root.
-    if has_le and not _rsync_etc_letsencrypt():
+    if has_le and not _rsync_etc_letsencrypt(domain=inv.domain):
         ui.error('LE state migration failed; aborting before deletion.')
         return False
 

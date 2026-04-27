@@ -4343,17 +4343,23 @@ class TestRsyncLeState:
             assert unifi_cert._rsync_etc_letsencrypt() is True
         run.assert_not_called()
 
-    def test_passes_archive_and_hardlink_flags(self, tmp_path):
-        """rsync invoked with -aH plus trailing-slash source for contents-only copy."""
+    def test_passes_archive_and_update_flags(self, tmp_path):
+        """rsync invoked with -aHu plus trailing-slash source for contents-only copy.
+
+        -u (--update) prevents stale source files from clobbering newer dest
+        files when dest already has a partial lineage; combined with the
+        early-return guard below it covers both safe-merge and skip cases.
+        """
         result = MagicMock(returncode=0, stderr='')
         with patch('os.path.isdir', return_value=True), \
+             patch('os.path.exists', return_value=False), \
              patch('os.makedirs'), \
              patch('subprocess.run', return_value=result) as run, \
              patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert._rsync_etc_letsencrypt() is True
         cmd = run.call_args.args[0]
-        assert cmd[:2] == ['rsync', '-aH']
+        assert cmd[:2] == ['rsync', '-aHu']
         assert cmd[2] == '/etc/letsencrypt/'
         assert cmd[3].endswith('/')
 
@@ -4361,10 +4367,45 @@ class TestRsyncLeState:
         """rsync exit non-zero → False so caller can abort before deletion."""
         result = MagicMock(returncode=23, stderr='rsync: protocol error')
         with patch('os.path.isdir', return_value=True), \
+             patch('os.path.exists', return_value=False), \
              patch('os.makedirs'), \
              patch('subprocess.run', return_value=result), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert._rsync_etc_letsencrypt() is False
+
+    def test_skips_when_dest_lineage_already_present(self, tmp_path):
+        """If dest has fullchain.pem for the domain, rsync is skipped entirely.
+
+        Regression test: prior behavior would rsync GlennR's older lineage
+        over a working newer lineage, replacing a valid cert with stale
+        files of the same name (cert1.pem, etc.) that happen to live at
+        identical relative paths. The fix is to early-return when the
+        destination already owns a working lineage for this domain.
+        """
+        live_dir = tmp_path / 'live' / 'example.com'
+        live_dir.mkdir(parents=True)
+        (live_dir / 'fullchain.pem').write_text('cert\n')
+
+        with patch('os.path.isdir', return_value=True), \
+             patch('subprocess.run') as run, \
+             patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert._rsync_etc_letsencrypt(domain='example.com')
+        assert ok is True
+        run.assert_not_called()
+
+    def test_proceeds_when_dest_lineage_missing(self, tmp_path):
+        """Dest path exists but no fullchain for this domain → proceed with rsync."""
+        # tmp_path exists but has no live/example.com/fullchain.pem
+        result = MagicMock(returncode=0, stderr='')
+        with patch('os.path.isdir', return_value=True), \
+             patch('os.makedirs'), \
+             patch('subprocess.run', return_value=result) as run, \
+             patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert._rsync_etc_letsencrypt(domain='example.com')
+        assert ok is True
+        run.assert_called_once()
 
 
 class TestMigrateUninstall:
@@ -4466,7 +4507,7 @@ class TestMigrateGlennr:
              patch.object(unifi_cert, 'snapshot_glennr',
                           side_effect=lambda *a, **k: ordering.append('snapshot') or '/x/snap.tgz'), \
              patch.object(unifi_cert, '_rsync_etc_letsencrypt',
-                          side_effect=lambda: ordering.append('rsync') or True), \
+                          side_effect=lambda *a, **k: ordering.append('rsync') or True), \
              patch.object(unifi_cert, '_remove_glennr_path',
                           side_effect=lambda *a, **k: ordering.append(f'rm:{a[0]}') or True), \
              patch.object(unifi_cert, 'self_heal',
