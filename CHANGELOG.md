@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Lifecycle-ownership branch. Targeting 2.0.0. Not yet exercised on a real UDM Pro end-to-end — Step 8 of the lifecycle plan is the beehive cutover.
+Lifecycle-ownership branch. Targeting 2.0.0. `--status`, `--ddns-update`, and remote dispatch verified end-to-end against beehive (UniFi OS 5.1.8); `--migrate-glennr` cutover is the remaining live test.
 
 ### Breaking Changes
 
@@ -20,11 +20,19 @@ Lifecycle-ownership branch. Targeting 2.0.0. Not yet exercised on a real UDM Pro
 - **Certbot bootstrap pipeline** — `--bootstrap` builds/repairs `/data/unifi-cert/certbot-venv` with pinned `certbot` + `certbot-dns-<provider>` from PyPI, caching wheels for offline rebuild after a firmware wipe.
 - **`--deploy-hook`** — certbot post-renewal entry. Reads `$RENEWED_LINEAGE` and syncs that lineage to the UniFi platform. No ACME, no bootstrap. Shares the same lock as `--renew` so concurrent invocations serialize cleanly.
 - **`--self-heal`** — idempotent repair entry. Ensures venv + cron + hook + boot script are present. Never runs ACME. Used by the boot script and any other automation context.
-- **Daily cron schedule** at `/etc/cron.d/unifi-cert` invoking `--renew` once a day. Installed automatically by the obtain-new flow on local installs.
+- **`--migrate-glennr`** — full migration from GlennR's `unifi-easy-encrypt.sh`. Pipeline: `inventory_glennr` → `import_provisioning` → snapshot to `/data/unifi-cert/backups/<ts>.tar.gz` → rsync `/etc/letsencrypt/` → allowlisted uninstall (3 dirs, 3 file globs, 4 specific crons + 1 glob + content-checked `/etc/cron.d/certbot`, 2 hook globs, 4 apt sources) → `self_heal()`. `--dry-run` previews; `--force` skips per-path confirms; `/etc/letsencrypt/` is removed last and only after the migrated lineage is verified at the new path.
+- **`--ddns-update`** — refreshes the cert hostname's A record at the DNS provider (DigitalOcean only for v1) using the existing API token. Cron entry at `/etc/cron.d/unifi-cert` runs every 5 minutes; idempotent no-op when the record already matches public IP. Drops the dependency on a third-party DDNS service for users with rotating WAN IPs.
+- **`--status`** — one-shot health report: provisioning config, cert metadata + days remaining, certbot venv version, cron / hook / boot script presence, lock state, GlennR-residue scan, last 20 log lines. Pure read-only.
+- **`--host` plumbing for lifecycle verbs.** `--status`, `--renew`, `--self-heal`, `--migrate-glennr`, `--ddns-update`, `--bootstrap`, and `--setup-hook` all accept `--host <device>`. The script is SCPed to `/data/scripts/unifi-cert.py` only when local + remote sha256 differ; the verb is then SSH-executed and stdout is forwarded back. `--migrate-glennr --host` requires `--dry-run` or `--force` (no TTY for prompts).
+- **Daily cron schedule** at `/etc/cron.d/unifi-cert` invoking `--renew` once a day at 03:17 plus `--ddns-update` every 5 minutes. Installed automatically by the obtain-new flow on local installs.
 - **Best-effort boot script** at `/data/on_boot.d/15-unifi-cert.sh` (when `unifi-utilities/on-boot-script` is installed) re-asserts state on every boot via `--self-heal`. No-op with a warning when `/data/on_boot.d/` is absent.
 - **Provisioning config** at `/data/unifi-cert/unifi-cert.conf` (mode 0600) — domain, email, DNS provider, credentials path. Persisted by obtain-new; consumed by cron-fired `--renew`.
 - **fcntl.flock-based locking** at `/data/unifi-cert/unifi-cert.lock` serializes `--renew` against `--deploy-hook`.
 - **Size-based log rotation** — `/data/unifi-cert/unifi-cert.log` is truncated to the last 100 KB once it exceeds 1 MB, preserving record boundaries.
+
+### Changed
+
+- **`main()` refactored to verb-dispatch table.** Per-verb logic now lives in `_handle_<verb>(args)` functions; `main()` runs the shared prep (UI, remote short-circuit, interactive mode, domain auto-detect, validation) and dispatches via `VERB_HANDLERS`. No CLI surface change.
 
 ### Fixed
 

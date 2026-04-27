@@ -6,7 +6,10 @@ Inspired by [GlennR's UniFi Easy Encrypt](https://community.ui.com/questions/Uni
 
 - **Fixes the WebUI desync** - GlennR's script updates certificate files but not PostgreSQL, so the UniFi interface shows stale cert info. This tool updates both.
 - **Fixes DNS credential fields** - Uses correct certbot field names (e.g., `dns_digitalocean_token` instead of `DO_AUTH_TOKEN`)
-- **Simpler codebase** - ~800 lines of Python vs ~6000 lines of bash, making it easier to maintain and debug
+- **Survives firmware wipes** - All state (certbot venv, Let's Encrypt lineages, provisioning config) lives under `/data/unifi-cert/` plus a self-heal pipeline that re-asserts cron / hook / venv on every boot
+- **One-shot migration from GlennR** - `--migrate-glennr` imports your existing provisioning, snapshots to a tarball, then uninstalls GlennR's footprint via an explicit allowlist
+- **Owns the renewal lifecycle** - daily cron-fired `--renew` actually runs ACME (the v1 `--renew` was sync-only and would silently let certs expire), with locking, log rotation, and a certbot post-renewal hook that keeps the WebUI in sync
+- **Simpler codebase** - ~3500 lines of Python (with 88% test coverage) vs ~6000 lines of bash, making it easier to maintain and debug
 - **Interactive wizard** - Just run it and answer prompts; no need to remember CLI flags
 
 ## Features
@@ -67,6 +70,86 @@ python3 unifi-cert.py --install \
   -d example.com \
   --host 192.168.1.1
 ```
+
+### Lifecycle Verbs Over `--host`
+
+Most lifecycle verbs accept `--host <device>` so you can drive a UniFi box from your workstation. The script is SCPed to `/data/scripts/unifi-cert.py` only when the local and remote sha256 differ, so repeat runs are no-op on the wire.
+
+| Verb              | `--host` supported? | Notes                                                            |
+|-------------------|---------------------|------------------------------------------------------------------|
+| `--status`        | yes                 | Read-only health report; safe to run anytime.                    |
+| `--renew`         | yes                 | Cron entry; manual force-fire usually wants `--force`.           |
+| `--self-heal`     | yes                 | Idempotent repair; never runs ACME.                              |
+| `--migrate-glennr`| yes                 | Requires `--dry-run` or `--force` over SSH (no TTY for prompts). |
+| `--ddns-update`   | yes                 | One-off A-record refresh; cron handles the steady state.         |
+| `--bootstrap`     | yes                 | Build/repair the persistent certbot venv only.                   |
+| `--setup-hook`    | yes                 | Rewrite the certbot post-renewal hook only.                      |
+| `--install`       | yes (separate path) | Streams cert + key by SCP; uses `install_certificate_remote()`.  |
+| `--deploy-hook`   | no                  | Reads `$RENEWED_LINEAGE`; only ever fires on the device itself.  |
+
+```bash
+# Inspect a remote device
+python3 unifi-cert.py --status --host beehive.example.com
+
+# Force a renewal pass without waiting for cron
+python3 unifi-cert.py --renew --force --host beehive.example.com
+
+# Preview what a GlennR migration would do
+python3 unifi-cert.py --migrate-glennr --dry-run --host beehive.example.com
+```
+
+### Migrating From GlennR's `unifi-easy-encrypt.sh`
+
+`--migrate-glennr` is the one-shot upgrade path. Pipeline:
+
+1. **Inventory** GlennR state from `/etc/letsencrypt/renewal/*.conf` (domain, email, DNS provider, credentials path) and `/root/unifi-easy-encrypt.sh` (script version).
+2. **Import provisioning** to `/data/unifi-cert/unifi-cert.conf` and copy DNS credentials to `/data/unifi-cert/credentials/<provider>.ini`.
+3. **Snapshot** every removable path plus `/etc/letsencrypt/` to `/data/unifi-cert/backups/<timestamp>.tar.gz`. Recovery is `tar xzf <tarball> -C /`.
+4. **Rsync** `/etc/letsencrypt/` → `/data/unifi-cert/letsencrypt/` (preserving symlinks; `live/` is a symlink farm into `archive/`).
+5. **Uninstall** the GlennR footprint via an explicit allowlist (3 dirs, 3 file globs, 4 specific crons + 1 glob + content-checked `/etc/cron.d/certbot`, 2 hook globs, 4 apt sources). `/etc/letsencrypt/` is removed last and only when the migrated lineage is verified at the new path.
+6. **`--self-heal`** to bootstrap the venv, install cron + hook + boot script.
+
+Always preview first:
+
+```bash
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --migrate-glennr --dry-run
+```
+
+Then commit (use `--force` to skip per-path confirmation prompts):
+
+```bash
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --migrate-glennr --force
+```
+
+### Health Check
+
+```bash
+# Local
+python3 unifi-cert.py --status
+
+# Remote
+python3 unifi-cert.py --status --host 192.168.1.1
+```
+
+`--status` reports provisioning config, certificate metadata + days remaining, certbot venv version, cron / hook / boot-script presence, lock state, any GlennR residue still on the device, and the last 20 log lines. Pure read-only — safe to run anytime.
+
+### DDNS Auto-Refresh (DigitalOcean)
+
+When you obtain a certificate via DigitalOcean, the same API token is reused to keep the cert hostname's A record fresh against your current public IP. The cron schedule installs a `--ddns-update` line that runs every 5 minutes:
+
+```cron
+*/5 * * * * root /usr/bin/python3 /data/scripts/unifi-cert.py --ddns-update >> /data/unifi-cert/unifi-cert.log 2>&1
+```
+
+The update is idempotent — if the A record already matches public IP, it's a no-op API call. Useful when your ISP rotates WAN IPs on modem reboot or DHCP renewal and you don't want to depend on a third-party DDNS service.
+
+To force an immediate refresh:
+
+```bash
+ssh root@192.168.1.1 /data/scripts/unifi-cert.py --ddns-update --force
+```
+
+DigitalOcean only for v1; the dispatch shape leaves room for Cloudflare / Route53 / others.
 
 ## DNS Credentials
 
@@ -139,6 +222,17 @@ Renewal Options:
   --enable-hook-autoupdate   Re-enable the renewal hook GitHub auto-update
                              path (default off; requires SHA-256 pin)
 
+Lifecycle Operations:
+  --status                   Print health report (cert, certbot venv, cron,
+                             hook, GlennR residue, log tail). Read-only.
+                             Pair with --host to inspect a remote device.
+  --migrate-glennr           Import GlennR provisioning, snapshot, rsync
+                             /etc/letsencrypt → /data/unifi-cert/letsencrypt,
+                             uninstall GlennR. Combine with --dry-run to
+                             preview, --force to skip per-path confirms.
+  --ddns-update              Refresh the cert hostname's A record at the
+                             DNS provider to current public IP. DO only.
+
 Modifiers:
   --dry-run                  Test without making changes
   --force                    Force renewal even if not due
@@ -147,6 +241,21 @@ Modifiers:
   -v, --verbose              Verbose output
   --no-color                 Disable colored output
 ```
+
+### Verb Summary
+
+| Verb              | Purpose                                                              | Default? |
+|-------------------|----------------------------------------------------------------------|:--------:|
+| (none)            | obtain-new: bootstrap → certbot → install → cron + hook + provisioning | yes |
+| `--install`       | install an existing cert/key pair (local or via `--host`)            |          |
+| `--renew`         | cron entry point; ACME-if-due + sync                                 |          |
+| `--deploy-hook`   | certbot post-renewal entry; sync only                                |          |
+| `--self-heal`     | idempotent repair (venv + cron + hook + boot)                        |          |
+| `--bootstrap`     | build/repair certbot venv only                                       |          |
+| `--setup-hook`    | rewrite the certbot post-renewal hook                                |          |
+| `--migrate-glennr`| migrate from GlennR + uninstall                                      |          |
+| `--ddns-update`   | refresh A record at DNS provider                                     |          |
+| `--status`        | read-only health report                                              |          |
 
 ## How It Works
 
@@ -289,9 +398,9 @@ python3 unifi-cert.py --install \
 ### Project Structure
 
 ```
-unifi-cert.py          # Single-file tool (no dependencies for runtime)
+unifi-cert.py          # Single-file tool (~3500 lines, no runtime deps)
 pyproject.toml         # Dev dependencies only
-tests/                 # Pytest test suite (90%+ coverage)
+tests/                 # Pytest suite (328 tests, 88% coverage)
 docs/                  # Additional documentation
 ```
 
