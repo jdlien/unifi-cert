@@ -3474,7 +3474,14 @@ def _handle_install(args: argparse.Namespace) -> int:
     if success:
         ui.header('Installation Complete')
         ui.success(f'Certificate for {args.domain} installed successfully!')
-        ui.info(f'Verify by visiting https://{args.host or "localhost"}')
+        # Prefer --host (workstation flow), fall back to args.domain (cert CN
+        # — the device's actual public hostname). "localhost" is meaningless
+        # on a headless UniFi device — the user visits from another machine.
+        verify_host = args.host or args.domain
+        if verify_host:
+            ui.info(f'Verify by visiting https://{verify_host}')
+        else:
+            ui.info("Verify by visiting your UniFi device's hostname or IP over HTTPS")
         return 0
     return 1
 
