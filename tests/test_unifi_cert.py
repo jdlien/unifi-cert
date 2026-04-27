@@ -3968,3 +3968,103 @@ class TestSelfHealCli:
              patch.object(unifi_cert, 'self_heal', return_value=False):
             result = unifi_cert.main()
         assert result == 1
+
+
+class TestHookAutoupdate:
+    """Tests for the renewal hook + opt-in auto-update gating.
+
+    Auto-update via curl-and-replace is the same anti-pattern that broke
+    GlennR's installer (and bit unifi-cert on 2026-04-27 by overwriting
+    an in-flight script). It must be off by default and only re-enabled
+    when a SHA-256 pin is baked in.
+    """
+
+    def _write_hook(self, tmp_path, **kwargs):
+        """Helper: render the hook into tmp_path/post/unifi-cert-hook.sh."""
+        hook_dir = tmp_path / 'post'
+        hook_dir.mkdir()
+        hook_path = hook_dir / 'unifi-cert-hook.sh'
+        original_join = os.path.join
+
+        def mock_join(*args):
+            if '/etc/letsencrypt' in str(args):
+                return str(hook_path)
+            return original_join(*args)
+
+        with patch.object(unifi_cert, 'ui'), \
+             patch('os.path.join', side_effect=mock_join):
+            ok = unifi_cert.setup_renewal_hook('example.com', '/data/scripts/unifi-cert.py', **kwargs)
+        return ok, hook_path
+
+    def test_default_hook_has_no_curl_autoupdate(self, tmp_path):
+        """Default install: no curl, no GitHub URL — hook is local-only."""
+        ok, hook_path = self._write_hook(tmp_path)
+        assert ok is True
+        content = hook_path.read_text()
+        assert 'curl' not in content
+        assert 'raw.githubusercontent.com' not in content
+        # And it should call --deploy-hook (not --renew) so it doesn't
+        # recurse into ACME from inside a renewal hook.
+        assert '--deploy-hook' in content
+        assert '--renew' not in content
+
+    def test_enable_autoupdate_without_pin_refused(self, tmp_path):
+        """enable_autoupdate=True but HOOK_AUTOUPDATE_SHA256='' → False, hook NOT written."""
+        with patch.object(unifi_cert, 'HOOK_AUTOUPDATE_SHA256', ''):
+            ok, hook_path = self._write_hook(tmp_path, enable_autoupdate=True)
+        assert ok is False
+        # Hook file should not exist (we refused before writing).
+        assert not hook_path.exists()
+
+    def test_enable_autoupdate_with_pin_writes_verified_hook(self, tmp_path):
+        """With a pin, hook contains curl + sha256sum + pin comparison."""
+        pin = 'a' * 64  # 64-char hex looks like sha256
+        with patch.object(unifi_cert, 'HOOK_AUTOUPDATE_SHA256', pin):
+            ok, hook_path = self._write_hook(tmp_path, enable_autoupdate=True)
+        assert ok is True
+        content = hook_path.read_text()
+        assert 'curl' in content
+        assert 'sha256sum' in content
+        assert pin in content  # pin is referenced in the hook for comparison
+        # Mismatch path keeps the existing script.
+        assert 'keeping existing script' in content
+        # Still calls --deploy-hook for the actual sync.
+        assert '--deploy-hook' in content
+
+    def test_hook_uses_renewed_lineage_env(self, tmp_path):
+        """Hook reads $RENEWED_LINEAGE so --deploy-hook gets the right path."""
+        ok, hook_path = self._write_hook(tmp_path)
+        assert ok is True
+        content = hook_path.read_text()
+        assert 'RENEWED_LINEAGE' in content
+
+    def test_hook_logs_to_unifi_cert_log(self, tmp_path):
+        """Hook redirects --deploy-hook output to LOG_FILE for --status visibility."""
+        ok, hook_path = self._write_hook(tmp_path)
+        assert ok is True
+        content = hook_path.read_text()
+        assert unifi_cert.LOG_FILE in content
+
+    def test_setup_hook_cli_passes_autoupdate_flag(self):
+        """`--setup-hook --enable-hook-autoupdate` threads the flag through."""
+        with patch('sys.argv', ['unifi-cert', '--setup-hook',
+                               '-d', 'example.com',
+                               '--enable-hook-autoupdate']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'ensure_script_installed'), \
+             patch.object(unifi_cert, 'setup_renewal_hook',
+                          return_value=True) as hook:
+            unifi_cert.main()
+        assert hook.call_args.kwargs.get('enable_autoupdate') is True
+
+    def test_setup_hook_cli_default_no_autoupdate(self):
+        """Plain `--setup-hook` does NOT enable autoupdate."""
+        with patch('sys.argv', ['unifi-cert', '--setup-hook', '-d', 'example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'ensure_script_installed'), \
+             patch.object(unifi_cert, 'setup_renewal_hook',
+                          return_value=True) as hook:
+            unifi_cert.main()
+        assert hook.call_args.kwargs.get('enable_autoupdate') is False
