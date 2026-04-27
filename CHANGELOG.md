@@ -5,9 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-04-27
 
-Lifecycle-ownership branch. Targeting 2.0.0. `--status`, `--ddns-update`, and remote dispatch verified end-to-end against beehive (UniFi OS 5.1.8); `--migrate-glennr` cutover is the remaining live test.
+End-to-end verified against beehive (UniFi OS 5.1.8): `--status`, `--ddns-update`, remote dispatch via `--host`, and the full `--migrate-glennr` cutover all proven on real hardware. Cert intact, GlennR footprint removed, cron-fired `--renew` and `--ddns-update` driving the steady state from the persistent provisioning config.
 
 ### Breaking Changes
 
@@ -37,6 +37,9 @@ Lifecycle-ownership branch. Targeting 2.0.0. `--status`, `--ddns-update`, and re
 ### Fixed
 
 - **UniFi OS 5.x cert-deploy paths.** Removes GlennR's `ssl:` override at `/data/unifi-core/config/overrides/local.yml` (which broke unifi-core's UUID cert lookup on 5.x), ensures nginx serves the active UUID cert, and replaces the Java `unifi-network` PKCS#12 keystore at `/usr/lib/unifi/data/keystore` directly via `openssl pkcs12 -export` (no JDK / keytool / pyjks required).
+- **`--migrate-glennr` rsync no longer clobbers a working newer lineage with stale GlennR data.** Caught during the beehive cutover prep: GlennR's `/etc/letsencrypt/archive/<domain>/cert1.pem` and the new tool's `/data/unifi-cert/letsencrypt/archive/<domain>/cert1.pem` share the same relative path, so the original `rsync -aH` would have replaced a valid Apr 27 cert with stale Feb 2 GlennR files. Fix: early-return when `<dst>/live/<domain>/fullchain.pem` already exists; switch the rsync flag to `-aHu` (`--update`) for the partial-state recovery path.
+- **`inventory_glennr()` now finds the email even when certbot didn't write it to `renewal/<domain>.conf`** (the common case). Falls back through `~/.secrets/certbot/config.ini` (the v1 user-prefs file) and `/etc/letsencrypt/accounts/*/*/*/regr.json` (certbot's ACME account registration JSON, which records the contact `mailto:`). `--migrate-glennr` also accepts `-d / -e / --dns-provider / --dns-credentials` as inventory overrides for any field the discovery missed.
+- **`ensure_script_installed()` no longer re-downloads the script from `main` on every call.** The pre-fix guard `'__file__' in dir()` checked function locals, not module globals, so `current_path` was always `None` and the curl-from-GitHub branch always ran — silently clobbering newly-deployed local scripts (most painfully during `--self-heal` right after a SCP push). Now uses `os.path.abspath(__file__)` with a `NameError` fallback for the genuine stdin/curl-pipe case.
 
 ## [1.0.0] - 2025-02-04
 
@@ -67,4 +70,5 @@ Lifecycle-ownership branch. Targeting 2.0.0. `--status`, `--ddns-update`, and re
 - Python 3.9+ compatible with explicit UTF-8 encoding for future-proofing
 - 95% test coverage
 
+[2.0.0]: https://github.com/jdlien/unifi-cert/releases/tag/v2.0.0
 [1.0.0]: https://github.com/jdlien/unifi-cert/releases/tag/v1.0.0
