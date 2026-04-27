@@ -1535,6 +1535,9 @@ Examples:
                        help='Renew existing certificate')
     parser.add_argument('--setup-hook', action='store_true',
                        help='Set up certbot renewal hook only')
+    parser.add_argument('--bootstrap', action='store_true',
+                       help='Build/repair the persistent certbot venv at '
+                            '/data/unifi-cert/certbot-venv and exit')
 
     # Operation modifiers
     parser.add_argument('--dry-run', action='store_true',
@@ -1702,9 +1705,24 @@ def main() -> int:
                 args.domain = detected
 
     # Validate required args (after auto-detection attempt)
-    if not args.domain and not args.setup_hook:
+    if not args.domain and not args.setup_hook and not args.bootstrap:
         ui.error('Domain is required. Use -d/--domain or run interactively.')
         ui.info('Tip: If a certificate is already installed, the domain can be auto-detected.')
+        return 1
+
+    # Bootstrap-only: build/repair /data/unifi-cert/certbot-venv and exit.
+    # Useful for verifying the bootstrap path independently of cert obtain/renew,
+    # and for self-heal contexts where we want to ensure certbot is available
+    # without immediately running ACME.
+    if args.bootstrap:
+        if not args.dns_provider:
+            ui.error('--dns-provider is required for bootstrap (controls which DNS plugin to install).')
+            return 1
+        ok, msg = bootstrap_certbot(args.dns_provider, force=args.force)
+        if ok:
+            ui.success(f'Bootstrap complete: {msg}')
+            return 0
+        ui.error(f'Bootstrap failed: {msg}')
         return 1
 
     # Setup renewal hook only

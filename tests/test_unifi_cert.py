@@ -3124,3 +3124,40 @@ class TestCertbotBootstrap:
              patch('subprocess.run', return_value=result), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert.cache_wheels(['certbot']) is False
+
+    def test_main_bootstrap_flag_success(self):
+        """--bootstrap dispatches to bootstrap_certbot and returns 0 on success."""
+        with patch('sys.argv', ['unifi-cert', '--bootstrap', '--dns-provider', 'digitalocean']), \
+             patch('sys.stdin.isatty', return_value=False), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'ok')) as mock_boot, \
+             patch.object(unifi_cert, 'ui'):
+            result = unifi_cert.main()
+        assert result == 0
+        mock_boot.assert_called_once_with('digitalocean', force=False)
+
+    def test_main_bootstrap_flag_requires_provider(self):
+        """--bootstrap without --dns-provider returns 1 with a clear error."""
+        with patch('sys.argv', ['unifi-cert', '--bootstrap']), \
+             patch('sys.stdin.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_main_bootstrap_flag_failure(self):
+        """--bootstrap surfaces bootstrap_certbot's (False, msg) as exit 1."""
+        with patch('sys.argv', ['unifi-cert', '--bootstrap', '--dns-provider', 'digitalocean']), \
+             patch('sys.stdin.isatty', return_value=False), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(False, 'apt down')), \
+             patch.object(unifi_cert, 'ui'):
+            result = unifi_cert.main()
+        assert result == 1
+
+    def test_main_bootstrap_flag_force(self):
+        """--bootstrap --force passes force=True through to bootstrap_certbot."""
+        with patch('sys.argv', ['unifi-cert', '--bootstrap', '--dns-provider', 'digitalocean', '--force']), \
+             patch('sys.stdin.isatty', return_value=False), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'ok')) as mock_boot, \
+             patch.object(unifi_cert, 'ui'):
+            result = unifi_cert.main()
+        assert result == 0
+        mock_boot.assert_called_once_with('digitalocean', force=True)
