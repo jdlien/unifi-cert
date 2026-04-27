@@ -1365,13 +1365,16 @@ class TestCertbot:
             result.stderr = ""
             return result
 
+        real_exists = os.path.exists
+
         def mock_exists(path):
             if 'fullchain.pem' in str(path) or 'privkey.pem' in str(path):
                 return True
-            return os.path.exists(path)
+            return real_exists(path)
 
         with patch('subprocess.run', side_effect=mock_run), \
              patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'mocked')), \
              patch('os.path.exists', side_effect=mock_exists):
 
             success, returned_cert, returned_key = unifi_cert.run_certbot(
@@ -1409,7 +1412,8 @@ class TestCertbot:
             return result
 
         with patch('subprocess.run', side_effect=mock_run), \
-             patch.object(unifi_cert, 'ui'):
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'mocked')):
             success, cert, key = unifi_cert.run_certbot(
                 'example.com',
                 'admin@example.com',
@@ -1432,7 +1436,8 @@ class TestCertbot:
             return result
 
         with patch('subprocess.run', side_effect=mock_run), \
-             patch.object(unifi_cert, 'ui'):
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'mocked')):
             success, cert, key = unifi_cert.run_certbot(
                 'example.com',
                 'admin@example.com',
@@ -1445,7 +1450,8 @@ class TestCertbot:
     def test_run_certbot_not_installed(self):
         """Test when certbot is not installed."""
         with patch('subprocess.run', side_effect=FileNotFoundError), \
-             patch.object(unifi_cert, 'ui'):
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'mocked')):
             success, cert, key = unifi_cert.run_certbot(
                 'example.com',
                 'admin@example.com',
@@ -2552,7 +2558,8 @@ class TestCertbotEdgeCases:
 
         with patch('subprocess.run', side_effect=mock_run), \
              patch('os.path.exists', return_value=False), \
-             patch.object(unifi_cert, 'ui'):
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'mocked')):
             success, cert, key = unifi_cert.run_certbot(
                 'example.com', 'admin@example.com', 'digitalocean', '/creds.ini'
             )
@@ -2858,3 +2865,262 @@ class TestEdgeCases:
 
         valid, msg = unifi_cert.validate_dns_credentials('cloudflare', creds_path)
         assert valid is True
+
+
+# =============================================================================
+# CERTBOT BOOTSTRAP - persistent venv + apt prereqs
+# =============================================================================
+
+class TestCertbotBootstrap:
+    """Tests for the certbot bootstrap pipeline."""
+
+    def test_resolve_certbot_bin_persistent(self):
+        """When the persistent venv binary exists, prefer it."""
+        with patch('os.path.exists', return_value=True):
+            assert unifi_cert.resolve_certbot_bin() == unifi_cert.CERTBOT_BIN
+
+    def test_resolve_certbot_bin_fallback(self):
+        """When persistent binary is absent, fall back to PATH lookup."""
+        with patch('os.path.exists', return_value=False):
+            assert unifi_cert.resolve_certbot_bin() == 'certbot'
+
+    def test_certbot_argv_base_with_persistent_root(self):
+        """When persistent config dir exists, return the routing flags."""
+        with patch('os.path.isdir', return_value=True):
+            argv = unifi_cert.certbot_argv_base()
+        assert '--config-dir' in argv
+        assert unifi_cert.CERTBOT_CONFIG_DIR in argv
+        assert '--work-dir' in argv
+        assert '--logs-dir' in argv
+
+    def test_certbot_argv_base_legacy(self):
+        """When persistent config dir is missing, return [] so certbot uses defaults."""
+        with patch('os.path.isdir', return_value=False):
+            assert unifi_cert.certbot_argv_base() == []
+
+    def test_certbot_live_dir_persistent(self):
+        """Live cert dir resolves to the persistent path when present."""
+        with patch('os.path.isdir', return_value=True):
+            live_dir = unifi_cert.certbot_live_dir('example.com')
+        assert live_dir.startswith(unifi_cert.CERTBOT_CONFIG_DIR)
+        assert live_dir.endswith('example.com')
+
+    def test_certbot_live_dir_legacy(self):
+        """Live cert dir falls back to /etc/letsencrypt/live/<domain>."""
+        with patch('os.path.isdir', return_value=False):
+            live_dir = unifi_cert.certbot_live_dir('example.com')
+        assert live_dir == '/etc/letsencrypt/live/example.com'
+
+    def test_certbot_health_check_healthy(self):
+        """certbot --version returning 0 means healthy."""
+        result = MagicMock(returncode=0)
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            assert unifi_cert.certbot_health_check() is True
+
+    def test_certbot_health_check_missing(self):
+        """No binary at the persistent path means unhealthy."""
+        with patch('os.path.exists', return_value=False):
+            assert unifi_cert.certbot_health_check() is False
+
+    def test_certbot_health_check_broken(self):
+        """certbot --version returning non-zero means unhealthy (e.g., venv broken)."""
+        result = MagicMock(returncode=1)
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            assert unifi_cert.certbot_health_check() is False
+
+    def test_certbot_health_check_timeout(self):
+        """A hung --version invocation should return False, not raise."""
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', side_effect=__import__('subprocess').TimeoutExpired('certbot', 10)):
+            assert unifi_cert.certbot_health_check() is False
+
+    def test_dpkg_installed_yes(self):
+        """A package whose status reads 'installed' is reported as installed."""
+        result = MagicMock(returncode=0, stdout='installed\n')
+        with patch('subprocess.run', return_value=result):
+            assert unifi_cert._dpkg_installed('python3-pip') is True
+
+    def test_dpkg_installed_no(self):
+        """Missing package (dpkg-query nonzero) is not installed."""
+        result = MagicMock(returncode=1, stdout='')
+        with patch('subprocess.run', return_value=result):
+            assert unifi_cert._dpkg_installed('python3-venv') is False
+
+    def test_dpkg_installed_uninstalled_status(self):
+        """Status 'config-files' or other non-installed status is not installed."""
+        result = MagicMock(returncode=0, stdout='config-files\n')
+        with patch('subprocess.run', return_value=result):
+            assert unifi_cert._dpkg_installed('python3-pip') is False
+
+    def test_ensure_apt_prereqs_all_present(self):
+        """When all prereqs are installed, short-circuit without calling apt-get."""
+        with patch.object(unifi_cert, '_dpkg_installed', return_value=True), \
+             patch('subprocess.run') as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert._ensure_apt_prereqs()
+        assert ok is True
+        # No subprocess calls should happen since nothing was needed.
+        mock_run.assert_not_called()
+
+    def test_ensure_apt_prereqs_install_needed(self):
+        """When prereqs missing, run apt-get update + install."""
+        update_result = MagicMock(returncode=0)
+        install_result = MagicMock(returncode=0, stdout='', stderr='')
+        with patch.object(unifi_cert, '_dpkg_installed', return_value=False), \
+             patch('subprocess.run', side_effect=[update_result, install_result]) as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert._ensure_apt_prereqs()
+        assert ok is True
+        # Two calls: update then install.
+        assert mock_run.call_count == 2
+        install_cmd = mock_run.call_args_list[1].args[0]
+        assert install_cmd[:3] == ['apt-get', 'install', '-y']
+
+    def test_ensure_apt_prereqs_install_fails(self):
+        """apt-get install non-zero exit returns (False, message)."""
+        update_result = MagicMock(returncode=0)
+        install_result = MagicMock(returncode=100, stdout='', stderr='boom')
+        with patch.object(unifi_cert, '_dpkg_installed', return_value=False), \
+             patch('subprocess.run', side_effect=[update_result, install_result]), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert._ensure_apt_prereqs()
+        assert ok is False
+        assert 'boom' in msg
+
+    def test_dns_plugin_installed_yes(self):
+        """pip show <plugin> returning 0 means plugin is installed."""
+        result = MagicMock(returncode=0)
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            assert unifi_cert._dns_plugin_installed('digitalocean') is True
+
+    def test_dns_plugin_installed_no(self):
+        """pip show non-zero or pip missing means plugin not installed."""
+        result = MagicMock(returncode=1)
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            assert unifi_cert._dns_plugin_installed('digitalocean') is False
+
+    def test_dns_plugin_installed_unknown_provider(self):
+        """Unknown provider returns False rather than blowing up."""
+        with patch('os.path.exists', return_value=True):
+            assert unifi_cert._dns_plugin_installed('not_a_provider') is False
+
+    def test_bootstrap_unknown_provider(self):
+        """Unknown DNS provider rejected up front."""
+        with patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('not_a_provider')
+        assert ok is False
+        assert 'unknown' in msg.lower()
+
+    def test_bootstrap_already_healthy(self):
+        """Healthy venv + plugin already installed → early return without subprocess."""
+        with patch.object(unifi_cert, '_ensure_persistent_dirs', return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check', return_value=True), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=True), \
+             patch('subprocess.run') as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert ok is True
+        assert msg == 'already healthy'
+        mock_run.assert_not_called()
+
+    def test_bootstrap_dirs_fail_returns_false(self):
+        """Filesystem unavailable → graceful (False, reason), no exception."""
+        with patch.object(unifi_cert, '_ensure_persistent_dirs',
+                          return_value=(False, 'Read-only file system')), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert ok is False
+        assert 'Read-only' in msg
+
+    def test_bootstrap_apt_prereqs_fail(self):
+        """If apt prereqs can't be installed, bootstrap fails cleanly."""
+        with patch.object(unifi_cert, '_ensure_persistent_dirs', return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(False, 'apt down')), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert ok is False
+        assert 'apt' in msg.lower()
+
+    def test_bootstrap_creates_venv_and_installs_from_pypi(self):
+        """Happy path: missing venv → create + install from PyPI + cache wheels + verify."""
+        # Sequence: venv-create (0), pip-upgrade (0), pip-install (0),
+        # pip-download/cache (0), then certbot --version (0).
+        results = [MagicMock(returncode=0, stderr='') for _ in range(5)]
+        # Health-check before bootstrap returns False (venv missing); after returns True.
+        health_check_calls = iter([False, True])
+        # First os.path.exists call: check CERTBOT_BIN before venv create → False.
+        # No wheel cache directory.
+        with patch.object(unifi_cert, '_ensure_persistent_dirs', return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check',
+                          side_effect=lambda: next(health_check_calls)), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(True, 'ok')), \
+             patch('os.path.exists', return_value=False), \
+             patch('os.path.isdir', return_value=False), \
+             patch('subprocess.run', side_effect=results) as mock_run, \
+             patch.object(unifi_cert, 'cache_wheels', return_value=True) as mock_cache, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert ok is True
+        assert msg == 'bootstrapped'
+        # Should have invoked: venv create, pip upgrade, pip install (no cache attempt
+        # because os.scandir/isdir indicate empty/missing). cache_wheels separately.
+        assert mock_run.call_count >= 3
+        mock_cache.assert_called_once()
+
+    def test_bootstrap_force_rebuild_removes_existing_venv(self):
+        """force=True triggers rmtree of existing venv before recreation."""
+        results = [MagicMock(returncode=0, stderr='') for _ in range(5)]
+        # With force=True the early-exit health check is skipped (short-circuits
+        # at `not force`), so only the post-install health check runs and must
+        # return True.
+        with patch.object(unifi_cert, '_ensure_persistent_dirs', return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check', return_value=True), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(True, 'ok')), \
+             patch('os.path.exists', return_value=True), \
+             patch('os.path.isdir', return_value=False), \
+             patch('shutil.rmtree') as mock_rmtree, \
+             patch('subprocess.run', side_effect=results), \
+             patch.object(unifi_cert, 'cache_wheels', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean', force=True)
+        assert ok is True
+        mock_rmtree.assert_called_once_with(unifi_cert.CERTBOT_VENV)
+
+    def test_bootstrap_health_check_fails_after_install(self):
+        """If install succeeds but certbot --version still fails, return False."""
+        # All subprocess calls succeed, but post-install health check fails.
+        results = [MagicMock(returncode=0, stderr='') for _ in range(5)]
+        with patch.object(unifi_cert, '_ensure_persistent_dirs', return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check', return_value=False), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(True, 'ok')), \
+             patch('os.path.exists', return_value=False), \
+             patch('os.path.isdir', return_value=False), \
+             patch('subprocess.run', side_effect=results), \
+             patch.object(unifi_cert, 'cache_wheels', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert ok is False
+        assert 'health check' in msg
+
+    def test_cache_wheels_no_pip_returns_false(self):
+        """cache_wheels short-circuits when the venv pip is absent."""
+        with patch('os.path.exists', return_value=False), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.cache_wheels(['certbot']) is False
+
+    def test_cache_wheels_pip_failure_is_nonfatal(self):
+        """A failing pip download warns and returns False without raising."""
+        result = MagicMock(returncode=1, stderr='no network')
+        with patch('os.path.exists', return_value=True), \
+             patch('os.makedirs'), \
+             patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.cache_wheels(['certbot']) is False

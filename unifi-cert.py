@@ -84,6 +84,28 @@ UNIFI_PATHS = {
     'eus_dir': '/data/eus_certificates',
 }
 
+# Persistent product root - everything the tool owns lives under /data so it
+# survives UniFi OS firmware updates (which wipe non-/data paths).
+UNIFI_CERT_ROOT = '/data/unifi-cert'
+CERTBOT_VENV = f'{UNIFI_CERT_ROOT}/certbot-venv'
+CERTBOT_BIN = f'{CERTBOT_VENV}/bin/certbot'
+CERTBOT_PIP = f'{CERTBOT_VENV}/bin/pip'
+CERTBOT_PYTHON = f'{CERTBOT_VENV}/bin/python'
+CERTBOT_CONFIG_DIR = f'{UNIFI_CERT_ROOT}/letsencrypt'
+CERTBOT_WORK_DIR = f'{UNIFI_CERT_ROOT}/work'
+CERTBOT_LOGS_DIR = f'{UNIFI_CERT_ROOT}/logs'
+WHEELS_DIR = f'{UNIFI_CERT_ROOT}/wheels'
+BACKUPS_DIR = f'{UNIFI_CERT_ROOT}/backups'
+CREDENTIALS_DIR = f'{UNIFI_CERT_ROOT}/credentials'
+LOG_FILE = f'{UNIFI_CERT_ROOT}/unifi-cert.log'
+LOCK_FILE = f'{UNIFI_CERT_ROOT}/unifi-cert.lock'
+PROVISIONING_CONFIG = f'{UNIFI_CERT_ROOT}/unifi-cert.conf'
+
+# apt prerequisites for the bootstrap path. UDM Pro firmware ships python3 but
+# strips python3-pip / python3-venv / python3-distutils; bootstrap re-installs
+# them and re-asserts on every boot via self-heal.
+APT_PREREQS = ('python3-pip', 'python3-venv', 'python3-distutils')
+
 # Config file for persisting user preferences
 CONFIG_FILE = os.path.expanduser('~/.secrets/certbot/config.ini')
 
@@ -840,17 +862,24 @@ def run_certbot(
         ui.error(f"Unknown DNS provider: {dns_provider}")
         return False, '', ''
 
-    # Build certbot command
-    cmd = [
-        'certbot', 'certonly',
-        f'--dns-{dns_provider}',
-        f'--dns-{dns_provider}-credentials', dns_credentials,
-        f'--dns-{dns_provider}-propagation-seconds', str(propagation),
-        '--domain', domain,
-        '--email', email,
-        '--agree-tos',
-        '--non-interactive',
-    ]
+    # Ensure certbot is bootstrapped (idempotent, fast no-op when healthy).
+    bootstrap_ok, bootstrap_msg = bootstrap_certbot(dns_provider)
+    if not bootstrap_ok:
+        ui.error(f"certbot bootstrap failed: {bootstrap_msg}")
+        return False, '', ''
+
+    certbot = resolve_certbot_bin()
+
+    # Build certbot command. certbot_argv_base() prepends --config-dir / --work-dir /
+    # --logs-dir flags so all certbot state lives under /data/unifi-cert/.
+    cmd = [certbot, *certbot_argv_base(), 'certonly',
+           f'--dns-{dns_provider}',
+           f'--dns-{dns_provider}-credentials', dns_credentials,
+           f'--dns-{dns_provider}-propagation-seconds', str(propagation),
+           '--domain', domain,
+           '--email', email,
+           '--agree-tos',
+           '--non-interactive']
 
     if dry_run:
         cmd.append('--dry-run')
@@ -867,11 +896,12 @@ def run_certbot(
             ui.error(f"Certbot failed: {result.stderr}")
             return False, '', ''
     except FileNotFoundError:
-        ui.error("certbot not found. Please install certbot and the DNS plugin.")
+        ui.error("certbot not found at expected path after bootstrap.")
         return False, '', ''
 
-    # Find certificate files
-    live_dir = f'/etc/letsencrypt/live/{domain}'
+    # Find certificate files. Persistent root is preferred; fall back to the
+    # legacy /etc/letsencrypt/ layout for systems that haven't been migrated.
+    live_dir = certbot_live_dir(domain)
     cert_path = os.path.join(live_dir, 'fullchain.pem')
     key_path = os.path.join(live_dir, 'privkey.pem')
 
@@ -885,6 +915,272 @@ def run_certbot(
     else:
         ui.error(f"Certificate files not found at {live_dir}")
         return False, '', ''
+
+
+# =============================================================================
+# CERTBOT BOOTSTRAP - persistent venv + apt prereqs (firmware-wipe survival)
+# =============================================================================
+
+def resolve_certbot_bin() -> str:
+    """
+    Return the path to the certbot binary to use.
+
+    Prefers the persistent venv at /data/unifi-cert/certbot-venv/bin/certbot.
+    Falls back to PATH lookup so callers on non-UniFi systems (e.g., dev / CI)
+    can still exercise run_certbot() with a system certbot.
+    """
+    if os.path.exists(CERTBOT_BIN):
+        return CERTBOT_BIN
+    return 'certbot'
+
+
+def certbot_argv_base() -> list[str]:
+    """
+    Return the certbot CLI flags that route state into the persistent root.
+
+    Only emitted when /data/unifi-cert/letsencrypt/ exists — this means
+    pre-migration runs (where /etc/letsencrypt/ is still authoritative) get
+    the empty list and certbot uses its default paths.
+    """
+    if os.path.isdir(CERTBOT_CONFIG_DIR):
+        return [
+            '--config-dir', CERTBOT_CONFIG_DIR,
+            '--work-dir', CERTBOT_WORK_DIR,
+            '--logs-dir', CERTBOT_LOGS_DIR,
+        ]
+    return []
+
+
+def certbot_live_dir(domain: str) -> str:
+    """Return the directory containing fullchain.pem / privkey.pem for `domain`."""
+    persistent = os.path.join(CERTBOT_CONFIG_DIR, 'live', domain)
+    if os.path.isdir(persistent):
+        return persistent
+    return f'/etc/letsencrypt/live/{domain}'
+
+
+def certbot_health_check() -> bool:
+    """Return True iff the persistent certbot binary executes and reports a version."""
+    if not os.path.exists(CERTBOT_BIN):
+        return False
+    try:
+        result = subprocess.run(
+            [CERTBOT_BIN, '--version'],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _dpkg_installed(package: str) -> bool:
+    """Return True if `package` is currently installed (status 'installed')."""
+    try:
+        result = subprocess.run(
+            ['dpkg-query', '-W', '-f=${db:Status-Status}\n', package],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == 'installed'
+
+
+def _ensure_apt_prereqs() -> tuple[bool, str]:
+    """
+    Ensure apt prereqs (python3-pip / python3-venv / python3-distutils) are installed.
+
+    These ship pre-stripped on UniFi OS firmware images, so we apt-install them
+    on demand. They get wiped on every firmware update — self-heal handles the
+    re-install on next renewal.
+
+    Returns: (success, message)
+    """
+    needed = [pkg for pkg in APT_PREREQS if not _dpkg_installed(pkg)]
+    if not needed:
+        return True, "all prereqs present"
+
+    ui.status(f"Installing apt prereqs: {' '.join(needed)}")
+    env = os.environ.copy()
+    env['DEBIAN_FRONTEND'] = 'noninteractive'
+
+    # apt-get update first so missing packages can resolve. Don't fail hard if
+    # it errors — repo state may be temporarily unavailable but installed lists
+    # may still be sufficient.
+    try:
+        subprocess.run(['apt-get', 'update'], capture_output=True, env=env, timeout=120)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.warning(f"apt-get update failed (non-fatal): {e}")
+
+    try:
+        result = subprocess.run(
+            ['apt-get', 'install', '-y', '--no-install-recommends', *needed],
+            capture_output=True, text=True, env=env, timeout=300,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"apt-get install errored: {e}"
+
+    if result.returncode != 0:
+        return False, f"apt-get install failed: {result.stderr.strip()}"
+    return True, f"installed {' '.join(needed)}"
+
+
+def _ensure_persistent_dirs() -> tuple[bool, str]:
+    """
+    Create the /data/unifi-cert/ directory tree with sane perms.
+
+    Returns (False, reason) on filesystem errors (e.g., running on a non-UniFi
+    host where /data doesn't exist) instead of raising — callers expect
+    bootstrap_certbot() to return a clean (success, message) tuple.
+    """
+    try:
+        for path in (UNIFI_CERT_ROOT, WHEELS_DIR, BACKUPS_DIR,
+                     CERTBOT_CONFIG_DIR, CERTBOT_WORK_DIR, CERTBOT_LOGS_DIR):
+            os.makedirs(path, mode=0o755, exist_ok=True)
+        # Credentials directory is more sensitive — owner-only.
+        os.makedirs(CREDENTIALS_DIR, mode=0o700, exist_ok=True)
+    except OSError as e:
+        return False, f"could not create {UNIFI_CERT_ROOT} tree: {e}"
+    return True, "ok"
+
+
+def _dns_plugin_installed(dns_provider: str) -> bool:
+    """Check if the certbot DNS plugin for `dns_provider` is installed in the venv."""
+    if not os.path.exists(CERTBOT_PIP):
+        return False
+    plugin = DNS_PROVIDERS.get(dns_provider, {}).get('plugin')
+    if not plugin:
+        return False
+    try:
+        result = subprocess.run(
+            [CERTBOT_PIP, 'show', plugin],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+def cache_wheels(packages: list[str]) -> bool:
+    """
+    Download wheels for `packages` into /data/unifi-cert/wheels/ for offline rebuild.
+
+    Non-fatal if it fails — bootstrap can still succeed without a fresh cache,
+    it just means the next firmware-wipe rebuild needs PyPI access.
+    """
+    if not os.path.exists(CERTBOT_PIP):
+        return False
+    os.makedirs(WHEELS_DIR, mode=0o755, exist_ok=True)
+    ui.status(f"Caching wheels to {WHEELS_DIR}...")
+    try:
+        result = subprocess.run(
+            [CERTBOT_PIP, 'download', '-d', WHEELS_DIR, *packages],
+            capture_output=True, text=True, timeout=300,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.warning(f"Wheel cache failed (non-fatal): {e}")
+        return False
+    if result.returncode != 0:
+        ui.warning(f"Wheel cache failed (non-fatal): {result.stderr.strip()}")
+        return False
+    ui.debug(f"Cached wheels for {' '.join(packages)}")
+    return True
+
+
+def bootstrap_certbot(dns_provider: str, force: bool = False) -> tuple[bool, str]:
+    """
+    Build /data/unifi-cert/certbot-venv and install certbot + the requested DNS plugin.
+
+    Idempotent — if the venv is healthy and the plugin is already present, returns
+    immediately without invoking pip or apt. Set force=True to rebuild from scratch
+    (e.g., after a Python minor-version bump that broke the venv).
+
+    Tries the wheel cache (offline path) before reaching for PyPI, so a previously
+    bootstrapped device with a populated /data/unifi-cert/wheels/ can recover after
+    a firmware wipe even if PyPI is unreachable.
+
+    Returns: (success, message)
+    """
+    if dns_provider not in DNS_PROVIDERS:
+        return False, f"unknown DNS provider: {dns_provider}"
+
+    dirs_ok, dirs_msg = _ensure_persistent_dirs()
+    if not dirs_ok:
+        return False, dirs_msg
+
+    if not force and certbot_health_check() and _dns_plugin_installed(dns_provider):
+        ui.debug(f"certbot venv at {CERTBOT_VENV} is healthy; skipping bootstrap")
+        return True, "already healthy"
+
+    ok, msg = _ensure_apt_prereqs()
+    if not ok:
+        return False, f"apt prereqs unavailable: {msg}"
+
+    if force and os.path.exists(CERTBOT_VENV):
+        ui.status(f"Removing existing venv at {CERTBOT_VENV} (force rebuild)...")
+        shutil.rmtree(CERTBOT_VENV)
+
+    if not os.path.exists(CERTBOT_BIN):
+        ui.status(f"Creating venv at {CERTBOT_VENV}...")
+        try:
+            result = subprocess.run(
+                ['python3', '-m', 'venv', CERTBOT_VENV],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"venv creation errored: {e}"
+        if result.returncode != 0:
+            return False, f"venv creation failed: {result.stderr.strip()}"
+
+    ui.status("Upgrading pip in venv...")
+    try:
+        subprocess.run(
+            [CERTBOT_PIP, 'install', '--upgrade', 'pip'],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        ui.warning(f"pip upgrade failed (non-fatal): {e}")
+
+    plugin = DNS_PROVIDERS[dns_provider]['plugin']
+    packages = ['certbot', plugin]
+
+    # Try offline install from wheel cache first.
+    installed_from_cache = False
+    if os.path.isdir(WHEELS_DIR) and any(os.scandir(WHEELS_DIR)):
+        ui.status(f"Installing {' '.join(packages)} from wheel cache...")
+        try:
+            result = subprocess.run(
+                [CERTBOT_PIP, 'install', '--no-index',
+                 f'--find-links={WHEELS_DIR}', *packages],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                installed_from_cache = True
+                ui.success("Installed from wheel cache")
+            else:
+                ui.warning(f"Wheel cache install failed; falling back to PyPI: "
+                           f"{result.stderr.strip()[:200]}")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            ui.warning(f"Wheel cache install errored; falling back to PyPI: {e}")
+
+    if not installed_from_cache:
+        ui.status(f"Installing {' '.join(packages)} from PyPI...")
+        try:
+            result = subprocess.run(
+                [CERTBOT_PIP, 'install', *packages],
+                capture_output=True, text=True, timeout=600,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"pip install errored: {e}"
+        if result.returncode != 0:
+            return False, f"pip install failed: {result.stderr.strip()}"
+        # Refresh the wheel cache so future rebuilds can run offline.
+        cache_wheels(packages)
+
+    if not certbot_health_check():
+        return False, "certbot installed but health check failed"
+
+    ui.success(f"certbot bootstrapped at {CERTBOT_BIN}")
+    return True, "bootstrapped"
 
 
 PERMANENT_SCRIPT_PATH = '/data/scripts/unifi-cert.py'
