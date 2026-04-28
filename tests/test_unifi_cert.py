@@ -1693,6 +1693,50 @@ class TestRemoteSSH:
 
         assert result is False
 
+    def test_run_remote_uses_ssh_multiplex(self):
+        """run_remote must pass ControlMaster/ControlPath/ControlPersist so
+        dispatch_remote_verb's 2-4 back-to-back sessions don't trip IDS
+        rate-limit signatures (SID 2001219, etc.)."""
+        captured = {}
+
+        def mock_run(cmd, *args, **kwargs):
+            captured['cmd'] = cmd
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ''
+            return r
+
+        with patch('subprocess.run', side_effect=mock_run):
+            unifi_cert.run_remote('192.168.1.1', 'true')
+
+        cmd = captured['cmd']
+        assert '-o' in cmd
+        # All three multiplex options must be present.
+        joined = ' '.join(cmd)
+        assert 'ControlMaster=auto' in joined
+        assert 'ControlPath=' in joined
+        assert 'ControlPersist=60s' in joined
+
+    def test_scp_file_uses_ssh_multiplex(self):
+        """scp_file must also use the multiplex socket so it shares the
+        ssh master that run_remote opened, instead of re-handshaking."""
+        captured = {}
+
+        def mock_run(cmd, *args, **kwargs):
+            captured['cmd'] = cmd
+            r = MagicMock()
+            r.returncode = 0
+            return r
+
+        with patch('subprocess.run', side_effect=mock_run):
+            unifi_cert.scp_file('/local/file', '192.168.1.1', '/remote/file')
+
+        cmd = captured['cmd']
+        joined = ' '.join(cmd)
+        assert 'ControlMaster=auto' in joined
+        assert 'ControlPath=' in joined
+        assert 'ControlPersist=60s' in joined
+
 
 class TestInstallCertificateRemote:
     """Tests for remote certificate installation."""
@@ -4443,21 +4487,26 @@ class TestImportProvisioning:
         # save_provisioning_config receives the NEW path, not the old one.
         assert save.call_args.kwargs['dns_credentials'] == str(new_creds)
 
-    def test_missing_creds_path_warns_but_saves(self, tmp_path):
-        """Credentials path that doesn't exist → warn, save with original path."""
+    def test_missing_creds_path_falls_back_to_canonical(self, tmp_path):
+        """Credentials path that doesn't exist → warn, save with the
+        canonical CREDENTIALS_DIR/<provider>.ini path so the user can drop
+        the file there and the next --renew picks it up. Saving the bogus
+        original path traps users with a stale reference for weeks."""
+        creds_dir = tmp_path / 'credentials'
         inv = unifi_cert.GlennRInventory(
             domain='example.com', dns_provider='digitalocean',
             dns_credentials_path='/does/not/exist.ini',
         )
         mock_ui = MagicMock()
-        with patch.object(unifi_cert, 'ui', mock_ui), \
+        with patch.object(unifi_cert, 'CREDENTIALS_DIR', str(creds_dir)), \
+             patch.object(unifi_cert, 'ui', mock_ui), \
              patch.object(unifi_cert, 'save_provisioning_config',
                           return_value=True) as save:
             ok = unifi_cert.import_provisioning_from_glennr(inv)
         assert ok is True
         mock_ui.warning.assert_called()
-        # Falls back to the original (non-existent) path.
-        assert save.call_args.kwargs['dns_credentials'] == '/does/not/exist.ini'
+        canonical = str(creds_dir / 'digitalocean.ini')
+        assert save.call_args.kwargs['dns_credentials'] == canonical
 
 
 class TestSnapshotGlennr:
@@ -4930,9 +4979,126 @@ class TestDedupeLeAccounts:
         assert not a3.exists()
 
 
+class TestNormalizeRenewalPathsInLineage:
+    """Tests for _normalize_renewal_paths_in_lineage()."""
+
+    def _stage(self, tmp_path):
+        renewal = tmp_path / 'renewal'
+        renewal.mkdir()
+        return renewal
+
+    def test_rewrites_archive_and_lineage_paths(self, tmp_path):
+        """archive_dir / cert / privkey / chain / fullchain prefixes
+        get rewritten from /etc/letsencrypt/ to CERTBOT_CONFIG_DIR/."""
+        renewal = self._stage(tmp_path)
+        conf = renewal / 'example.com.conf'
+        conf.write_text(
+            'version = 1.12.0\n'
+            'archive_dir = /etc/letsencrypt/archive/example.com\n'
+            'cert = /etc/letsencrypt/live/example.com/cert.pem\n'
+            'privkey = /etc/letsencrypt/live/example.com/privkey.pem\n'
+            'chain = /etc/letsencrypt/live/example.com/chain.pem\n'
+            'fullchain = /etc/letsencrypt/live/example.com/fullchain.pem\n'
+            '\n[renewalparams]\n'
+            'authenticator = dns-digitalocean\n'
+        )
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'CREDENTIALS_DIR',
+                          str(tmp_path / 'credentials')), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._normalize_renewal_paths_in_lineage()
+        result = conf.read_text()
+        prefix = str(tmp_path).rstrip('/') + '/'
+        assert f'archive_dir = {prefix}archive/example.com' in result
+        assert f'cert = {prefix}live/example.com/cert.pem' in result
+        assert f'privkey = {prefix}live/example.com/privkey.pem' in result
+        assert f'chain = {prefix}live/example.com/chain.pem' in result
+        assert f'fullchain = {prefix}live/example.com/fullchain.pem' in result
+        # No legacy prefix anywhere.
+        assert '/etc/letsencrypt/' not in result
+
+    def test_rewrites_dns_credentials_outside_persistent_root(self, tmp_path):
+        """dns_<provider>_credentials pointing outside CERTBOT_CONFIG_DIR /
+        CREDENTIALS_DIR is replaced with the canonical creds path."""
+        renewal = self._stage(tmp_path)
+        conf = renewal / 'example.com.conf'
+        conf.write_text(
+            '[renewalparams]\n'
+            'authenticator = dns-digitalocean\n'
+            'dns_digitalocean_credentials = /root/.secrets/digitalocean.ini\n'
+        )
+        creds_dir = tmp_path / 'credentials'
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'CREDENTIALS_DIR', str(creds_dir)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._normalize_renewal_paths_in_lineage()
+        canonical = str(creds_dir / 'digitalocean.ini')
+        result = conf.read_text()
+        assert f'dns_digitalocean_credentials = {canonical}' in result
+        assert '/root/.secrets/digitalocean.ini' not in result
+
+    def test_leaves_credentials_already_in_persistent_root_alone(self, tmp_path):
+        """A credentials path under CREDENTIALS_DIR is already canonical,
+        so don't rewrite (idempotent for re-runs)."""
+        renewal = self._stage(tmp_path)
+        creds_dir = tmp_path / 'credentials'
+        canonical = str(creds_dir / 'digitalocean.ini')
+        conf = renewal / 'example.com.conf'
+        conf.write_text(
+            '[renewalparams]\n'
+            f'dns_digitalocean_credentials = {canonical}\n'
+        )
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'CREDENTIALS_DIR', str(creds_dir)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._normalize_renewal_paths_in_lineage()
+        # File unchanged (one line, same canonical path).
+        assert conf.read_text().count(canonical) == 1
+
+    def test_leaves_other_lines_intact(self, tmp_path):
+        """Lines that aren't path/credentials fields pass through unchanged,
+        including section headers, blank lines, and renewalparams."""
+        renewal = self._stage(tmp_path)
+        conf = renewal / 'example.com.conf'
+        original = (
+            '# leading comment\n'
+            'version = 4.2.0\n'
+            'archive_dir = /etc/letsencrypt/archive/example.com\n'
+            '\n'
+            '[renewalparams]\n'
+            'account = abcdef0123456789\n'
+            'authenticator = dns-digitalocean\n'
+            'dns_digitalocean_propagation_seconds = 60\n'
+            'server = https://acme-v02.api.letsencrypt.org/directory\n'
+            'key_type = ecdsa\n'
+        )
+        conf.write_text(original)
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'CREDENTIALS_DIR',
+                          str(tmp_path / 'credentials')), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._normalize_renewal_paths_in_lineage()
+        result = conf.read_text()
+        # All the non-path fields preserved.
+        for fragment in ('# leading comment', 'version = 4.2.0',
+                         '[renewalparams]', 'account = abcdef0123456789',
+                         'authenticator = dns-digitalocean',
+                         'dns_digitalocean_propagation_seconds = 60',
+                         'server = https://acme-v02.api.letsencrypt.org/directory',
+                         'key_type = ecdsa'):
+            assert fragment in result
+
+    def test_no_renewal_dir_is_a_noop(self, tmp_path):
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'CREDENTIALS_DIR',
+                          str(tmp_path / 'credentials')), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._normalize_renewal_paths_in_lineage()  # must not raise
+
+
 class TestMigrateGlennrCallsCleanupHelpers:
-    """migrate_glennr() must invoke the residue/account cleanup helpers
-    after the LE rsync, before the GlennR uninstall."""
+    """migrate_glennr() must invoke the residue/normalize/account cleanup
+    helpers after the LE rsync, before the GlennR uninstall."""
 
     def test_helpers_invoked_post_rsync(self):
         inv = unifi_cert.GlennRInventory(
@@ -4954,6 +5120,8 @@ class TestMigrateGlennrCallsCleanupHelpers:
                           side_effect=lambda *a, **k: ordering.append('rsync') or True), \
              patch.object(unifi_cert, '_purge_glennr_residue_in_lineage',
                           side_effect=lambda: ordering.append('purge')), \
+             patch.object(unifi_cert, '_normalize_renewal_paths_in_lineage',
+                          side_effect=lambda: ordering.append('normalize')), \
              patch.object(unifi_cert, '_dedupe_le_accounts',
                           side_effect=lambda: ordering.append('dedupe')), \
              patch.object(unifi_cert, '_remove_glennr_path',
@@ -4962,9 +5130,10 @@ class TestMigrateGlennrCallsCleanupHelpers:
                           side_effect=lambda **k: ordering.append('self_heal') or True), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert.migrate_glennr(force=True) is True
-        # rsync → purge → dedupe → rm:<paths> → self_heal
+        # rsync → purge → normalize → dedupe → rm:<paths> → self_heal
         assert ordering.index('rsync') < ordering.index('purge')
-        assert ordering.index('purge') < ordering.index('dedupe')
+        assert ordering.index('purge') < ordering.index('normalize')
+        assert ordering.index('normalize') < ordering.index('dedupe')
         rm_indices = [i for i, x in enumerate(ordering) if x.startswith('rm:')]
         assert all(ordering.index('dedupe') < i for i in rm_indices)
 

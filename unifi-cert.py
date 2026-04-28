@@ -910,11 +910,16 @@ def import_provisioning_from_glennr(inv: GlennRInventory) -> bool:
             ui.error(f'Failed to copy credentials: {e}')
             return False
     elif inv.dns_credentials_path:
+        # Source path doesn't exist (already removed, or moved). Default the
+        # config to the canonical persistent path; user must drop the file
+        # there before --renew can run. Surfacing the canonical path here
+        # avoids leaving a dangling /root/.secrets/<provider>.ini reference
+        # that certbot will trip on weeks later.
         ui.warning(
-            f'Credentials path {inv.dns_credentials_path} does not exist; '
-            'config will reference it but credentials must be restored manually.'
+            f'Credentials path {inv.dns_credentials_path} does not exist. '
+            f'Provisioning will reference {new_creds_path} — copy your '
+            f'{inv.dns_provider} credentials there before the next renewal.'
         )
-        new_creds_path = inv.dns_credentials_path
 
     return save_provisioning_config(
         domain=inv.domain,
@@ -1082,6 +1087,84 @@ def _purge_glennr_residue_in_lineage() -> None:
                 ui.warning(f'Could not remove {path}: {e}')
 
 
+def _normalize_renewal_paths_in_lineage() -> None:
+    """Rewrite legacy /etc/letsencrypt/* paths in migrated renewal/<domain>.conf.
+
+    The rsync of /etc/letsencrypt/ → CERTBOT_CONFIG_DIR/ copies the renewal
+    config byte-for-byte, including absolute path fields that still reference
+    the soon-to-be-deleted /etc/letsencrypt/. Once /etc/letsencrypt/ is
+    removed in step 5 of migrate_glennr, certbot reads `archive_dir = /etc/
+    letsencrypt/archive/<domain>`, finds nothing there, decides the lineage
+    is missing, and forks to <domain>-0001 on the next --renew despite
+    --cert-name. The same applies to GlennR's `/root/.secrets/<provider>.ini`
+    credentials reference, which won't exist post-migration.
+
+    This helper rewrites:
+      - archive_dir / cert / privkey / chain / fullchain prefixes
+        /etc/letsencrypt/ → CERTBOT_CONFIG_DIR/
+      - dns_<provider>_credentials → CREDENTIALS_DIR/<provider>.ini when the
+        original path is outside CERTBOT_CONFIG_DIR/CREDENTIALS_DIR (the
+        canonical credentials location set up by import_provisioning_from_glennr).
+    """
+    renewal_dir = os.path.join(CERTBOT_CONFIG_DIR, 'renewal')
+    if not os.path.isdir(renewal_dir):
+        return
+
+    legacy_prefix = '/etc/letsencrypt/'
+    new_prefix = CERTBOT_CONFIG_DIR.rstrip('/') + '/'
+    path_field_re = re.compile(
+        r'^(\s*(?:archive_dir|cert|privkey|chain|fullchain)\s*=\s*)'
+        + re.escape(legacy_prefix) + r'(.*)$'
+    )
+    creds_field_re = re.compile(
+        r'^(\s*dns_([a-z0-9]+)_credentials\s*=\s*)(\S+)\s*$',
+        re.IGNORECASE,
+    )
+
+    persistent_roots = (
+        CERTBOT_CONFIG_DIR.rstrip('/') + '/',
+        CREDENTIALS_DIR.rstrip('/') + '/',
+    )
+
+    for conf in glob.glob(os.path.join(renewal_dir, '*.conf')):
+        try:
+            with open(conf, 'r') as f:
+                lines = f.readlines()
+        except OSError as e:
+            ui.warning(f'Could not read {conf}: {e}')
+            continue
+
+        rewritten = []
+        changed = False
+        for line in lines:
+            eol = '\n' if line.endswith('\n') else ''
+            stripped = line.rstrip('\n')
+            m_path = path_field_re.match(stripped)
+            if m_path:
+                rewritten.append(m_path.group(1) + new_prefix
+                                 + m_path.group(2) + eol)
+                changed = True
+                continue
+            m_creds = creds_field_re.match(stripped)
+            if m_creds:
+                old_value = m_creds.group(3)
+                if not any(old_value.startswith(root) for root in persistent_roots):
+                    canonical = os.path.join(
+                        CREDENTIALS_DIR, f'{m_creds.group(2).lower()}.ini')
+                    rewritten.append(m_creds.group(1) + canonical + eol)
+                    changed = True
+                    continue
+            rewritten.append(line)
+
+        if changed:
+            try:
+                with open(conf, 'w') as f:
+                    f.writelines(rewritten)
+                ui.info(f'Normalized paths in {conf}')
+            except OSError as e:
+                ui.warning(f'Could not rewrite {conf}: {e}')
+
+
 def _dedupe_le_accounts() -> None:
     """Remove Let's Encrypt accounts not referenced by any renewal config.
 
@@ -1207,9 +1290,12 @@ def migrate_glennr(dry_run: bool = False, force: bool = False,
         ui.error('LE state migration failed; aborting before deletion.')
         return False
 
-    # 3a. Scrub GlennR-specific debris that came along in the rsync.
+    # 3a. Scrub GlennR-specific debris that came along in the rsync, and
+    # rewrite legacy /etc/letsencrypt/* paths in renewal/*.conf to point
+    # at the new persistent root before /etc/letsencrypt/ is removed.
     if has_le:
         _purge_glennr_residue_in_lineage()
+        _normalize_renewal_paths_in_lineage()
         _dedupe_le_accounts()
 
     # 4. Verify the new path has the lineage before we delete the old one.
@@ -2806,11 +2892,37 @@ def print_status(host: Optional[str] = None,
 # REMOTE SSH OPERATIONS
 # =============================================================================
 
+def _ssh_multiplex_args() -> list[str]:
+    """Return SSH multiplex flags so dispatch_remote_verb's 2-4 sessions
+    per call collapse into one TCP+TLS connection from the wire's POV.
+
+    Without this, IDS signatures like "ET SCAN Potential SSH Scan"
+    (Suricata SID 2001219, fires on rapid-fire SSH from a single source)
+    flag a verb dispatch as a port-scan and silently drop the packets,
+    making the box appear unreachable. UniFi's CyberSecure / Threat
+    Management ships these signatures enabled by default. Multiplexing
+    the connection pre-empts the trigger entirely without touching the
+    IDS config.
+
+    %r/%h/%p expand to remote-user / host / port; ControlPersist=60s
+    keeps the master alive long enough for the back-to-back sub-commands
+    inside ensure_remote_script() and the verb-execution call.
+    """
+    home = os.path.expanduser('~')
+    sock = os.path.join(home, '.ssh', 'cm-%r@%h:%p')
+    return [
+        '-o', 'ControlMaster=auto',
+        '-o', f'ControlPath={sock}',
+        '-o', 'ControlPersist=60s',
+    ]
+
+
 def run_remote(host: str, command: str, timeout: int = 30) -> tuple[bool, str]:
     """Run a command on a remote host via SSH."""
     try:
         result = subprocess.run(
             ['ssh', '-o', 'ConnectTimeout=5', '-o', 'BatchMode=yes',
+             *_ssh_multiplex_args(),
              f'root@{host}', command],
             capture_output=True, text=True, timeout=timeout
         )
@@ -2825,7 +2937,8 @@ def scp_file(local_path: str, host: str, remote_path: str) -> bool:
     """Copy a file to a remote host via SCP."""
     try:
         result = subprocess.run(
-            ['scp', '-q', local_path, f'root@{host}:{remote_path}'],
+            ['scp', '-q', *_ssh_multiplex_args(),
+             local_path, f'root@{host}:{remote_path}'],
             capture_output=True, timeout=60
         )
         return result.returncode == 0
