@@ -1390,6 +1390,53 @@ class TestCertbot:
         assert 'fullchain.pem' in returned_cert
         assert 'privkey.pem' in returned_key
 
+    def test_run_certbot_passes_cert_name(self, temp_dir):
+        """certbot argv must include `--cert-name <domain>` so renewals
+        reuse the existing lineage instead of forking to <domain>-0001."""
+        live_dir = os.path.join(temp_dir, 'live', 'example.com')
+        os.makedirs(live_dir)
+        with open(os.path.join(live_dir, 'fullchain.pem'), 'w') as f:
+            f.write('c')
+        with open(os.path.join(live_dir, 'privkey.pem'), 'w') as f:
+            f.write('k')
+
+        captured = {}
+
+        def mock_run(cmd, *args, **kwargs):
+            captured['cmd'] = cmd
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ''
+            result.stderr = ''
+            return result
+
+        real_exists = os.path.exists
+
+        def mock_exists(path):
+            if 'fullchain.pem' in str(path) or 'privkey.pem' in str(path):
+                return True
+            return real_exists(path)
+
+        for force in (False, True):
+            captured.clear()
+            with patch('subprocess.run', side_effect=mock_run), \
+                 patch.object(unifi_cert, 'ui'), \
+                 patch.object(unifi_cert, 'bootstrap_certbot', return_value=(True, 'mocked')), \
+                 patch('os.path.exists', side_effect=mock_exists):
+                ok, _, _ = unifi_cert.run_certbot(
+                    'example.com',
+                    'admin@example.com',
+                    'digitalocean',
+                    '/path/to/creds.ini',
+                    force=force,
+                )
+            assert ok is True
+            cmd = captured['cmd']
+            assert cmd.count('--cert-name') == 1, cmd
+            assert cmd[cmd.index('--cert-name') + 1] == 'example.com', cmd
+            if force:
+                assert '--force-renewal' in cmd
+
     def test_run_certbot_unknown_provider(self):
         """Test certbot with unknown DNS provider."""
         with patch.object(unifi_cert, 'ui'):
@@ -4487,6 +4534,7 @@ class TestRsyncLeState:
         with patch('os.path.isdir', return_value=True), \
              patch('os.path.exists', return_value=False), \
              patch('os.makedirs'), \
+             patch('shutil.which', return_value='/usr/bin/rsync'), \
              patch('subprocess.run', return_value=result) as run, \
              patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
              patch.object(unifi_cert, 'ui'):
@@ -4502,6 +4550,7 @@ class TestRsyncLeState:
         with patch('os.path.isdir', return_value=True), \
              patch('os.path.exists', return_value=False), \
              patch('os.makedirs'), \
+             patch('shutil.which', return_value='/usr/bin/rsync'), \
              patch('subprocess.run', return_value=result), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert._rsync_etc_letsencrypt() is False
@@ -4533,12 +4582,47 @@ class TestRsyncLeState:
         result = MagicMock(returncode=0, stderr='')
         with patch('os.path.isdir', return_value=True), \
              patch('os.makedirs'), \
+             patch('shutil.which', return_value='/usr/bin/rsync'), \
              patch('subprocess.run', return_value=result) as run, \
              patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
              patch.object(unifi_cert, 'ui'):
             ok = unifi_cert._rsync_etc_letsencrypt(domain='example.com')
         assert ok is True
         run.assert_called_once()
+
+    def test_falls_back_to_copytree_when_rsync_missing(self, tmp_path):
+        """Stock UDM Pro SE has no rsync; fall back to shutil.copytree
+        with symlinks=True so live/ → archive/ symlinks survive."""
+        with patch('os.path.isdir', return_value=True), \
+             patch('os.path.exists', return_value=False), \
+             patch('os.makedirs'), \
+             patch('shutil.which', return_value=None), \
+             patch('shutil.copytree') as copytree, \
+             patch('subprocess.run') as run, \
+             patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert._rsync_etc_letsencrypt(domain='example.com')
+        assert ok is True
+        run.assert_not_called()
+        copytree.assert_called_once()
+        args, kwargs = copytree.call_args
+        assert args[0] == '/etc/letsencrypt/'
+        assert args[1].rstrip('/') == str(tmp_path).rstrip('/')
+        assert kwargs.get('symlinks') is True
+        assert kwargs.get('dirs_exist_ok') is True
+
+    def test_copytree_failure_returns_false(self):
+        """copytree errors propagate as False so caller aborts before deletion."""
+        with patch('os.path.isdir', return_value=True), \
+             patch('os.path.exists', return_value=False), \
+             patch('os.makedirs'), \
+             patch('shutil.which', return_value=None), \
+             patch('shutil.copytree', side_effect=OSError('disk full')), \
+             patch('subprocess.run') as run, \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert._rsync_etc_letsencrypt()
+        assert ok is False
+        run.assert_not_called()
 
 
 class TestMigrateUninstall:
@@ -4714,6 +4798,175 @@ class TestMigrateGlennr:
         # Allowlisted paths still removed, but /etc/letsencrypt is preserved.
         assert '/srv/EUS' in rm_calls
         assert '/etc/letsencrypt' not in rm_calls
+
+
+class TestPurgeGlennrResidueInLineage:
+    """Tests for _purge_glennr_residue_in_lineage()."""
+
+    def _stage(self, tmp_path):
+        (tmp_path / 'renewal').mkdir()
+        (tmp_path / 'renewal-hooks' / 'pre').mkdir(parents=True)
+        (tmp_path / 'renewal-hooks' / 'post').mkdir(parents=True)
+        return tmp_path
+
+    def test_strips_eus_post_hook_line_from_renewal_conf(self, tmp_path):
+        self._stage(tmp_path)
+        conf = tmp_path / 'renewal' / 'example.com.conf'
+        conf.write_text(
+            'version = 1.12.0\n'
+            'archive_dir = /x/archive/example.com\n'
+            '\n'
+            '[renewalparams]\n'
+            'account = abc123\n'
+            'authenticator = dns-digitalocean\n'
+            'post_hook = /etc/letsencrypt/renewal-hooks/post/EUS_example.com.sh\n'
+            'pre_hook = /etc/letsencrypt/renewal-hooks/pre/EUS_example.com.sh\n'
+            'server = https://acme-v02.api.letsencrypt.org/directory\n'
+        )
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._purge_glennr_residue_in_lineage()
+        result = conf.read_text()
+        assert 'EUS_example.com.sh' not in result
+        assert 'post_hook' not in result
+        assert 'pre_hook' not in result
+        # Other lines preserved.
+        assert 'account = abc123' in result
+        assert 'authenticator = dns-digitalocean' in result
+
+    def test_leaves_unrelated_post_hook_line_intact(self, tmp_path):
+        self._stage(tmp_path)
+        conf = tmp_path / 'renewal' / 'foo.com.conf'
+        conf.write_text(
+            'post_hook = /usr/local/bin/my-deploy-script.sh\n'
+            'account = def456\n'
+        )
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._purge_glennr_residue_in_lineage()
+        result = conf.read_text()
+        assert 'my-deploy-script.sh' in result
+        assert 'post_hook' in result
+
+    def test_removes_eus_renewal_hook_files(self, tmp_path):
+        self._stage(tmp_path)
+        eus_post = tmp_path / 'renewal-hooks' / 'post' / 'EUS_foo.sh'
+        eus_pre = tmp_path / 'renewal-hooks' / 'pre' / 'EUS_foo.sh'
+        keep = tmp_path / 'renewal-hooks' / 'post' / 'unifi-cert-hook.sh'
+        eus_post.write_text('#!/bin/bash\n')
+        eus_pre.write_text('#!/bin/bash\n')
+        keep.write_text('#!/bin/bash\n')
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._purge_glennr_residue_in_lineage()
+        assert not eus_post.exists()
+        assert not eus_pre.exists()
+        assert keep.exists()  # Non-EUS hook left alone.
+
+    def test_no_renewal_dir_is_a_noop(self, tmp_path):
+        # Empty CERTBOT_CONFIG_DIR — function must not raise.
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._purge_glennr_residue_in_lineage()
+
+
+class TestDedupeLeAccounts:
+    """Tests for _dedupe_le_accounts()."""
+
+    def _stage_account(self, tmp_path, acct_id):
+        d = (tmp_path / 'accounts' / 'acme-v02.api.letsencrypt.org' /
+             'directory' / acct_id)
+        d.mkdir(parents=True)
+        (d / 'regr.json').write_text('{}')
+        return d
+
+    def _stage_renewal(self, tmp_path, name, account_id):
+        renewal_dir = tmp_path / 'renewal'
+        renewal_dir.mkdir(exist_ok=True)
+        (renewal_dir / f'{name}.conf').write_text(
+            f'[renewalparams]\naccount = {account_id}\n'
+        )
+
+    def test_removes_unreferenced_account_only(self, tmp_path):
+        good = self._stage_account(tmp_path, '59e42bf4b8a613df59d3fde7d30eacb0')
+        bad = self._stage_account(tmp_path, '7e4d0dda37b1e14951719421a03b836c')
+        self._stage_renewal(tmp_path, 'example.com',
+                            '59e42bf4b8a613df59d3fde7d30eacb0')
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._dedupe_le_accounts()
+        assert good.exists()
+        assert not bad.exists()
+
+    def test_no_renewal_configs_is_a_noop(self, tmp_path):
+        """No referenced accounts → keep everything (don't delete blind)."""
+        a = self._stage_account(tmp_path, 'aaaaaaaa1111')
+        b = self._stage_account(tmp_path, 'bbbbbbbb2222')
+        (tmp_path / 'renewal').mkdir()
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._dedupe_le_accounts()
+        assert a.exists()
+        assert b.exists()
+
+    def test_no_accounts_dir_is_a_noop(self, tmp_path):
+        (tmp_path / 'renewal').mkdir()
+        self._stage_renewal(tmp_path, 'example.com', 'abc1234')
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._dedupe_le_accounts()  # must not raise
+
+    def test_multiple_renewals_with_different_accounts(self, tmp_path):
+        a1 = self._stage_account(tmp_path, 'aaaaaaaaaaa1')
+        a2 = self._stage_account(tmp_path, 'bbbbbbbbbbb2')
+        a3 = self._stage_account(tmp_path, 'cccccccccccc')
+        self._stage_renewal(tmp_path, 'one', 'aaaaaaaaaaa1')
+        self._stage_renewal(tmp_path, 'two', 'bbbbbbbbbbb2')
+        with patch.object(unifi_cert, 'CERTBOT_CONFIG_DIR', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert._dedupe_le_accounts()
+        assert a1.exists()
+        assert a2.exists()
+        assert not a3.exists()
+
+
+class TestMigrateGlennrCallsCleanupHelpers:
+    """migrate_glennr() must invoke the residue/account cleanup helpers
+    after the LE rsync, before the GlennR uninstall."""
+
+    def test_helpers_invoked_post_rsync(self):
+        inv = unifi_cert.GlennRInventory(
+            domain='example.com', email='a@b.com',
+            dns_provider='digitalocean',
+            dns_credentials_path='/root/.secrets/do.ini',
+            glennr_version='8.4.2',
+            detected_paths=[('/srv/EUS', 'dir', 'GlennR data directory')],
+        )
+        ordering = []
+        with patch.object(unifi_cert, 'inventory_glennr', return_value=inv), \
+             patch('os.path.isdir', return_value=True), \
+             patch('os.path.exists', return_value=True), \
+             patch.object(unifi_cert, 'import_provisioning_from_glennr',
+                          side_effect=lambda *a, **k: ordering.append('import') or True), \
+             patch.object(unifi_cert, 'snapshot_glennr',
+                          side_effect=lambda *a, **k: ordering.append('snapshot') or '/x/s.tgz'), \
+             patch.object(unifi_cert, '_rsync_etc_letsencrypt',
+                          side_effect=lambda *a, **k: ordering.append('rsync') or True), \
+             patch.object(unifi_cert, '_purge_glennr_residue_in_lineage',
+                          side_effect=lambda: ordering.append('purge')), \
+             patch.object(unifi_cert, '_dedupe_le_accounts',
+                          side_effect=lambda: ordering.append('dedupe')), \
+             patch.object(unifi_cert, '_remove_glennr_path',
+                          side_effect=lambda *a, **k: ordering.append(f'rm:{a[0]}') or True), \
+             patch.object(unifi_cert, 'self_heal',
+                          side_effect=lambda **k: ordering.append('self_heal') or True), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.migrate_glennr(force=True) is True
+        # rsync → purge → dedupe → rm:<paths> → self_heal
+        assert ordering.index('rsync') < ordering.index('purge')
+        assert ordering.index('purge') < ordering.index('dedupe')
+        rm_indices = [i for i, x in enumerate(ordering) if x.startswith('rm:')]
+        assert all(ordering.index('dedupe') < i for i in rm_indices)
 
 
 class TestMainMigrateGlennr:

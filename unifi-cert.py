@@ -995,6 +995,19 @@ def _rsync_etc_letsencrypt(domain: Optional[str] = None) -> bool:
     except OSError as e:
         ui.error(f'Failed to create {CERTBOT_CONFIG_DIR}: {e}')
         return False
+
+    # Stock UDM Pro SE images don't ship rsync. Fall back to shutil.copytree
+    # with symlinks=True so the live/ → archive/ symlink farm survives.
+    if shutil.which('rsync') is None:
+        ui.info('rsync not found; falling back to shutil.copytree.')
+        try:
+            shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+        except (OSError, shutil.Error) as e:
+            ui.error(f'copytree fallback failed: {e}')
+            return False
+        ui.success(f'Migrated /etc/letsencrypt/ → {CERTBOT_CONFIG_DIR}/ (copytree)')
+        return True
+
     cmd = ['rsync', '-aHu', src, dst]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -1027,6 +1040,91 @@ def _remove_glennr_path(path: str, kind: str, force: bool) -> bool:
         return False
     ui.success(f'Removed {path}')
     return True
+
+
+def _purge_glennr_residue_in_lineage() -> None:
+    """Strip GlennR-specific hook references from the migrated lineage.
+
+    The rsync of /etc/letsencrypt/ → /data/unifi-cert/letsencrypt/ carries
+    GlennR's `pre_hook` / `post_hook = .../EUS_*.sh` lines in
+    renewal/<domain>.conf and the `renewal-hooks/{pre,post}/EUS_*.sh`
+    scripts themselves. Once `/srv/EUS` is uninstalled those hooks bomb on
+    every renewal. We own these files now (they live under the persistent
+    root) so editing them in place doesn't violate the migration's
+    allowlist invariant.
+    """
+    renewal_dir = os.path.join(CERTBOT_CONFIG_DIR, 'renewal')
+    if os.path.isdir(renewal_dir):
+        eus_hook_re = re.compile(r'^\s*(?:pre|post)_hook\s*=.*EUS_', re.IGNORECASE)
+        for conf in glob.glob(os.path.join(renewal_dir, '*.conf')):
+            try:
+                with open(conf, 'r') as f:
+                    lines = f.readlines()
+            except OSError as e:
+                ui.warning(f'Could not read {conf}: {e}')
+                continue
+            kept = [ln for ln in lines if not eus_hook_re.match(ln)]
+            if len(kept) != len(lines):
+                try:
+                    with open(conf, 'w') as f:
+                        f.writelines(kept)
+                    ui.info(f'Stripped GlennR hook line(s) from {conf}')
+                except OSError as e:
+                    ui.warning(f'Could not rewrite {conf}: {e}')
+
+    for sub in ('pre', 'post'):
+        for path in glob.glob(os.path.join(
+                CERTBOT_CONFIG_DIR, 'renewal-hooks', sub, 'EUS_*.sh')):
+            try:
+                os.remove(path)
+                ui.info(f'Removed migrated GlennR hook {path}')
+            except OSError as e:
+                ui.warning(f'Could not remove {path}: {e}')
+
+
+def _dedupe_le_accounts() -> None:
+    """Remove Let's Encrypt accounts not referenced by any renewal config.
+
+    A partially-failed earlier install can leave a second account under
+    accounts/<server>/directory/<id>/. certbot then refuses to run
+    non-interactively ("Please choose an account"). The migrated
+    renewal/<domain>.conf files carry `account = <id>`, which is the
+    authoritative answer; everything else is dead weight.
+    """
+    renewal_dir = os.path.join(CERTBOT_CONFIG_DIR, 'renewal')
+    accounts_root = os.path.join(CERTBOT_CONFIG_DIR, 'accounts')
+    if not (os.path.isdir(renewal_dir) and os.path.isdir(accounts_root)):
+        return
+
+    referenced: set[str] = set()
+    account_re = re.compile(r'^\s*account\s*=\s*([0-9a-f]+)\s*$', re.IGNORECASE)
+    for conf in glob.glob(os.path.join(renewal_dir, '*.conf')):
+        try:
+            with open(conf, 'r') as f:
+                for line in f:
+                    m = account_re.match(line)
+                    if m:
+                        referenced.add(m.group(1).lower())
+        except OSError:
+            continue
+
+    if not referenced:
+        return  # Don't delete anything we can't justify.
+
+    # accounts/<server>/directory/<id>/
+    for server in os.listdir(accounts_root):
+        directory = os.path.join(accounts_root, server, 'directory')
+        if not os.path.isdir(directory):
+            continue
+        for acct_id in os.listdir(directory):
+            if acct_id.lower() in referenced:
+                continue
+            acct_path = os.path.join(directory, acct_id)
+            try:
+                shutil.rmtree(acct_path)
+                ui.info(f'Removed unreferenced LE account {acct_id}')
+            except OSError as e:
+                ui.warning(f'Could not remove {acct_path}: {e}')
 
 
 def migrate_glennr(dry_run: bool = False, force: bool = False,
@@ -1108,6 +1206,11 @@ def migrate_glennr(dry_run: bool = False, force: bool = False,
     if has_le and not _rsync_etc_letsencrypt(domain=inv.domain):
         ui.error('LE state migration failed; aborting before deletion.')
         return False
+
+    # 3a. Scrub GlennR-specific debris that came along in the rsync.
+    if has_le:
+        _purge_glennr_residue_in_lineage()
+        _dedupe_le_accounts()
 
     # 4. Verify the new path has the lineage before we delete the old one.
     skip_le_dir_deletion = False
@@ -1620,7 +1723,11 @@ def run_certbot(
 
     # Build certbot command. certbot_argv_base() prepends --config-dir / --work-dir /
     # --logs-dir flags so all certbot state lives under /data/unifi-cert/.
+    # --cert-name pins the lineage. Without it, any drift between the migrated
+    # renewal/<domain>.conf flags and the current CLI flags makes certbot fork
+    # to <domain>-0001, after which the script syncs the wrong lineage.
     cmd = [certbot, *certbot_argv_base(), 'certonly',
+           '--cert-name', domain,
            f'--dns-{dns_provider}',
            f'--dns-{dns_provider}-credentials', dns_credentials,
            f'--dns-{dns_provider}-propagation-seconds', str(propagation),
