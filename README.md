@@ -110,11 +110,12 @@ python3 unifi-cert.py --migrate-glennr --dry-run --host beehive.example.com
 `--migrate-glennr` is the one-shot upgrade path. Pipeline:
 
 1. **Inventory** GlennR state from `/etc/letsencrypt/renewal/*.conf` (domain, email, DNS provider, credentials path) and `/root/unifi-easy-encrypt.sh` (script version).
-2. **Import provisioning** to `/data/unifi-cert/unifi-cert.conf` and copy DNS credentials to `/data/unifi-cert/credentials/<provider>.ini`.
+2. **Import provisioning** to `/data/unifi-cert/unifi-cert.conf` and copy DNS credentials to `/data/unifi-cert/credentials/<provider>.ini`. If the GlennR-referenced credentials file no longer exists on disk, the config still points at the canonical persistent path — just drop the file there before the next renewal.
 3. **Snapshot** every removable path plus `/etc/letsencrypt/` to `/data/unifi-cert/backups/<timestamp>.tar.gz`. Recovery is `tar xzf <tarball> -C /`.
-4. **Rsync** `/etc/letsencrypt/` → `/data/unifi-cert/letsencrypt/` (preserving symlinks; `live/` is a symlink farm into `archive/`).
-5. **Uninstall** the GlennR footprint via an explicit allowlist (3 dirs, 3 file globs, 4 specific crons + 1 glob + content-checked `/etc/cron.d/certbot`, 2 hook globs, 4 apt sources). `/etc/letsencrypt/` is removed last and only when the migrated lineage is verified at the new path.
-6. **`--self-heal`** to bootstrap the venv, install cron + hook + boot script.
+4. **Rsync** `/etc/letsencrypt/` → `/data/unifi-cert/letsencrypt/` (preserving symlinks; `live/` is a symlink farm into `archive/`). Falls back to `shutil.copytree(symlinks=True)` on hosts without `rsync` installed.
+5. **Normalize** the migrated tree: strip GlennR-specific `pre/post_hook = …EUS_*.sh` lines from renewal/*.conf, remove the rsync'd `EUS_*.sh` hook scripts, rewrite legacy `/etc/letsencrypt/...` path fields (`archive_dir`, `cert`, `privkey`, `chain`, `fullchain`) to point at the persistent root, and dedupe orphaned Let's Encrypt accounts not referenced by any renewal config.
+6. **Uninstall** the GlennR footprint via an explicit allowlist (3 dirs, 3 file globs, 4 specific crons + 1 glob + content-checked `/etc/cron.d/certbot`, 2 hook globs, 4 apt sources). `/etc/letsencrypt/` is removed last and only when the migrated lineage is verified at the new path.
+7. **`--self-heal`** to bootstrap the venv, install cron + hook + boot script.
 
 Always preview first:
 
@@ -452,9 +453,9 @@ python3 unifi-cert.py --install \
 ### Project Structure
 
 ```
-unifi-cert.py          # Single-file tool (~3500 lines, no runtime deps)
+unifi-cert.py          # Single-file tool (~3900 lines, no runtime deps)
 pyproject.toml         # Dev dependencies only
-tests/                 # Pytest suite (328 tests, 88% coverage)
+tests/                 # Pytest suite (357 tests, 88% coverage)
 docs/                  # Additional documentation
 ```
 
