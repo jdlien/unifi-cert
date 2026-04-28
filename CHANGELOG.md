@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-04-28
+
+End-to-end verified against bar (UDM Pro SE) + the Rednex NVR (UNVR). Eight migration-flow + remote-dispatch bugs uncovered during back-to-back GlennR cutovers and fixed at the source. Both hosts now on a single canonical lineage with a fresh LE cert; future installs should run end-to-end with no manual sed-and-rename.
+
+### Fixed
+
+- **`run_certbot()` now passes `--cert-name <domain>` to certbot.** Without this, any drift between the migrated `renewal/<domain>.conf` flags and the current CLI flags makes certbot fork to `<domain>-0001` instead of refreshing the existing lineage. The script then syncs the *old* lineage and the device keeps serving the about-to-expire cert. `--cert-name` pins the lineage by name in both the obtain-new and renew code paths.
+- **`migrate_glennr()` strips the GlennR post-renewal hook references the rsync brought along.** The rsync of `/etc/letsencrypt/` carries `(pre|post)_hook = .../EUS_<domain>.sh` lines in `renewal/<domain>.conf` plus the `renewal-hooks/{pre,post}/EUS_*.sh` scripts themselves. Once `/srv/EUS` is uninstalled, every renewal bombs the hook with `/srv/EUS/temp_file: No such file or directory`. New `_purge_glennr_residue_in_lineage()` removes both byte-by-byte after the rsync.
+- **`migrate_glennr()` rewrites legacy `/etc/letsencrypt/*` paths in the migrated `renewal/<domain>.conf`.** The rsync preserves absolute path fields verbatim (`archive_dir`, `cert`, `privkey`, `chain`, `fullchain`), so once `/etc/letsencrypt/` is removed in step 6 of the migration, certbot reads stale paths, decides the lineage is missing, and forks to `<domain>-0001` despite `--cert-name`. New `_normalize_renewal_paths_in_lineage()` rewrites these prefixes to `CERTBOT_CONFIG_DIR/`. Also rewrites `dns_<provider>_credentials` to the canonical `CREDENTIALS_DIR/<provider>.ini` when the original path is outside the persistent root.
+- **`migrate_glennr()` dedupes orphaned Let's Encrypt accounts.** A partially-failed earlier install can leave an unreferenced account under `accounts/<server>/directory/<id>/`; certbot then refuses to run non-interactively (`Please choose an account`). New `_dedupe_le_accounts()` removes account directories not referenced by any `account = <id>` line in the migrated renewal configs. No-op when no accounts are referenced (defense against deleting blind).
+- **`_rsync_etc_letsencrypt()` falls back to `shutil.copytree(symlinks=True, dirs_exist_ok=True)` when `rsync` isn't installed.** Stock UDM Pro SE images don't ship rsync, so the migration was hard-aborting with bare `Errno 2`. The fallback preserves the `live/` → `archive/` symlink farm via `symlinks=True`. Pure stdlib, Python 3.8+ compatible.
+- **`run_remote()` and `scp_file()` now multiplex SSH connections via `ControlMaster` / `ControlPath` / `ControlPersist`.** Without this, `dispatch_remote_verb()`'s 2-4 quick sub-sessions per call (sha256 compare, scp, chmod, run) trip IDS rate-limit signatures like Suricata SID 2001219 (`ET SCAN Potential SSH Scan`) which is enabled by default in UniFi CyberSecure. The IDS silently drops the burst and the box appears unreachable. Multiplexing collapses the connections into one TCP+TLS session from the wire's POV, pre-empting the trigger entirely without touching the IDS config.
+- **`import_provisioning_from_glennr()` defaults the saved `dns_credentials` field to `CREDENTIALS_DIR/<provider>.ini` when the GlennR-referenced source file is missing.** Previous behavior preserved the dangling source path (e.g. `/root/.secrets/digitalocean.ini`), trapping users with a stale reference that broke renewals weeks later. The new default + a loud warning give users a straightforward "drop the file here" recovery path.
+- **`ensure_remote_script()`'s `chmod failed on <host>` warning is gone in practice.** It was the 4th back-to-back SSH connection in the dispatch flow, getting rate-limit-dropped by the IDS in the same way as above. Resolved as a side-effect of the multiplexing fix; no separate code change required.
+
+### Tests
+
+- 350 → 357 collected (`+9` net: argv assertions for `--cert-name`, the rsync→copytree fallback, ControlMaster flag presence in `ssh`/`scp` argv, path-normalization helper coverage, account-dedupe coverage, and migrate-flow ordering with the new helper). 88% coverage maintained.
+
 ## [2.0.0] - 2026-04-27
 
 End-to-end verified against beehive (UniFi OS 5.1.8): `--status`, `--ddns-update`, remote dispatch via `--host`, and the full `--migrate-glennr` cutover all proven on real hardware. Cert intact, GlennR footprint removed, cron-fired `--renew` and `--ddns-update` driving the steady state from the persistent provisioning config.
@@ -70,5 +89,6 @@ End-to-end verified against beehive (UniFi OS 5.1.8): `--status`, `--ddns-update
 - Python 3.9+ compatible with explicit UTF-8 encoding for future-proofing
 - 95% test coverage
 
+[2.0.1]: https://github.com/jdlien/unifi-cert/releases/tag/v2.0.1
 [2.0.0]: https://github.com/jdlien/unifi-cert/releases/tag/v2.0.0
 [1.0.0]: https://github.com/jdlien/unifi-cert/releases/tag/v1.0.0
