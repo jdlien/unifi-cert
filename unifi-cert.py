@@ -13,6 +13,7 @@ import argparse
 import fcntl
 import glob
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -133,12 +135,37 @@ APT_PREREQS = ('python3-pip', 'python3-venv', 'python3-distutils')
 # Config file for persisting user preferences
 CONFIG_FILE = os.path.expanduser('~/.secrets/certbot/config.ini')
 
-# IP lookup providers (fallback chain)
+# IP lookup providers (fallback chain). Each extractor takes the raw response
+# body as text and returns an address string, so plain-text endpoints can sit
+# alongside JSON ones.
+#
+# Ordering is load-bearing, for two reasons:
+#
+#   1. IPv4-ONLY HOSTNAMES FIRST. We are filling in an A record, which can only
+#      hold an IPv4 address — but a dual-stack device (Telus hands out IPv6)
+#      will happily reach a dual-stack lookup service over v6, and be told its
+#      v6 address. Observed live: ipwho.is answered 2001:56a:… from the same
+#      machine where ipify answered 198.53.200.179. Hostnames that publish only
+#      an A record force the connection over v4, so the answer is the address
+#      we actually need. The dual-stack services stay as fallbacks: they're
+#      correct on v4-only networks, and get skipped by is_public_ipv4()
+#      elsewhere.
+#   2. TLS BEFORE PLAINTEXT. Whatever comes back here is published in DNS, so
+#      an answer an on-path party could rewrite is the last resort.
+#
+# my-ip.ca leads because it's first-party (no third-party rate limits, and its
+# operator is the person running this tool). The public services stay behind it
+# so a single host being down can't stall DDNS — hence a chain, not one source.
 IP_PROVIDERS = [
-    ('https://ipwho.is/', lambda d: d.get('ip')),
-    ('https://json.geoiplookup.io/', lambda d: d.get('ip')),
-    ('http://ip-api.com/json/', lambda d: d.get('query')),
-    ('https://api.ipify.org?format=json', lambda d: d.get('ip')),
+    # /ip/ is the plain-text endpoint. The bare host content-negotiates and
+    # serves a full HTML page to anything it doesn't recognize as a CLI.
+    ('https://ipv4.my-ip.ca/ip/', lambda b: b.strip()),
+    ('https://api4.ipify.org?format=json', lambda b: json.loads(b).get('ip')),
+    ('https://ipv4.icanhazip.com', lambda b: b.strip()),
+    ('https://ipwho.is/', lambda b: json.loads(b).get('ip')),
+    ('https://json.geoiplookup.io/', lambda b: json.loads(b).get('ip')),
+    ('https://api.ipify.org?format=json', lambda b: json.loads(b).get('ip')),
+    ('http://ip-api.com/json/', lambda b: json.loads(b).get('query')),
 ]
 
 
@@ -424,6 +451,20 @@ def detect_domain_from_cert(cert_path: str = None) -> Optional[str]:
 # IP LOOKUP - Multi-provider fallback
 # =============================================================================
 
+def is_public_ipv4(value: Optional[str]) -> bool:
+    """True only for a syntactically valid, globally routable IPv4 address.
+
+    A regex match isn't enough here: this value is published as an A record.
+    A captive portal or hijacked DNS answering with 192.168.x.x would sail
+    past a shape check and then point the hostname at nothing reachable.
+    """
+    try:
+        addr = ipaddress.IPv4Address((value or '').strip())
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+    return addr.is_global and not addr.is_multicast
+
+
 def get_public_ip(timeout: float = 2.0) -> Optional[str]:
     """Get public IP address using fallback providers."""
     import urllib.request
@@ -434,12 +475,23 @@ def get_public_ip(timeout: float = 2.0) -> Optional[str]:
             ui.debug(f'Trying IP provider: {url}')
             req = urllib.request.Request(url, headers={'User-Agent': 'unifi-cert/1.0'})
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                data = json.loads(response.read().decode())
-                ip = extractor(data)
-                if ip and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+                ip = extractor(response.read().decode())
+                if is_public_ipv4(ip):
                     ui.debug(f'Got IP: {ip}')
-                    return ip
-        except (urllib.error.URLError, json.JSONDecodeError, KeyError, TimeoutError):
+                    return ip.strip()
+                if ip:
+                    # Most often an IPv6 address from a dual-stack service
+                    # reached over v6. Not an error — just not something an
+                    # A record can hold. Try the next provider.
+                    #
+                    # Truncate: a service that content-negotiates can answer
+                    # with an entire HTML page, and this line would otherwise
+                    # land in the log every five minutes forever.
+                    shown = ip if len(ip) <= 60 else ip[:60].replace('\n', ' ') + '…'
+                    ui.debug(f'{url} returned {shown!r}, which is not a public '
+                             'IPv4 address; skipping')
+        except (urllib.error.URLError, ValueError, KeyError, AttributeError,
+                TimeoutError):
             continue
     return None
 
@@ -489,23 +541,54 @@ def save_config(email: str = None, dns_provider: str = None) -> bool:
         return False
 
 
-def save_provisioning_config(domain: str, email: str, dns_provider: str,
-                              dns_credentials: str) -> bool:
+# Provisioning keys written in this order. The ddns_* trio each falls back to
+# its cert equivalent at read time (see _ddns_settings), so an install whose
+# cert CN *is* the A record never needs them.
+PROVISIONING_KEYS = (
+    'domain', 'email', 'dns_provider', 'dns_credentials',
+    'ddns_enabled', 'ddns_domain', 'ddns_provider', 'ddns_credentials',
+)
+
+
+def save_provisioning_config(domain: str = None, email: str = None,
+                              dns_provider: str = None,
+                              dns_credentials: str = None,
+                              ddns_domain: str = None,
+                              ddns_provider: str = None,
+                              ddns_credentials: str = None) -> bool:
     """Persist provisioning fields to PROVISIONING_CONFIG.
 
     Consumed by cron-fired --renew (no CLI args) so the daily renewal can
     self-configure. Stores the credentials *path*; secrets stay in the
     credentials file under CREDENTIALS_DIR (mode 0600).
+
+    Merges with what's already on disk rather than overwriting it. The ddns_*
+    keys are typically hand-added after install, and a later obtain-new run
+    must not silently drop them — a wiped ddns_domain falls back to the cert
+    CN, which is exactly the misconfiguration this tool exists to prevent.
     """
+    config = load_provisioning_config()
+    updates = {
+        'domain': domain,
+        'email': email,
+        'dns_provider': dns_provider,
+        'dns_credentials': dns_credentials,
+        'ddns_domain': ddns_domain,
+        'ddns_provider': ddns_provider,
+        'ddns_credentials': ddns_credentials,
+    }
+    config.update({k: v for k, v in updates.items() if v is not None})
+
     try:
         os.makedirs(UNIFI_CERT_ROOT, mode=0o755, exist_ok=True)
         with open(PROVISIONING_CONFIG, 'w', encoding='utf-8') as fh:
             fh.write('# UniFi Certificate Manager provisioning config\n')
             fh.write('# Auto-generated; consumed by --renew when called without flags\n')
-            fh.write(f'domain = {domain}\n')
-            fh.write(f'email = {email}\n')
-            fh.write(f'dns_provider = {dns_provider}\n')
-            fh.write(f'dns_credentials = {dns_credentials}\n')
+            for key in PROVISIONING_KEYS:
+                if key in config:
+                    fh.write(f'{key} = {config[key]}\n')
+            for key in sorted(set(config) - set(PROVISIONING_KEYS)):
+                fh.write(f'{key} = {config[key]}\n')
         os.chmod(PROVISIONING_CONFIG, 0o600)
         return True
     except OSError as e:
@@ -568,6 +651,20 @@ def validate_dns_credentials(provider: str, creds_file: str) -> tuple[bool, str]
         return True, "Credentials validated"
     except IOError as e:
         return False, f"Cannot read credentials file: {e}"
+
+
+def default_credentials_path(provider: str) -> str:
+    """Where to look for, or create, a provider's credentials file.
+
+    On a UniFi device this has to be the persistent root. `~/.secrets` is
+    `/root/.secrets` there, which a firmware update wipes — and a credentials
+    file left behind becomes a second, forgotten copy of a live API token
+    that nothing references and nobody remembers to rotate. Off-device runs
+    keep the conventional workstation location.
+    """
+    if os.path.isdir(UNIFI_PATHS['config_dir']):
+        return os.path.join(CREDENTIALS_DIR, f'{provider}.ini')
+    return os.path.expanduser(f'~/.secrets/certbot/{provider}.ini')
 
 
 def create_credentials_file(provider: str, token: str, output_path: str) -> bool:
@@ -2305,22 +2402,44 @@ def is_renewal_due(domain: str, days: int = 30) -> bool:
     return remaining.days < days
 
 
+def ddns_is_enabled(cfg: Optional[dict] = None) -> bool:
+    """Whether the DDNS cron line should be installed.
+
+    Defaults to on. Set `ddns_enabled = false` in the provisioning config for
+    sites whose DDNS is handled elsewhere — without this the cron line is
+    unremovable in practice, since self_heal() rewrites CRON_FILE on every
+    renewal and every boot.
+    """
+    if cfg is None:
+        cfg = load_provisioning_config()
+    return str(cfg.get('ddns_enabled', 'true')).strip().lower() not in (
+        'false', 'no', '0', 'off')
+
+
 def install_cron_schedule() -> bool:
-    """Write CRON_FILE with daily --renew + 5-min --ddns-update lines.
+    """Write CRON_FILE with the daily --renew line, plus 5-min --ddns-update.
 
     Idempotent overwrite. DDNS runs every 5 minutes so a fresh WAN IP gets
     pushed promptly; --renew is daily because ACME doesn't need higher
-    cadence and rate limits favour caution.
+    cadence and rate limits favour caution. The DDNS line is omitted when
+    ddns_enabled is false.
     """
+    ddns_enabled = ddns_is_enabled()
     try:
         os.makedirs(os.path.dirname(CRON_FILE), exist_ok=True)
         with open(CRON_FILE, 'w', encoding='utf-8') as fh:
             fh.write('# UniFi cert auto-renewal + DDNS\n')
             fh.write('# Auto-generated by unifi-cert.py self_heal()\n')
             fh.write(CRON_LINE)
-            fh.write(DDNS_CRON_LINE)
+            if ddns_enabled:
+                fh.write(DDNS_CRON_LINE)
+            else:
+                fh.write('# DDNS disabled (ddns_enabled = false in '
+                         f'{PROVISIONING_CONFIG})\n')
         os.chmod(CRON_FILE, 0o644)
         ui.success(f'Installed cron schedule: {CRON_FILE}')
+        if not ddns_enabled:
+            ui.info('DDNS cron line omitted (ddns_enabled = false)')
         return True
     except OSError as e:
         ui.error(f'Failed to install cron schedule: {e}')
@@ -2392,20 +2511,67 @@ def self_heal(dns_provider: Optional[str] = None,
 
 
 # =============================================================================
-# DDNS - DigitalOcean A-record auto-refresh
+# DDNS - A-record auto-refresh (DigitalOcean + Cloudflare)
 # =============================================================================
 #
-# Telus rotates the WAN IP on every modem reboot / DHCP-lease expiry / power
-# blip, which silently breaks inbound connectivity to the cert hostname even
-# while DNS-01 cert obtain keeps working. We reuse the existing DigitalOcean
-# API token (used for cert obtain) to keep the cert hostname's A-record fresh.
-# Drops the dependency on a third-party DDNS service.
+# Telus and similar residential ISPs rotate the WAN IP on every modem reboot /
+# DHCP-lease expiry / power blip, which silently breaks inbound connectivity to
+# the device even while DNS-01 cert obtain keeps working. We reuse a DNS API
+# token already on the box to keep the target A record fresh, dropping the
+# dependency on a third-party DDNS service.
 #
-# Provider lock-in: DigitalOcean only for v1. Same provisioning shape supports
-# Cloudflare / Route53 / others later — dispatch on dns_provider value.
+# Two invariants make this safe to fire every five minutes:
+#
+#   1. NEVER CREATE. We look the record up, edit it *by ID*, and refuse when
+#      it's missing. UniFi's built-in inadyn re-resolves by name on every
+#      update and POSTs a second record when that lookup misses — which is how
+#      home.jdlien.ca ended up carrying two A records, one stale, with clients
+#      round-robining onto a dead IP and burning a 3s connect timeout per try.
+#      Editing by ID structurally cannot duplicate.
+#
+#   2. THE DDNS TARGET IS CONFIGURED SEPARATELY FROM THE CERT CN. They are
+#      genuinely different records: beehive.jdlien.com (cert CN, DigitalOcean)
+#      is a CNAME to home.jdlien.ca (DDNS anchor, Cloudflare). Deriving the
+#      target from the cert CN produced 6,295 consecutive "No A record found"
+#      failures and zero successful updates. ddns_domain / ddns_provider /
+#      ddns_credentials each fall back to the cert equivalent, so installs
+#      whose CN *is* the A record need no extra configuration.
+#
+# Failures are tracked in DDNS_STATE_FILE and reported on an escalating
+# schedule rather than every run — the same error 6,295 times is
+# indistinguishable from noise, which is how the outage stayed invisible.
 
-DDNS_API_BASE = 'https://api.digitalocean.com/v2'
-DDNS_TIMEOUT = 10  # seconds, per-request
+DDNS_API_BASES = {
+    'digitalocean': 'https://api.digitalocean.com/v2',
+    'cloudflare': 'https://api.cloudflare.com/client/v4',
+}
+DDNS_PROVIDERS = tuple(sorted(DDNS_API_BASES))
+
+DDNS_TIMEOUT = 10           # seconds, per-request
+# Page sizes for the diagnostic zone listing only. Zone *resolution* uses
+# exact per-name lookups, so no cap here can turn an owned zone into a
+# "no such zone" error — these numbers only bound how many names an error
+# message is willing to quote back at you.
+DDNS_ZONE_PAGE_SIZE = 50    # Cloudflare
+DDNS_DO_PER_PAGE = 200      # DigitalOcean max; its default of 20 truncates silently
+
+DDNS_STATE_FILE = f'{UNIFI_CERT_ROOT}/ddns-state.json'
+
+# State keys for failures that belong to the run rather than to any one
+# target. Held separately so they can be cleared once the run gets past them.
+DDNS_CONFIG_TARGET = '(configuration)'
+DDNS_PUBLIC_IP_TARGET = '(public-ip)'
+DDNS_SYNTHETIC_TARGETS = (DDNS_CONFIG_TARGET, DDNS_PUBLIC_IP_TARGET)
+
+# Consecutive-failure counts that get a loud report, at a 5-minute cadence:
+# the first failure, one hour in, one day in, and daily after that. Everything
+# between is logged at debug level so a broken target can't drown the log.
+DDNS_FAILURE_ALERTS = (1, 12, 288)
+
+# --status flags a target whose last success is older than this. At a 5-minute
+# cadence anything past an hour means the cron job itself stopped running —
+# a case that otherwise renders as a reassuring green line forever.
+DDNS_STALE_SUCCESS_SECONDS = 3600
 
 DDNS_CRON_LINE = (
     f'*/5 * * * * root /usr/bin/python3 {PERMANENT_SCRIPT_PATH} --ddns-update '
@@ -2413,12 +2579,100 @@ DDNS_CRON_LINE = (
 )
 
 
-def _ddns_request(method: str, url: str, token: str,
-                   body: Optional[dict] = None) -> dict:
-    """Issue a DigitalOcean API request, return parsed JSON.
+class DdnsError(Exception):
+    """A DDNS operation failed. Message is user-facing and should say why.
 
-    Raises urllib.error.URLError on transport failure, RuntimeError on
-    HTTP non-2xx. Returns parsed dict on success ({} for empty body).
+    `status` carries the HTTP status when the failure came from a response,
+    so callers can distinguish "this zone isn't yours" (404) from "your token
+    is bad" (401) without string-matching the message.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass
+class DdnsZone:
+    """A resolved zone plus the provider handle used to edit records in it.
+
+    `ref` is what the provider's record endpoints want — the zone *name* for
+    DigitalOcean, the zone *id* for Cloudflare — while `name` stays
+    human-readable for messages and FQDN reconstruction.
+    """
+    name: str
+    ref: str
+    host: str       # label within the zone; '@' for the apex
+    provider: str
+
+    @property
+    def fqdn(self) -> str:
+        return self.name if self.host == '@' else f'{self.host}.{self.name}'
+
+
+@dataclass
+class DdnsSettings:
+    """Resolved DDNS configuration: what to update, where, with which token."""
+    targets: list
+    provider: str
+    credentials: str
+
+
+def _ddns_api_base(provider: str) -> str:
+    """API root for a DDNS-capable provider."""
+    try:
+        return DDNS_API_BASES[provider]
+    except KeyError:
+        raise DdnsError(
+            f'DDNS does not support DNS provider {provider!r} '
+            f'(supported: {", ".join(DDNS_PROVIDERS)}).'
+        )
+
+
+def _ddns_error_detail(raw: bytes) -> str:
+    """Pull a human message out of a provider error body.
+
+    Cloudflare returns {"success": false, "errors": [{"code", "message"}]};
+    DigitalOcean returns {"id", "message"}. Surfacing that beats swallowing
+    it — "Invalid API Token" from an IP-allowlisted token reads identically
+    to a revoked one unless you can see the body.
+    """
+    try:
+        payload = json.loads((raw or b'').decode('utf-8', 'replace'))
+    except ValueError:
+        return (raw or b'').decode('utf-8', 'replace').strip()[:200]
+    if isinstance(payload, dict):
+        errors = payload.get('errors')
+        if isinstance(errors, list) and errors:
+            return '; '.join(
+                str(e.get('message', e)) if isinstance(e, dict) else str(e)
+                for e in errors
+            )
+        if payload.get('message'):
+            return str(payload['message'])
+        # A well-formed object that simply carries no error text. Return
+        # nothing so the caller's own description wins — echoing the raw dict
+        # back at the user explains less than the sentence it would replace.
+        return ''
+    return str(payload)[:200]
+
+
+def _ddns_request(method: str, url: str, token: str,
+                   body: Optional[dict] = None,
+                   provider: str = 'digitalocean') -> Any:
+    """Issue a provider API request and return the decoded payload.
+
+    Cloudflare wraps every response in {"success", "result", "errors"}; that
+    envelope is unwrapped here so callers see the same bare shape DigitalOcean
+    returns. Raises DdnsError — with the provider's own error text where it
+    supplied one — on transport failure, non-2xx, bad JSON, or any response
+    that isn't a well-formed Cloudflare success envelope.
+
+    The Cloudflare check is deliberately allowlist-shaped (success must be
+    exactly True, and the envelope must be a dict carrying 'result'). Treating
+    an empty or unrecognized body as success is how a write that never
+    happened gets logged as one — the exact failure mode this module exists
+    to eliminate.
     """
     data = None
     headers = {
@@ -2429,21 +2683,54 @@ def _ddns_request(method: str, url: str, token: str,
         data = json.dumps(body).encode('utf-8')
         headers['Content-Type'] = 'application/json'
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=DDNS_TIMEOUT) as resp:
-        status = getattr(resp, 'status', None) or resp.getcode()
-        if status >= 300:
-            raise RuntimeError(f'{method} {url}: HTTP {status}')
-        raw = resp.read()
+
+    try:
+        with urllib.request.urlopen(req, timeout=DDNS_TIMEOUT) as resp:
+            status = getattr(resp, 'status', None) or resp.getcode()
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = _ddns_error_detail(e.read())
+        except Exception:
+            detail = ''
+        raise DdnsError(f'{method} {url}: HTTP {e.code}'
+                        + (f' — {detail}' if detail else ''), status=e.code)
+    except (urllib.error.URLError, OSError) as e:
+        raise DdnsError(f'{method} {url}: {e}')
+
+    if status >= 300:
+        raise DdnsError(f'{method} {url}: HTTP {status}', status=status)
+
+    if provider == 'cloudflare':
         if not raw:
-            return {}
-        return json.loads(raw.decode('utf-8'))
+            raise DdnsError(f'{method} {url}: empty response body — expected a '
+                            'Cloudflare success envelope', status=status)
+    elif not raw:
+        return {}
+
+    try:
+        payload = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise DdnsError(f'{method} {url}: malformed JSON response ({e})',
+                        status=status)
+
+    if provider == 'cloudflare':
+        if not isinstance(payload, dict):
+            raise DdnsError(f'{method} {url}: expected a Cloudflare envelope '
+                            f'object, got {type(payload).__name__}', status=status)
+        if payload.get('success') is not True:
+            raise DdnsError(f'{method} {url}: '
+                            f'{_ddns_error_detail(raw) or "request failed"}',
+                            status=status)
+        if 'result' not in payload:
+            raise DdnsError(f'{method} {url}: Cloudflare envelope reported '
+                            'success but carried no result', status=status)
+        return payload['result']
+    return payload
 
 
-def _ddns_extract_token(creds_path: str, provider: str = 'digitalocean') -> Optional[str]:
-    """Extract dns_<provider>_token value from a certbot credentials INI."""
-    field_name = DNS_PROVIDERS.get(provider, {}).get('field')
-    if not field_name:
-        return None
+def _ddns_read_creds_field(creds_path: str, field_name: str) -> Optional[str]:
+    """Read one `key = value` field out of a certbot credentials INI."""
     try:
         with open(creds_path, 'r', encoding='utf-8') as fh:
             for line in fh:
@@ -2458,113 +2745,538 @@ def _ddns_extract_token(creds_path: str, provider: str = 'digitalocean') -> Opti
     return None
 
 
-def _ddns_resolve_zone(token: str, domain: str) -> tuple[Optional[str], Optional[str]]:
-    """Find the DigitalOcean zone that owns `domain`.
+def _ddns_extract_token(creds_path: str, provider: str = 'digitalocean') -> Optional[str]:
+    """Extract the provider's API token from a certbot credentials INI."""
+    field_name = DNS_PROVIDERS.get(provider, {}).get('field')
+    if not field_name:
+        return None
+    return _ddns_read_creds_field(creds_path, field_name)
 
-    Lists user's DigitalOcean domains and finds the longest suffix match —
-    handles multi-part TLDs (e.g. co.uk) without hardcoding a public-suffix
-    list. Returns (zone, host) where host is '@' for the apex.
+
+def _ddns_token(settings: 'DdnsSettings') -> str:
+    """Load the API token for `settings`, or raise with a pointed diagnosis."""
+    token = _ddns_extract_token(settings.credentials, settings.provider)
+    if token:
+        return token
+
+    field = DNS_PROVIDERS.get(settings.provider, {}).get('field', 'the API token')
+    hint = ''
+    if settings.provider == 'cloudflare' and _ddns_read_creds_field(
+        settings.credentials, 'dns_cloudflare_api_key'
+    ):
+        # The legacy global key grants full account access and only works with
+        # X-Auth-Email/X-Auth-Key headers, not bearer auth. Refuse rather than
+        # support it — a scoped token is both safer and what certbot wants now.
+        hint = (' That file holds a legacy global API key (dns_cloudflare_api_key). '
+                'DDNS needs a scoped API token instead: create one under My Profile '
+                '→ API Tokens with Zone:DNS:Edit + Zone:Zone:Read, and store it as '
+                'dns_cloudflare_api_token.')
+    raise DdnsError(f'Could not read {field} from {settings.credentials}.{hint}')
+
+
+def _ddns_zone_candidates(domain: str) -> list:
+    """Parent zones `domain` could live in, longest (most specific) first.
+
+    'home.jdlien.ca' → ['home.jdlien.ca', 'jdlien.ca']. Any leading wildcard
+    label is dropped, and the bare TLD is never a candidate. Probing these in
+    order gives correct longest-suffix semantics — and correct handling of
+    multi-part TLDs like co.uk — without a public-suffix list.
     """
-    try:
-        data = _ddns_request('GET', f'{DDNS_API_BASE}/domains', token)
-    except (urllib.error.URLError, RuntimeError, json.JSONDecodeError) as e:
-        ui.error(f'DigitalOcean API error listing domains: {e}')
-        return None, None
-
-    names = [d.get('name', '') for d in data.get('domains', [])]
-    matches = [n for n in names if n and (domain == n or domain.endswith('.' + n))]
-    if not matches:
-        return None, None
-    zone = max(matches, key=len)
-    host = '@' if domain == zone else domain[:-(len(zone) + 1)]
-    return zone, host
+    labels = [l for l in domain.split('.') if l and l != '*']
+    return ['.'.join(labels[i:]) for i in range(max(len(labels) - 1, 0))]
 
 
-def _ddns_get_a_record(token: str, zone: str,
-                        host: str) -> tuple[Optional[int], Optional[str]]:
-    """Return (record_id, current_ip) for the A record at host.zone.
+def _ddns_lookup_zone(token: str, provider: str, candidate: str) -> Optional[str]:
+    """Return the provider ref for `candidate` if the token owns it, else None.
 
-    Returns (None, None) if the record doesn't exist or the API call fails.
+    Exact single-zone lookups rather than a paged listing: a listing walk has
+    to stop somewhere, and stopping early reports a zone you *do* own as
+    unowned — a false negative dressed up as a configuration error.
     """
-    name = zone if host == '@' else f'{host}.{zone}'
-    url = f'{DDNS_API_BASE}/domains/{zone}/records?type=A&name={name}'
+    base = _ddns_api_base(provider)
+    name = urllib.parse.quote(candidate, safe='')
+
+    if provider == 'cloudflare':
+        rows = _ddns_request('GET', f'{base}/zones?name={name}', token,
+                             provider='cloudflare')
+        for z in (rows if isinstance(rows, list) else []):
+            if str(z.get('name', '')).lower() == candidate.lower() and z.get('id'):
+                return z['id']
+        return None
+
     try:
-        data = _ddns_request('GET', url, token)
-    except (urllib.error.URLError, RuntimeError, json.JSONDecodeError) as e:
-        ui.error(f'DigitalOcean API error fetching A record: {e}')
-        return None, None
-    records = data.get('domain_records', [])
+        data = _ddns_request('GET', f'{base}/domains/{name}', token)
+    except DdnsError as e:
+        if e.status == 404:
+            return None
+        raise
+    zone = data.get('domain') if isinstance(data, dict) else None
+    if isinstance(zone, dict) and zone.get('name'):
+        return zone['name']
+    return None
+
+
+def _ddns_visible_zones(token: str, provider: str) -> list:
+    """Sample of zone names the token can see. Diagnostics only.
+
+    Deliberately capped and only ever used to enrich an error message — never
+    to decide whether a zone exists, which is what _ddns_lookup_zone is for.
+    """
+    base = _ddns_api_base(provider)
+    try:
+        if provider == 'cloudflare':
+            rows = _ddns_request(
+                'GET', f'{base}/zones?per_page={DDNS_ZONE_PAGE_SIZE}', token,
+                provider='cloudflare')
+            return sorted(str(z.get('name')) for z in (rows if isinstance(rows, list) else [])
+                          if z.get('name'))
+        data = _ddns_request('GET', f'{base}/domains?per_page={DDNS_DO_PER_PAGE}', token)
+        return sorted(str(d.get('name'))
+                      for d in (data.get('domains', []) if isinstance(data, dict) else [])
+                      if d.get('name'))
+    except DdnsError:
+        return []
+
+
+def _ddns_resolve_zone(token: str, domain: str,
+                        provider: str = 'digitalocean') -> DdnsZone:
+    """Find the zone that owns `domain`, most specific first.
+
+    On a miss the error names what the token *can* see, because a token scoped
+    to the wrong zone and a genuinely missing zone are otherwise identical.
+    """
+    _ddns_api_base(provider)  # reject non-DDNS providers before any request
+    name = None
+    ref = None
+    for candidate in _ddns_zone_candidates(domain):
+        ref = _ddns_lookup_zone(token, provider, candidate)
+        if ref:
+            name = candidate
+            break
+
+    if not name:
+        visible = _ddns_visible_zones(token, provider)
+        seen = ', '.join(visible[:8]) + ('…' if len(visible) > 8 else '')
+        raise DdnsError(
+            f'No {provider} zone owns {domain}. '
+            f'This token sees: {seen or "no zones at all"}.'
+        )
+    host = '@' if domain == name else domain[:-(len(name) + 1)]
+    return DdnsZone(name=name, ref=ref, host=host, provider=provider)
+
+
+def _ddns_record_fqdn(zone: DdnsZone, raw_name: str) -> str:
+    """Normalize a provider's record name to a comparable FQDN.
+
+    DigitalOcean returns the relative label ('beehive', or '@' for the apex);
+    Cloudflare returns the full name. Both collapse to the same string here so
+    the caller can compare against what it asked for.
+    """
+    name = (raw_name or '').strip().rstrip('.').lower()
+    if zone.provider == 'cloudflare':
+        return name
+    if name in ('', '@'):
+        return zone.name.lower()
+    return f'{name}.{zone.name}'.lower()
+
+
+def _ddns_list_records(token: str, zone: DdnsZone, rtype: str = 'A') -> list:
+    """Return [{'id', 'value'}] for records of `rtype` at zone.fqdn.
+
+    The name is URL-encoded because wildcard targets ('*.home.jdlien.ca') are
+    a legitimate and common case — the wildcard carries the same duplicate
+    exposure as the bare record and needs updating alongside it.
+
+    Every row is re-checked against the name and type we asked for, and rows
+    without an id are dropped. We only ever address records by id for writes,
+    so a mismatched row that slipped through the server-side filter would mean
+    editing the wrong hostname's A record — "never create" would still hold
+    while the actual safety property did not.
+    """
+    base = _ddns_api_base(zone.provider)
+    name = urllib.parse.quote(zone.fqdn, safe='')
+    want = zone.fqdn.lower()
+
+    if zone.provider == 'cloudflare':
+        result = _ddns_request(
+            'GET', f'{base}/zones/{zone.ref}/dns_records?type={rtype}&name={name}',
+            token, provider='cloudflare',
+        )
+        rows = result if isinstance(result, list) else []
+        value_key = 'content'
+    else:
+        data = _ddns_request(
+            'GET', f'{base}/domains/{zone.ref}/records?type={rtype}&name={name}', token)
+        rows = data.get('domain_records', []) if isinstance(data, dict) else []
+        value_key = 'data'
+
+    records = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        record_id = row.get('id')
+        if record_id in (None, ''):
+            ui.debug(f'Ignoring {rtype} row without an id at {zone.fqdn}: {row}')
+            continue
+        row_type = str(row.get('type', rtype)).upper()
+        row_fqdn = _ddns_record_fqdn(zone, str(row.get('name', '')))
+        if row_type != rtype.upper() or row_fqdn != want:
+            ui.debug(f'Ignoring {row_type} record for {row_fqdn} returned by a '
+                     f'{rtype}/{want} query')
+            continue
+        records.append({'id': record_id, 'value': row.get(value_key)})
+    return records
+
+
+def _ddns_missing_record_message(token: str, zone: DdnsZone) -> str:
+    """Explain a missing A record, naming the CNAME when that's the cause.
+
+    A CNAME at the DDNS target is *the* failure this tool kept hitting, and
+    "No A record found" alone gives no hint that the fix is to point
+    ddns_domain one hop further down the chain.
+    """
+    base = (f'No A record found for {zone.fqdn} in the {zone.provider} '
+            f'zone {zone.name}.')
+    try:
+        cnames = _ddns_list_records(token, zone, 'CNAME')
+    except Exception as e:
+        # Best-effort diagnostic only. Whatever goes wrong probing for the
+        # CNAME, the caller still needs the missing-A-record error intact —
+        # never let the nicety replace the finding.
+        ui.debug(f'CNAME probe for {zone.fqdn} failed: {e}')
+        cnames = []
+    if cnames:
+        target = str(cnames[0].get('value') or '').rstrip('.') or '(unknown target)'
+        advice = (f'{base} It is a CNAME → {target}, and a CNAME cannot carry an '
+                  f'IP. Set ddns_domain = {target} in {PROVISIONING_CONFIG} so '
+                  'DDNS updates the A record at the end of the chain.')
+        if target != '(unknown target)' and not (
+            target == zone.name or target.endswith('.' + zone.name)
+        ):
+            # The Beehive shape: the CNAME hops into a zone at another
+            # provider. Repointing ddns_domain alone would just move the
+            # failure, so name the other two keys as well.
+            advice += (f' {target} is outside the {zone.provider} zone '
+                       f'{zone.name}, so set ddns_provider and ddns_credentials '
+                       'for whichever provider hosts it.')
+        return advice
+    return (f'{base} Create it once at your DNS provider — this tool edits '
+            'existing records by ID and never creates them, so it can never '
+            'duplicate one.')
+
+
+def _ddns_get_a_record(token: str, zone: DdnsZone) -> tuple:
+    """Return (record_id, current_ip, record_count) for the A record at zone.fqdn.
+
+    Raises DdnsError when no A record exists. Warns — loudly, every run — when
+    more than one exists: that's the exact fingerprint of inadyn's duplicate
+    bug, and it degrades connectivity intermittently rather than visibly.
+    """
+    records = _ddns_list_records(token, zone, 'A')
     if not records:
-        return None, None
-    rec = records[0]
-    return rec.get('id'), rec.get('data')
+        raise DdnsError(_ddns_missing_record_message(token, zone))
+    if len(records) > 1:
+        values = ', '.join(str(r.get('value')) for r in records)
+        ui.warning(
+            f'{zone.fqdn} has {len(records)} A records ({values}). Only the first '
+            'is updated. Clients round-robin between them, so every request that '
+            'lands on a stale IP stalls until it times out — delete the extras '
+            'at your DNS provider.'
+        )
+    return records[0].get('id'), records[0].get('value'), len(records)
 
 
-def _ddns_put_a_record(token: str, zone: str, record_id: int, new_ip: str) -> bool:
-    """PUT a new IP value for the A record. Returns True on HTTP 2xx."""
-    url = f'{DDNS_API_BASE}/domains/{zone}/records/{record_id}'
+def _ddns_put_a_record(token: str, zone: DdnsZone, record_id, new_ip: str) -> None:
+    """Point an existing A record at `new_ip`, addressing it by ID.
+
+    Never creates. Raises DdnsError on failure.
+    """
+    base = _ddns_api_base(zone.provider)
+    if zone.provider == 'cloudflare':
+        _ddns_request('PATCH', f'{base}/zones/{zone.ref}/dns_records/{record_id}',
+                      token, body={'content': new_ip}, provider='cloudflare')
+    else:
+        _ddns_request('PUT', f'{base}/domains/{zone.ref}/records/{record_id}',
+                      token, body={'data': new_ip})
+
+
+# -----------------------------------------------------------------------------
+# DDNS state — last success, failure streaks, duplicate counts
+# -----------------------------------------------------------------------------
+
+def _ddns_load_state() -> dict:
+    """Read DDNS_STATE_FILE. Returns {'targets': {}} when absent or corrupt."""
     try:
-        _ddns_request('PUT', url, token, body={'data': new_ip})
-    except (urllib.error.URLError, RuntimeError, json.JSONDecodeError) as e:
-        ui.error(f'DigitalOcean API error updating record: {e}')
-        return False
-    return True
+        with open(DDNS_STATE_FILE, 'r', encoding='utf-8') as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return {'targets': {}}
+    if not isinstance(state, dict) or not isinstance(state.get('targets'), dict):
+        return {'targets': {}}
+    return state
+
+
+def _ddns_save_state(state: dict) -> None:
+    """Write DDNS_STATE_FILE atomically. Best-effort — never fails a run."""
+    try:
+        os.makedirs(UNIFI_CERT_ROOT, mode=0o755, exist_ok=True)
+        tmp = f'{DDNS_STATE_FILE}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+        os.replace(tmp, DDNS_STATE_FILE)
+    except OSError as e:
+        ui.debug(f'Could not write {DDNS_STATE_FILE}: {e}')
+
+
+def _ddns_forget(*targets: str) -> None:
+    """Drop state entries entirely.
+
+    Used for the synthetic '(configuration)' / '(public-ip)' keys once the
+    condition they recorded has cleared, and for targets no longer configured.
+    Without this a transient failure stays red in --status forever, and a
+    permanently-red report is one nobody reads.
+    """
+    state = _ddns_load_state()
+    removed = [t for t in targets if t in state['targets']]
+    if not removed:
+        return
+    for target in removed:
+        del state['targets'][target]
+    _ddns_save_state(state)
+
+
+def _ddns_prune_state(configured: list) -> None:
+    """Forget targets that are no longer configured."""
+    keep = set(configured) | set(DDNS_SYNTHETIC_TARGETS)
+    stale = [t for t in _ddns_load_state()['targets'] if t not in keep]
+    if stale:
+        _ddns_forget(*stale)
+
+
+def _ddns_note_success(target: str, provider: str, ip: str,
+                        record_count: int) -> None:
+    """Record a successful update and clear the failure streak."""
+    state = _ddns_load_state()
+    now = datetime.now().isoformat(timespec='seconds')
+    entry = state['targets'].get(target, {})
+    previous_failures = entry.get('consecutive_failures', 0)
+    entry.update({
+        'provider': provider,
+        'last_attempt': now,
+        'last_success': now,
+        'last_ip': ip,
+        'record_count': record_count,
+        'consecutive_failures': 0,
+        'last_error': None,
+    })
+    state['targets'][target] = entry
+    _ddns_save_state(state)
+    if previous_failures:
+        ui.success(f'{target} recovered after {previous_failures} failed attempt(s).')
+
+
+def _ddns_note_failure(target: str, provider: str, message: str) -> None:
+    """Record a failure and report it on an escalating schedule.
+
+    Reports the first failure, a new failure *mode* whenever the message
+    changes, then hourly and daily milestones. Silence between those is
+    deliberate: 6,295 identical error lines is what hid this outage for
+    months, and --status carries the running count regardless.
+    """
+    state = _ddns_load_state()
+    now = datetime.now().isoformat(timespec='seconds')
+    entry = state['targets'].get(target, {})
+    previous_error = entry.get('last_error')
+    count = entry.get('consecutive_failures', 0) + 1
+    entry.update({
+        'provider': provider,
+        'last_attempt': now,
+        'consecutive_failures': count,
+        'last_error': message,
+    })
+    state['targets'][target] = entry
+    _ddns_save_state(state)
+
+    changed = message != previous_error
+    milestone = count in DDNS_FAILURE_ALERTS or (
+        count > DDNS_FAILURE_ALERTS[-1] and count % DDNS_FAILURE_ALERTS[-1] == 0
+    )
+    if not (changed or milestone):
+        ui.debug(f'DDNS {target}: {message} (failure #{count})')
+        return
+
+    ui.error(f'DDNS update failed for {target}: {message}')
+    if count > 1:
+        last_success = entry.get('last_success')
+        since = f'nothing has updated it since {last_success}' if last_success \
+            else 'it has never updated successfully'
+        ui.error(f'  {count} consecutive failures (~{count * 5 // 60}h) — {since}.')
+
+
+# -----------------------------------------------------------------------------
+# DDNS orchestration
+# -----------------------------------------------------------------------------
+
+def _ddns_settings(cfg: dict, domain: Optional[str] = None,
+                    provider: Optional[str] = None,
+                    credentials: Optional[str] = None) -> DdnsSettings:
+    """Resolve DDNS targets / provider / credentials from flags + config.
+
+    Each ddns_* key falls back to its cert equivalent so single-record
+    installs need no extra configuration. ddns_domain accepts a comma- or
+    space-separated list, because a wildcard ('*.home.jdlien.ca') needs the
+    same maintenance as the record it shadows.
+    """
+    raw = domain or cfg.get('ddns_domain') or cfg.get('domain')
+    targets = [t.strip() for t in (raw or '').replace(' ', ',').split(',') if t.strip()]
+    if not targets:
+        raise DdnsError(
+            'No DDNS target configured. Pass --ddns-domain, or set ddns_domain '
+            f'(falling back to domain) in {PROVISIONING_CONFIG}.'
+        )
+
+    cert_provider = cfg.get('dns_provider') or 'digitalocean'
+    ddns_provider = (provider or cfg.get('ddns_provider')
+                     or cert_provider)
+    if ddns_provider not in DDNS_API_BASES:
+        raise DdnsError(
+            f'DDNS does not support DNS provider {ddns_provider!r} '
+            f'(supported: {", ".join(DDNS_PROVIDERS)}). Set ddns_provider in '
+            f'{PROVISIONING_CONFIG} if your DDNS zone lives elsewhere than '
+            'your ACME zone.'
+        )
+
+    creds = credentials or cfg.get('ddns_credentials')
+    if not creds:
+        fallback = cfg.get('dns_credentials')
+        # The credentials fall back to the cert's only when that file can
+        # actually authenticate the DDNS provider — either because it's the
+        # same provider, or because one file holds both tokens. Handing a
+        # DigitalOcean token to Cloudflare's API would fail as an opaque 401,
+        # which is precisely the class of silent misconfiguration this path
+        # exists to prevent.
+        field = DNS_PROVIDERS.get(ddns_provider, {}).get('field')
+        usable = ddns_provider == cert_provider or (
+            fallback and field and _ddns_read_creds_field(fallback, field)
+        )
+        if fallback and not usable:
+            raise DdnsError(
+                f'ddns_provider is {ddns_provider} but the certificate provider '
+                f'is {cert_provider}, and ddns_credentials is unset — '
+                f'{fallback} holds no {field}, so falling back to it would '
+                f'authenticate against the wrong API. Set ddns_credentials in '
+                f'{PROVISIONING_CONFIG}.'
+            )
+        creds = fallback
+    if not creds:
+        raise DdnsError(
+            'No DNS credentials configured for DDNS. Pass --ddns-credentials, '
+            f'or set ddns_credentials / dns_credentials in {PROVISIONING_CONFIG}.'
+        )
+    if not os.path.exists(creds):
+        raise DdnsError(f'DNS credentials file not found: {creds}')
+
+    return DdnsSettings(targets=targets, provider=ddns_provider, credentials=creds)
+
+
+def _ddns_update_target(token: str, provider: str, target: str,
+                         public_ip: str, force: bool = False) -> None:
+    """Bring one target's A record in line with `public_ip`. Raises DdnsError."""
+    zone = _ddns_resolve_zone(token, target, provider)
+    record_id, current_ip, count = _ddns_get_a_record(token, zone)
+
+    if current_ip == public_ip and not force:
+        ui.debug(f'A record {zone.fqdn} already up to date: {public_ip}')
+        _ddns_note_success(target, provider, public_ip, count)
+        return
+
+    _ddns_put_a_record(token, zone, record_id, public_ip)
+    ui.success(f'Updated {zone.fqdn} A → {public_ip} (was {current_ip})')
+    _ddns_note_success(target, provider, public_ip, count)
+
+
+def ddns_validate(cfg: Optional[dict] = None) -> tuple:
+    """Read-only check that the configured DDNS target is actually updatable.
+
+    Resolves the zone and looks the A record up without writing anything, so
+    a CNAME target — or a token that can't see the zone — is caught at
+    provisioning time instead of failing silently every five minutes for
+    months. Returns (ok, message).
+    """
+    if cfg is None:
+        cfg = load_provisioning_config()
+    if not ddns_is_enabled(cfg):
+        return True, 'DDNS is disabled (ddns_enabled = false); nothing to validate.'
+    try:
+        settings = _ddns_settings(cfg)
+        token = _ddns_token(settings)
+    except DdnsError as e:
+        return False, str(e)
+
+    problems = []
+    for target in settings.targets:
+        try:
+            zone = _ddns_resolve_zone(token, target, settings.provider)
+            _ddns_get_a_record(token, zone)
+        except DdnsError as e:
+            problems.append(f'{target}: {e}')
+    if problems:
+        return False, ' '.join(problems)
+    return True, (f'DDNS target(s) {", ".join(settings.targets)} resolve to '
+                  f'editable A records at {settings.provider}.')
 
 
 def ddns_update(domain: Optional[str] = None,
-                dns_credentials: Optional[str] = None,
+                credentials: Optional[str] = None,
+                provider: Optional[str] = None,
                 force: bool = False) -> bool:
-    """Refresh the DigitalOcean A record for `domain` to the current public IP.
+    """Refresh every configured DDNS target's A record to the current public IP.
 
-    Reads provisioning config when args missing (the cron-fired case).
-    Idempotent — matching IP is a no-op (debug log only). Pass force=True
-    to PATCH even when the record matches.
+    Reads provisioning config for anything not passed (the cron-fired case).
+    Idempotent — a matching IP is a no-op logged at debug level. Pass
+    force=True to write even when the record already matches. Returns True
+    only when every target succeeded.
     """
     cfg = load_provisioning_config()
-    domain = domain or cfg.get('domain')
-    dns_credentials = dns_credentials or cfg.get('dns_credentials')
-    dns_provider = cfg.get('dns_provider', 'digitalocean')
+    try:
+        settings = _ddns_settings(cfg, domain=domain, provider=provider,
+                                  credentials=credentials)
+        token = _ddns_token(settings)
+    except DdnsError as e:
+        # Track config errors too: a misconfigured install fires every five
+        # minutes just like a broken one, and deserves the same escalation.
+        _ddns_note_failure(DDNS_CONFIG_TARGET,
+                           provider or cfg.get('ddns_provider')
+                           or cfg.get('dns_provider') or '(unset)', str(e))
+        return False
 
+    # Config resolved, so any recorded config failure is history.
+    _ddns_forget(DDNS_CONFIG_TARGET)
+
+    # Forget targets that are no longer configured — state that can only
+    # accumulate failures ends up permanently red and therefore ignored. Only
+    # when the target set came from the config, though: a one-shot
+    # --ddns-domain override is not a reconfiguration, and must not discard
+    # the tracked history of what cron actually maintains.
     if not domain:
-        ui.error('--ddns-update needs a domain (use -d or seed provisioning config).')
-        return False
-    if dns_provider != 'digitalocean':
-        ui.error(f'--ddns-update currently supports digitalocean only '
-                 f'(provisioning config has dns_provider={dns_provider}).')
-        return False
-    if not dns_credentials or not os.path.exists(dns_credentials):
-        ui.error(f'DNS credentials file not found: {dns_credentials}')
-        return False
-
-    token = _ddns_extract_token(dns_credentials, dns_provider)
-    if not token:
-        ui.error(f'Could not extract dns_{dns_provider}_token from {dns_credentials}.')
-        return False
+        _ddns_prune_state(settings.targets)
 
     public_ip = get_public_ip(timeout=5)
     if not public_ip:
-        ui.error('Could not determine public IP from any provider.')
+        _ddns_note_failure(DDNS_PUBLIC_IP_TARGET, settings.provider,
+                           'Could not determine public IP from any provider.')
         return False
+    _ddns_forget(DDNS_PUBLIC_IP_TARGET)
 
-    zone, host = _ddns_resolve_zone(token, domain)
-    if not zone:
-        ui.error(f'No DigitalOcean zone found for {domain}.')
-        return False
-
-    record_id, current_ip = _ddns_get_a_record(token, zone, host)
-    if record_id is None:
-        ui.error(f'No A record found for {host}.{zone}; create it first '
-                 'in the DigitalOcean web UI.')
-        return False
-
-    if current_ip == public_ip and not force:
-        ui.debug(f'A record {host}.{zone} already up to date: {public_ip}')
-        return True
-
-    if _ddns_put_a_record(token, zone, record_id, public_ip):
-        ui.success(f'Updated {host}.{zone} A → {public_ip} (was {current_ip})')
-        return True
-    return False
+    all_ok = True
+    for target in settings.targets:
+        try:
+            _ddns_update_target(token, settings.provider, target, public_ip,
+                                force=force)
+        except DdnsError as e:
+            _ddns_note_failure(target, settings.provider, str(e))
+            all_ok = False
+    return all_ok
 
 
 # Set this to a SHA-256 hex digest of a known-good unifi-cert.py release to
@@ -2818,6 +3530,70 @@ def _print_glennr_section() -> None:
     ui.info('Run --migrate-glennr to import provisioning + clean up.')
 
 
+def _ddns_success_age(last_success: Optional[str]) -> Optional[float]:
+    """Seconds since an ISO last-success stamp, or None if absent/unparseable."""
+    if not last_success:
+        return None
+    try:
+        return (datetime.now() - datetime.fromisoformat(last_success)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _print_ddns_section(cfg: dict) -> None:
+    """DDNS configuration + last-run outcome.
+
+    Reads DDNS_STATE_FILE rather than probing the provider, so --status stays
+    offline and side-effect free. That makes it a report of the last run, not
+    a live check — but a stale last-success timestamp is precisely the signal
+    that went unnoticed for months, so it's the number worth showing.
+    """
+    enabled = ddns_is_enabled(cfg)
+    try:
+        settings = _ddns_settings(cfg)
+    except DdnsError as e:
+        ui.warning(f'DDNS not configured: {e}')
+        settings = None
+
+    if settings:
+        ui.table([
+            ('Enabled', 'yes' if enabled else 'no (ddns_enabled = false)'),
+            ('Targets', ', '.join(settings.targets)),
+            ('Provider', settings.provider),
+            ('Credentials', settings.credentials),
+        ])
+    if not enabled:
+        ui.info('DDNS cron line is not installed; nothing here is being refreshed.')
+
+    targets = _ddns_load_state().get('targets', {})
+    if not targets:
+        ui.info(f'No DDNS run recorded yet ({DDNS_STATE_FILE} absent).')
+        return
+
+    for target, entry in sorted(targets.items()):
+        failures = entry.get('consecutive_failures', 0)
+        last_success = entry.get('last_success') or 'never'
+        if failures:
+            ui.error(f'{target}: {failures} consecutive failure(s), '
+                     f'last success {last_success}')
+            ui.info(f'  last error: {entry.get("last_error") or "(none recorded)"}')
+        else:
+            stale = _ddns_success_age(entry.get('last_success'))
+            if enabled and stale is not None and stale > DDNS_STALE_SUCCESS_SECONDS:
+                # A zero-failure entry that stopped updating means cron isn't
+                # firing at all. Rendering that as a green line is worse than
+                # useless — it is the reassurance that hides the outage.
+                ui.warning(f'{target} → {entry.get("last_ip") or "(unknown)"} but '
+                           f'last success was {int(stale // 3600)}h ago '
+                           f'({last_success}); the 5-minute job looks stopped.')
+            else:
+                ui.success(f'{target} → {entry.get("last_ip") or "(unknown)"} '
+                           f'(last success {last_success})')
+        if (entry.get('record_count') or 0) > 1:
+            ui.warning(f'  {target} had {entry["record_count"]} A records at the '
+                       'last check — duplicates stall connections intermittently.')
+
+
 def _print_log_tail_section() -> None:
     """Last STATUS_LOG_TAIL_LINES of LOG_FILE."""
     if not os.path.exists(LOG_FILE):
@@ -2878,6 +3654,9 @@ def print_status(host: Optional[str] = None,
     ui.header('Schedule & hooks')
     _print_schedule_section()
     _print_lock_section()
+
+    ui.header('DDNS')
+    _print_ddns_section(cfg)
 
     ui.header('GlennR residue')
     _print_glennr_section()
@@ -3050,6 +3829,9 @@ def _build_remote_command(verb: str, args: argparse.Namespace) -> str:
         ('-e', getattr(args, 'email', None)),
         ('--dns-provider', getattr(args, 'dns_provider', None)),
         ('--dns-credentials', getattr(args, 'dns_credentials', None)),
+        ('--ddns-domain', getattr(args, 'ddns_domain', None)),
+        ('--ddns-provider', getattr(args, 'ddns_provider', None)),
+        ('--ddns-credentials', getattr(args, 'ddns_credentials', None)),
     )
     for flag, value in string_flags:
         if value:
@@ -3356,8 +4138,24 @@ Examples:
                             'and uninstall GlennR\'s footprint. Use --dry-run '
                             'to preview, --force to skip per-path confirms.')
     parser.add_argument('--ddns-update', action='store_true',
-                       help='Refresh the cert hostname A record at the DNS '
-                            'provider to current public IP. DigitalOcean only.')
+                       help='Refresh the DDNS target A record(s) at the DNS '
+                            'provider to the current public IP. Never creates '
+                            'records — edits existing ones by ID.')
+
+    # DDNS target overrides. Each falls back to its cert equivalent, so these
+    # are only needed when the DDNS anchor differs from the certificate CN
+    # (e.g. the CN is a CNAME pointing at a record in another provider's zone).
+    parser.add_argument('--ddns-domain',
+                       help='DDNS target hostname(s), comma-separated. '
+                            'Defaults to ddns_domain, then domain, from the '
+                            'provisioning config.')
+    parser.add_argument('--ddns-provider',
+                       choices=list(DDNS_PROVIDERS),
+                       help='DNS provider hosting the DDNS target zone '
+                            '(defaults to --dns-provider)')
+    parser.add_argument('--ddns-credentials',
+                       help='Credentials file for the DDNS provider '
+                            '(defaults to --dns-credentials)')
     parser.add_argument('--status', action='store_true',
                        help='Print a health report (cert, certbot venv, cron, '
                             'hook, GlennR residue, log tail). Combine with '
@@ -3460,7 +4258,7 @@ def interactive_mode() -> dict:
     save_config(email=config['email'], dns_provider=config['dns_provider'])
 
     # Credentials
-    default_creds = os.path.expanduser(f'~/.secrets/certbot/{config["dns_provider"]}.ini')
+    default_creds = default_credentials_path(config['dns_provider'])
     config['dns_credentials'] = ui.prompt('DNS credentials file', default=default_creds)
 
     # Check if credentials exist, offer to create
@@ -3580,10 +4378,21 @@ def _handle_migrate_glennr(args: argparse.Namespace) -> int:
 
 
 def _handle_ddns_update(args: argparse.Namespace) -> int:
-    """`--ddns-update`: refresh A record at DNS provider to current public IP."""
+    """`--ddns-update`: refresh DDNS target A record(s) to current public IP.
+
+    --ddns-* wins over the cert flags, which in turn win over the provisioning
+    config. -d stays honoured so the pre-decoupling invocation still works.
+    """
     rotate_log()
-    ok = ddns_update(domain=args.domain,
-                     dns_credentials=args.dns_credentials,
+    provider = args.ddns_provider or args.dns_provider
+    if provider and provider not in DDNS_API_BASES:
+        # --dns-provider covers every ACME plugin; only some have a DDNS
+        # backend. Ignore an inherited one rather than failing the run, so
+        # `--ddns-update --dns-provider route53` still consults the config.
+        provider = args.ddns_provider
+    ok = ddns_update(domain=args.ddns_domain or args.domain,
+                     credentials=args.ddns_credentials or args.dns_credentials,
+                     provider=provider,
                      force=args.force)
     return 0 if ok else 1
 
@@ -3716,8 +4525,7 @@ def _handle_obtain_new(args: argparse.Namespace) -> int:
         return 1
 
     if not args.dns_credentials:
-        default_creds = os.path.expanduser(
-            f'~/.secrets/certbot/{args.dns_provider}.ini')
+        default_creds = default_credentials_path(args.dns_provider)
         if os.path.exists(default_creds):
             ui.info(f'Using credentials from: {default_creds}')
             args.dns_credentials = default_creds
@@ -3781,13 +4589,35 @@ def _handle_obtain_new(args: argparse.Namespace) -> int:
     # config. Remote installs run from a workstation; the device-side schedule
     # gets installed during --renew/--self-heal on the device itself.
     if not args.host:
-        install_cron_schedule()
-        save_provisioning_config(
+        # Save provisioning before installing cron: the cron writer reads
+        # ddns_enabled from it, and --renew depends on it existing at all.
+        if not save_provisioning_config(
             domain=args.domain,
             email=args.email,
             dns_provider=args.dns_provider,
             dns_credentials=args.dns_credentials,
-        )
+            ddns_domain=args.ddns_domain,
+            ddns_provider=args.ddns_provider,
+            ddns_credentials=args.ddns_credentials,
+        ):
+            ui.warning(f'Could not write {PROVISIONING_CONFIG}. Cron-fired '
+                       '--renew has nothing to self-configure from; fix the '
+                       'path and re-run.')
+        if not install_cron_schedule():
+            ui.warning('Cron schedule not installed — renewals and DDNS will '
+                       'not run on their own. Re-run --self-heal once the '
+                       'cause is fixed.')
+
+        # Validate the DDNS target now rather than discovering months later
+        # that a CNAME made every five-minute run a no-op. Never fatal: the
+        # certificate is already installed, and DDNS is a separate concern.
+        ddns_ok, ddns_message = ddns_validate()
+        if ddns_ok:
+            ui.success(ddns_message)
+        else:
+            ui.warning(f'DDNS target is not updatable: {ddns_message}')
+            ui.info('The certificate is installed and renewals are scheduled; '
+                    'only the A-record refresh is affected.')
 
     ui.header('Complete')
     ui.success(f'Certificate for {args.domain} obtained and installed!')

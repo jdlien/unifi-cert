@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-07-31
+
+Cloudflare DDNS support, and the fix for `--ddns-update` never having succeeded once. See `docs/DDNS-CLOUDFLARE-PLAN.md` for the incident write-up.
+
+Deployed and verified end-to-end on beehive (UDM Pro, `beehive.jdlien.com`) on 2026-07-31, against the live `jdlien.ca` zone at Cloudflare. The prior install had logged **6,366** consecutive `No A record found` failures and zero successful updates since April. After deployment: both targets resolve, an unchanged IP is a correct no-op, and a `--force` write edits both records **in place** — verified by record ID before and after (`620dfff9…`, `6088d3ba…` unchanged, zone still holding exactly three A records, the unrelated apex untouched). That last check is the never-create invariant proven against the real API rather than a mock.
+
+### Added
+
+- **Cloudflare DDNS backend.** `--ddns-update` now supports Cloudflare alongside DigitalOcean: zone lookup via `GET /zones?name=`, record lookup via `GET /zones/{id}/dns_records`, update via `PATCH …/dns_records/{id}` with `{"content": ip}`. Cloudflare's `{success, result, errors}` envelope is unwrapped centrally, and its error text is surfaced on failures instead of a bare HTTP status. Requires a scoped API token (`dns_cloudflare_api_token`) with `Zone:DNS:Edit` + `Zone:Zone:Read`; legacy global API keys are refused with instructions, since they can't do bearer auth and grant far more than this needs.
+- **The DDNS target is now configured separately from the certificate CN.** New `ddns_domain` / `ddns_provider` / `ddns_credentials` provisioning keys, plus matching `--ddns-domain` / `--ddns-provider` / `--ddns-credentials` flags (forwarded over `--host`). Each falls back to its cert equivalent, so existing installs are unaffected. `ddns_domain` accepts a comma-separated list so a wildcard is maintained alongside the record it shadows.
+
+  This was the actual bug: the target was derived from the cert CN, which on the affected device is a CNAME to a record in a different provider's zone. There is no A record at that name and never was — 6,295 consecutive failures, zero successful updates, from April to July.
+
+- **`ddns_enabled = false`** omits the DDNS cron line. Needed because `self_heal()` rewrites `CRON_FILE` on every renewal and every boot, so deleting the line by hand doesn't stick.
+- **Failure visibility.** `/data/unifi-cert/ddns-state.json` tracks last success, last IP, failure streak, and last error per target. Reports fire on the first failure, on any *new* error, then at hourly and daily milestones — the same message 6,295 times is indistinguishable from noise. `--status` gained a DDNS section showing configuration, per-target last success, failure streaks, a warning when a target has more than one A record (the fingerprint of the duplicate-record bug), and a warning when the last success is old enough to mean cron itself has stopped.
+- **`ddns_validate()`**, a read-only provisioning-time check that the DDNS target resolves to an editable A record. obtain-new runs it and warns; it never fails the install, since the certificate is already in place by then.
+- **CNAME diagnosis.** When no A record exists, the tool probes for a CNAME at the same name and names the fix — including `ddns_provider` and `ddns_credentials` when the CNAME points into another provider's zone, where repointing `ddns_domain` alone would just move the failure.
+
+### Fixed
+
+- **`save_provisioning_config()` merges instead of overwriting.** It previously rewrote the file with four hardcoded keys, so any hand-added `ddns_*` key would be silently dropped by a later obtain-new run — reverting the DDNS target to the cert CN and reintroducing the bug above. Unknown keys are now preserved too.
+- **A Cloudflare response that isn't a well-formed success envelope no longer counts as a successful update.** An empty or unrecognized body was previously accepted, meaning a write that never happened could be logged as one.
+- **Records are verified before being edited.** `_ddns_list_records()` re-checks each returned row's name and type against what was requested and drops rows without an id. Writes address records by id, so a row that slipped past the server-side filter would have meant editing some other hostname's A record.
+- **Zone resolution can no longer produce a false negative.** It now probes candidate suffixes rather than walking a paged zone listing; the previous listing fetched only DigitalOcean's default first 20 domains, so an account with more would have had an owned zone reported as unowned.
+- **The public IP is validated as globally routable** before being written to DNS. A regex shape check would have accepted an RFC1918 address from a captive portal or hijacked resolver. The plaintext-HTTP lookup provider also moved to last in the fallback chain, behind the HTTPS ones.
+- **The IP lookup now leads with IPv4-only hostnames** (`api4.ipify.org`, `ipv4.icanhazip.com`). On a dual-stack connection the device reaches a dual-stack lookup service over IPv6 and is told its *IPv6* address — observed live, where `ipwho.is` answered `2001:56a:…` while `ipify` answered the IPv4 from the same machine. An A record can only hold IPv4, so every dual-stack provider's answer was being discarded; had they all been dual-stack the chain would have returned nothing and DDNS would never have run. Hostnames that publish only an A record force the connection over v4. Extractors now take the raw response body, so plain-text endpoints work alongside JSON ones, and `https://ipv4.my-ip.ca/ip/` leads the chain as a first-party source with the public services behind it. A rejected body is truncated to 60 characters in the log, since a content-negotiating service can answer with an entire HTML page.
+- **obtain-new no longer reports success when the provisioning-config write or cron install failed.** Both return values were ignored.
+- **Credentials now default into the persistent root when running on a UniFi device.** The interactive wizard and obtain-new both defaulted to `~/.secrets/certbot/<provider>.ini`, which on a device is `/root/.secrets/` — wiped by firmware updates, and outside everything else the tool owns. Found in the wild on beehive: a byte-identical duplicate of the live DigitalOcean token sitting unreferenced in `/root/.secrets/certbot/`, dating from the original install. A forgotten second copy of a live credential is one nobody remembers to rotate. New `default_credentials_path()` returns `CREDENTIALS_DIR/<provider>.ini` on-device and the conventional workstation path elsewhere.
+
 ## [2.0.1] - 2026-04-28
 
 End-to-end verified against bar (UDM Pro SE) + the Rednex NVR (UNVR). Eight migration-flow + remote-dispatch bugs uncovered during back-to-back GlennR cutovers and fixed at the source. Both hosts now on a single canonical lineage with a fresh LE cert; future installs should run end-to-end with no manual sed-and-rename.
@@ -89,6 +118,7 @@ End-to-end verified against beehive (UniFi OS 5.1.8): `--status`, `--ddns-update
 - Python 3.9+ compatible with explicit UTF-8 encoding for future-proofing
 - 95% test coverage
 
+[2.1.0]: https://github.com/jdlien/unifi-cert/releases/tag/v2.1.0
 [2.0.1]: https://github.com/jdlien/unifi-cert/releases/tag/v2.0.1
 [2.0.0]: https://github.com/jdlien/unifi-cert/releases/tag/v2.0.0
 [1.0.0]: https://github.com/jdlien/unifi-cert/releases/tag/v1.0.0

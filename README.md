@@ -18,7 +18,7 @@ Inspired by [GlennR's UniFi Easy Encrypt](https://community.ui.com/questions/Uni
 - **One-command GlennR migration** - `--migrate-glennr` snapshots GlennR's footprint, imports its provisioning, then uninstalls it via an explicit allowlist. `--dry-run` previews; `--force` skips per-path confirms
 - **Lifecycle verbs over `--host`** - `--status`, `--renew`, `--self-heal`, `--migrate-glennr`, `--ddns-update`, `--bootstrap`, `--setup-hook` all accept `--host <device>` so you can drive a UniFi box from your workstation. Script is SCPed only when local + remote sha256 differ
 - **Health check** - `--status` prints a one-shot read-only report: cert metadata + days remaining, certbot venv version, cron / hook / boot-script state, lock state, GlennR-residue scan, last 20 log lines
-- **DDNS auto-refresh** - `--ddns-update` keeps the cert hostname's A record fresh against your current public IP using the same DigitalOcean token as ACME. Cron runs it every 5 min; idempotent no-op when the record already matches
+- **DDNS auto-refresh** - `--ddns-update` keeps an A record fresh against your current public IP on DigitalOcean or Cloudflare. Cron runs it every 5 min; idempotent no-op when the record already matches. Edits by record ID and never creates, so it cannot leave duplicate A records behind. The target is configurable separately from the cert CN
 - **Auto-detects domain** - Reads CN from existing certificate, no need to specify `-d` when syncing
 - **Auto-detects credentials** - Finds `~/.secrets/certbot/{provider}.ini` automatically
 - **Remembers preferences** - Saves email and DNS provider to `~/.secrets/certbot/config.ini`
@@ -141,23 +141,53 @@ python3 unifi-cert.py --status --host 192.168.1.1
 
 `--status` reports provisioning config, certificate metadata + days remaining, certbot venv version, cron / hook / boot-script presence, lock state, any GlennR residue still on the device, and the last 20 log lines. Pure read-only — safe to run anytime.
 
-### DDNS Auto-Refresh (DigitalOcean)
+### DDNS Auto-Refresh (DigitalOcean + Cloudflare)
 
-When you obtain a certificate via DigitalOcean, the same API token is reused to keep the cert hostname's A record fresh against your current public IP. The cron schedule installs a `--ddns-update` line that runs every 5 minutes:
+Keeps a hostname's A record pointed at your current public IP, so inbound access survives an ISP rotating your WAN address on modem reboot or DHCP renewal — without depending on a third-party DDNS service. The cron schedule installs a `--ddns-update` line that runs every 5 minutes:
 
 ```cron
 */5 * * * * root /usr/bin/python3 /data/scripts/unifi-cert.py --ddns-update >> /data/unifi-cert/unifi-cert.log 2>&1
 ```
 
-The update is idempotent — if the A record already matches public IP, it's a no-op API call. Useful when your ISP rotates WAN IPs on modem reboot or DHCP renewal and you don't want to depend on a third-party DDNS service.
-
-To force an immediate refresh:
+The update is idempotent — a matching A record is a no-op. To force an immediate refresh:
 
 ```bash
 ssh root@192.168.1.1 /data/scripts/unifi-cert.py --ddns-update --force
 ```
 
-DigitalOcean only for v1; the dispatch shape leaves room for Cloudflare / Route53 / others.
+**It never creates records.** It looks the record up, edits it *by ID*, and refuses when it's missing. Updaters that re-resolve by name on every run (UniFi's built-in inadyn among them) create a *second* A record whenever that lookup misses, leaving clients to round-robin onto a dead IP. Editing by ID structurally can't do that.
+
+#### Targeting a different record than the certificate
+
+The DDNS target and the certificate CN are often the same record, in which case there's nothing to configure. When they differ — a common case is the cert CN being a CNAME pointing at the record that actually holds the IP, possibly in another provider's zone — set them separately in `/data/unifi-cert/unifi-cert.conf`:
+
+```ini
+domain           = beehive.jdlien.com                  # cert CN, ACME
+dns_provider     = digitalocean
+dns_credentials  = /data/unifi-cert/credentials/digitalocean.ini
+
+ddns_domain      = home.jdlien.ca,*.home.jdlien.ca     # what DDNS updates
+ddns_provider    = cloudflare
+ddns_credentials = /data/unifi-cert/credentials/cloudflare.ini
+```
+
+`ddns_domain` accepts a list, so a wildcard is maintained alongside the record it shadows. Each `ddns_*` key falls back to its cert equivalent when absent — except `ddns_credentials`, which only falls back when the provider is unchanged (or the file also holds the other provider's token). Pointing a DigitalOcean token at Cloudflare's API just yields an opaque 401, so it refuses and says which key to set.
+
+The same values are available as one-shot overrides: `--ddns-domain`, `--ddns-provider`, `--ddns-credentials`.
+
+Cloudflare needs a **User** API token (`cfut_` prefix, under My Profile → API Tokens) with `Zone:DNS:Edit` + `Zone:Zone:Read`, stored as `dns_cloudflare_api_token`. Legacy global API keys are refused — they can't do bearer auth and grant far more than this needs.
+
+#### Turning DDNS off
+
+```ini
+ddns_enabled = false
+```
+
+Then re-run `--self-heal`. Deleting the cron line by hand doesn't stick; `self_heal()` rewrites the cron file on every renewal and every boot.
+
+#### When it breaks
+
+Failures are tracked in `/data/unifi-cert/ddns-state.json` and reported on an escalating schedule — the first failure, any *new* error, then hourly and daily milestones — rather than an identical line every 5 minutes. `--status` shows each target's last success, failure streak, and a warning when the record has duplicates or when the last success is old enough to mean cron itself has stopped.
 
 ## DNS Credentials
 
@@ -238,8 +268,13 @@ Lifecycle Operations:
                              /etc/letsencrypt → /data/unifi-cert/letsencrypt,
                              uninstall GlennR. Combine with --dry-run to
                              preview, --force to skip per-path confirms.
-  --ddns-update              Refresh the cert hostname's A record at the
-                             DNS provider to current public IP. DO only.
+  --ddns-update              Refresh the DDNS target A record(s) at the DNS
+                             provider to current public IP. Never creates.
+  --ddns-domain NAMES        DDNS target hostname(s), comma-separated
+                             (default: ddns_domain, then domain, from config)
+  --ddns-provider PROVIDER   Provider hosting the DDNS zone (digitalocean,
+                             cloudflare; default: --dns-provider)
+  --ddns-credentials PATH    Credentials file for the DDNS provider
 
 Modifiers:
   --dry-run                  Test without making changes
@@ -262,7 +297,7 @@ Modifiers:
 | `--bootstrap`     | build/repair certbot venv only                                       |          |
 | `--setup-hook`    | rewrite the certbot post-renewal hook                                |          |
 | `--migrate-glennr`| migrate from GlennR + uninstall                                      |          |
-| `--ddns-update`   | refresh A record at DNS provider                                     |          |
+| `--ddns-update`   | refresh the DDNS target A record(s) at the DNS provider               |          |
 | `--status`        | read-only health report                                              |          |
 
 ## How It Works

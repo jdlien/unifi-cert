@@ -34,7 +34,7 @@ unifi-cert.py (~3500 lines, 88% test coverage)
 ├── CERTBOT               - Let's Encrypt integration
 ├── CERTBOT BOOTSTRAP     - Persistent venv + apt prereqs (firmware-wipe survival)
 ├── SCHEDULE & SELF-HEAL  - cron, boot script, lock, log rotation, renewal-due, self_heal()
-├── DDNS                  - DigitalOcean A-record auto-refresh (--ddns-update)
+├── DDNS                  - A-record auto-refresh, DigitalOcean + Cloudflare (--ddns-update)
 ├── HOOK                  - certbot post-renewal hook + opt-in pinned autoupdate
 ├── STATUS                - print_status() composes a one-shot health report
 ├── REMOTE SSH            - SSH/SCP + dispatch_remote_verb() (--host plumbing)
@@ -48,8 +48,9 @@ Everything that needs to survive UniFi OS firmware updates lives under `/data/un
 
 ```
 /data/unifi-cert/
-├── unifi-cert.conf      # provisioning config (domain, email, dns provider, creds path)
+├── unifi-cert.conf      # provisioning config (domain, email, dns provider, creds path, ddns_*)
 ├── unifi-cert.log       # main log (rotated >1 MB, keep last 100 KB)
+├── ddns-state.json      # per-target last success / failure streak / duplicate count
 ├── unifi-cert.lock      # fcntl.flock — serializes --renew vs --deploy-hook
 ├── credentials/         # DNS provider credentials (mode 0600)
 ├── letsencrypt/         # certbot --config-dir (accounts, archive, live, renewal)
@@ -76,7 +77,7 @@ Each verb has a `_handle_<verb>(args) -> int` function; `main()` dispatches via 
 | `--setup-hook` | rewrite the renewal hook (use `--enable-hook-autoupdate` for opt-in autoupdate) | yes |
 | `--bootstrap` | build/repair `/data/unifi-cert/certbot-venv` and exit | yes |
 | `--migrate-glennr` | import GlennR provisioning + uninstall its footprint | yes (requires `--dry-run` or `--force`) |
-| `--ddns-update` | refresh A record at DNS provider; cron-fired every 5 min | yes |
+| `--ddns-update` | refresh the DDNS target A record(s); cron-fired every 5 min | yes |
 | `--status` | read-only health report (cert, certbot venv, cron, hook, GlennR residue, log tail) | yes |
 
 ### `--host` plumbing
@@ -96,11 +97,21 @@ Key invariants (changing any of these is a regression):
 
 ## DDNS Auto-Refresh
 
-`--ddns-update` keeps the cert hostname's A record fresh against the current public IP. Built for users on Telus / Comcast / similar where the modem rotates the WAN IP on every reboot or DHCP-lease expiry, and we don't want a third-party DDNS dependency.
+`--ddns-update` keeps the DDNS target's A record fresh against the current public IP. Built for users on Telus / Comcast / similar where the modem rotates the WAN IP on every reboot or DHCP-lease expiry, and we don't want a third-party DDNS dependency. Backends: DigitalOcean and Cloudflare.
 
-Pipeline: `get_public_ip()` (multi-provider fallback chain) → `_ddns_resolve_zone()` (longest-suffix match against the user's actual DigitalOcean zones, so multi-part TLDs work without a public-suffix list) → `_ddns_get_a_record()` → diff → `_ddns_put_a_record()` if changed. Idempotent — no-op API call when the record already matches.
+Pipeline: `_ddns_settings()` (resolve targets/provider/creds) → `_ddns_token()` → `get_public_ip()` → per target: `_ddns_resolve_zone()` → `_ddns_get_a_record()` → diff → `_ddns_put_a_record()` if changed. Idempotent — no-op when the record already matches.
 
-Provider lock-in: DigitalOcean only for v1, but the dispatch shape supports Cloudflare / Route53 / others — branch on `dns_provider` and add `_ddns_*_<provider>()` helpers.
+Invariants (changing any of these is a regression):
+
+- **Never create.** Records are looked up and edited *by ID*; a missing record is an error, never a POST. Updaters that re-resolve by name create a duplicate A record when the lookup misses — that's what broke `home.jdlien.ca` (see `docs/DDNS-CLOUDFLARE-PLAN.md`). `_ddns_list_records()` re-verifies each returned row's name and type and drops rows without an id, so a slipped filter can't cause the wrong record to be edited.
+- **The DDNS target is configured separately from the cert CN.** `ddns_domain` / `ddns_provider` / `ddns_credentials` fall back to the cert equivalents; `ddns_credentials` only falls back when the provider is unchanged or the file also carries the DDNS provider's field. `ddns_domain` takes a comma-separated list (wildcards need the same maintenance as the record they shadow).
+- **Cloudflare responses must be a well-formed `{success: true, result: …}` envelope.** An empty or unrecognized body raises rather than being treated as a successful write — an unconfirmable PATCH must never be logged as an update.
+- **Zone resolution probes candidate suffixes** (`GET /zones?name=` / `GET /domains/{name}`) rather than walking a paged listing, which would have a cap and would report an owned zone as unowned. Listing survives only to enrich the "this token sees…" error.
+- **Failures escalate, they don't repeat.** `DDNS_STATE_FILE` tracks last success, streak, and last error per target; reports fire on the first failure, any *new* error, then hourly/daily milestones. Synthetic `(configuration)` / `(public-ip)` keys clear on recovery and removed targets are pruned, so `--status` can't be permanently red.
+- **`ddns_enabled = false`** omits the DDNS cron line. Required because `self_heal()` rewrites `CRON_FILE` on every renewal and boot, so hand-deleting the line can't stick.
+- **The published IP is validated** with `is_public_ipv4()` — a captive portal answering with RFC1918 would otherwise be written straight into public DNS.
+
+`ddns_validate()` is the read-only provisioning-time check (resolve zone + find A record, no writes). obtain-new runs it and warns; it never fails the install, since the certificate is already in place by then.
 
 Cron line is installed alongside `--renew` by `install_cron_schedule()`:
 
@@ -119,6 +130,7 @@ Cron line is installed alongside `--renew` by `install_cron_schedule()`:
 - `os.path.exists()` against `CRON_FILE` / `RENEWAL_HOOK_PATH` / `BOOT_SCRIPT_PATH`
 - `acquire_lock(timeout=0)` round-trip — held vs idle
 - `inventory_glennr()` — residue scan (reuses the migration allowlist)
+- `_print_ddns_section()` — DDNS config plus `DDNS_STATE_FILE` (offline; reports the last run, not a live probe). Warns on a duplicate A record and on a last-success older than `DDNS_STALE_SUCCESS_SECONDS`, which means cron itself has stopped
 - last `STATUS_LOG_TAIL_LINES` (20) of `LOG_FILE`
 
 When `host` is set, `print_status()` short-circuits to `dispatch_remote_verb('--status', host, args)` so the same code path runs on the device.

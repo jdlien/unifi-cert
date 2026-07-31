@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, call, mock_open, patch
 
@@ -484,7 +484,7 @@ class TestIPLookup:
         """Test successful IP lookup."""
         import urllib.request
         mock_response = MagicMock()
-        mock_response.read.return_value = b'{"ip": "203.0.113.1"}'
+        mock_response.read.return_value = b'{"ip": "93.184.215.14"}'
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
 
@@ -493,7 +493,7 @@ class TestIPLookup:
         urllib.request.urlopen = MagicMock(return_value=mock_response)
         try:
             result = unifi_cert.get_public_ip()
-            assert result == "203.0.113.1"
+            assert result == "93.184.215.14"
         finally:
             urllib.request.urlopen = original_urlopen
 
@@ -508,7 +508,7 @@ class TestIPLookup:
             if call_count[0] == 1:
                 raise urllib.error.URLError("First provider failed")
             mock_response = MagicMock()
-            mock_response.read.return_value = b'{"ip": "203.0.113.2"}'
+            mock_response.read.return_value = b'{"ip": "93.184.215.15"}'
             mock_response.__enter__ = MagicMock(return_value=mock_response)
             mock_response.__exit__ = MagicMock(return_value=False)
             return mock_response
@@ -517,9 +517,164 @@ class TestIPLookup:
         urllib.request.urlopen = mock_urlopen
         try:
             result = unifi_cert.get_public_ip()
-            assert result == "203.0.113.2"
+            assert result == "93.184.215.15"
         finally:
             urllib.request.urlopen = original_urlopen
+
+    @pytest.mark.parametrize('address', [
+        '192.168.1.1',      # RFC1918 — a captive portal or hijacked resolver
+        '10.0.0.5',
+        '100.64.0.1',       # CGNAT
+        '127.0.0.1',
+        '203.0.113.1',      # RFC5737 documentation range
+        '0.0.0.0',
+        'not-an-ip',
+        '',
+    ])
+    def test_non_public_addresses_are_rejected(self, address):
+        """This value is published as an A record — a shape check isn't enough."""
+        assert unifi_cert.is_public_ipv4(address) is False
+
+    def test_public_address_accepted(self):
+        assert unifi_cert.is_public_ipv4('198.53.200.179') is True
+
+    def test_ipv6_answer_falls_through_to_an_ipv4_provider(self):
+        """A dual-stack device gets told its v6 address; an A record can't hold it.
+
+        Observed live on the target network: ipwho.is answered
+        2001:56a:… over IPv6 while ipify answered the IPv4. Without the
+        fall-through the whole chain returns None and DDNS never runs.
+        """
+        import urllib.request
+
+        def mock_urlopen(req, *args, **kwargs):
+            # Every dual-stack service answers with the v6 address; only the
+            # IPv4-pinned hostnames can report the v4 one.
+            if 'api4.' in req.full_url or 'ipv4.' in req.full_url:
+                raise urllib.error.URLError('pretend the v4 hosts are down')
+            resp = MagicMock()
+            resp.read.return_value = b'{"ip": "2001:56a:f8e6:e00:8876:4a2:63bb:b383"}'
+            if 'ip-api' in req.full_url:
+                resp.read.return_value = b'{"query": "198.53.200.179"}'
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = mock_urlopen
+        try:
+            with patch.object(unifi_cert, 'ui'):
+                assert unifi_cert.get_public_ip() == '198.53.200.179'
+        finally:
+            urllib.request.urlopen = original
+
+    def test_all_providers_answering_ipv6_returns_none(self):
+        """Better to fail loudly than to publish something that isn't an IPv4."""
+        import urllib.request
+
+        def mock_urlopen(req, *args, **kwargs):
+            resp = MagicMock()
+            resp.read.return_value = b'{"ip": "2001:56a:f8e6:e00::1", "query": "2001:56a:f8e6:e00::1"}'
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = mock_urlopen
+        try:
+            with patch.object(unifi_cert, 'ui'):
+                assert unifi_cert.get_public_ip() is None
+        finally:
+            urllib.request.urlopen = original
+
+    def test_html_page_body_is_rejected(self):
+        """Observed live: a content-negotiating service served an HTML page.
+
+        Anything that isn't a public IPv4 must fall through rather than head
+        toward a DNS write, and the rejection must not dump the whole page
+        into the log on every five-minute run.
+        """
+        import urllib.request
+        html = b'<!DOCTYPE html>\n<html lang="en">\n<title>Your IP</title>\n' + b'x' * 4000
+
+        def mock_urlopen(req, *args, **kwargs):
+            resp = MagicMock()
+            resp.read.return_value = html if 'my-ip.ca' in req.full_url \
+                else b'{"ip": "198.53.200.179"}'
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        mock_ui = MagicMock()
+        original = urllib.request.urlopen
+        urllib.request.urlopen = mock_urlopen
+        try:
+            with patch.object(unifi_cert, 'ui', mock_ui):
+                assert unifi_cert.get_public_ip() == '198.53.200.179'
+        finally:
+            urllib.request.urlopen = original
+        logged = ' '.join(str(c) for c in mock_ui.debug.call_args_list)
+        assert len(logged) < 500, 'a rejected body must not be logged in full'
+
+    def test_ipv4_only_providers_are_tried_first(self):
+        """The chain must lead with hostnames that can only answer over v4."""
+        first_two = [url for url, _ in unifi_cert.IP_PROVIDERS[:2]]
+        assert any('api4.' in u for u in first_two)
+        assert any('ipv4.' in u for u in first_two)
+
+    def test_plaintext_provider_is_last(self):
+        """An answer an on-path party could rewrite goes straight into DNS."""
+        urls = [url for url, _ in unifi_cert.IP_PROVIDERS]
+        http_only = [u for u in urls if u.startswith('http://')]
+        assert http_only == [urls[-1]]
+
+    def test_plaintext_body_provider_is_parsed(self):
+        """icanhazip returns a bare address with a trailing newline, not JSON."""
+        import urllib.request
+
+        def mock_urlopen(req, *args, **kwargs):
+            resp = MagicMock()
+            # First provider is JSON; make it fail so we reach the text one.
+            if 'ipify' in req.full_url:
+                raise urllib.error.URLError('down')
+            resp.read.return_value = b'198.53.200.179\n'
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = mock_urlopen
+        try:
+            with patch.object(unifi_cert, 'ui'):
+                assert unifi_cert.get_public_ip() == '198.53.200.179'
+        finally:
+            urllib.request.urlopen = original
+
+    def test_provider_returning_private_ip_is_skipped(self):
+        """A bogus answer must fall through to the next provider, not be used."""
+        import urllib.request
+
+        def mock_urlopen(req, *args, **kwargs):
+            resp = MagicMock()
+            # The first provider is behind a captive portal; the next real
+            # answer must win rather than the bogus RFC1918 one.
+            if 'api4.' in req.full_url:
+                resp.read.return_value = b'{"ip": "192.168.1.1"}'
+            elif 'ipv4.' in req.full_url:
+                resp.read.return_value = b'93.184.215.16\n'
+            else:
+                resp.read.return_value = b'{"ip": "93.184.215.16"}'
+            resp.__enter__ = MagicMock(return_value=resp)
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = mock_urlopen
+        try:
+            with patch.object(unifi_cert, 'ui'):
+                assert unifi_cert.get_public_ip() == '93.184.215.16'
+        finally:
+            urllib.request.urlopen = original
 
     def test_get_public_ip_all_fail(self):
         """Test IP lookup when all providers fail."""
@@ -3721,6 +3876,28 @@ class TestSelfHeal:
         cron.assert_called_once()
 
 
+class TestDefaultCredentialsPath:
+    """Credentials must default into the persistent root when on a device.
+
+    /root/.secrets is wiped by firmware updates, and a copy left there becomes
+    a second forgotten copy of a live API token — which is exactly what was
+    found on beehive, dating from the original install.
+    """
+
+    def test_on_device_uses_persistent_root(self, tmp_path):
+        creds_dir = tmp_path / 'credentials'
+        with patch.object(unifi_cert, 'CREDENTIALS_DIR', str(creds_dir)), \
+             patch('os.path.isdir', return_value=True):
+            path = unifi_cert.default_credentials_path('cloudflare')
+        assert path == str(creds_dir / 'cloudflare.ini')
+        assert '.secrets' not in path
+
+    def test_off_device_uses_workstation_location(self):
+        with patch('os.path.isdir', return_value=False):
+            path = unifi_cert.default_credentials_path('digitalocean')
+        assert path.endswith('/.secrets/certbot/digitalocean.ini')
+
+
 class TestProvisioningConfig:
     """Tests for save_provisioning_config() / load_provisioning_config()."""
 
@@ -3775,6 +3952,50 @@ class TestProvisioningConfig:
             assert unifi_cert.save_provisioning_config(
                 'a.com', 'a@b.com', 'digitalocean', '/x/y.ini'
             ) is False
+
+    def test_save_persists_ddns_keys(self, tmp_path):
+        """The ddns_* trio round-trips alongside the cert fields."""
+        cfg = tmp_path / 'unifi-cert.conf'
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(cfg)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(
+                domain='beehive.jdlien.com', email='a@b.com',
+                dns_provider='digitalocean', dns_credentials='/x/do.ini',
+                ddns_domain='home.jdlien.ca,*.home.jdlien.ca',
+                ddns_provider='cloudflare',
+                ddns_credentials='/x/cloudflare.ini',
+            )
+            loaded = unifi_cert.load_provisioning_config()
+        assert loaded['ddns_domain'] == 'home.jdlien.ca,*.home.jdlien.ca'
+        assert loaded['ddns_provider'] == 'cloudflare'
+        assert loaded['ddns_credentials'] == '/x/cloudflare.ini'
+
+    def test_save_merges_and_preserves_ddns_keys(self, tmp_path):
+        """A later obtain-new must not wipe hand-added ddns_* keys.
+
+        Dropping ddns_domain silently reverts the DDNS target to the cert CN —
+        exactly the misconfiguration that caused 6,295 failed updates.
+        """
+        cfg = tmp_path / 'unifi-cert.conf'
+        cfg.write_text(
+            'domain = beehive.jdlien.com\n'
+            'ddns_domain = home.jdlien.ca\n'
+            'ddns_provider = cloudflare\n'
+            'custom_key = keep-me\n'
+        )
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(cfg)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(
+                domain='beehive.jdlien.com', email='a@b.com',
+                dns_provider='digitalocean', dns_credentials='/x/do.ini',
+            )
+            loaded = unifi_cert.load_provisioning_config()
+        assert loaded['ddns_domain'] == 'home.jdlien.ca'
+        assert loaded['ddns_provider'] == 'cloudflare'
+        assert loaded['email'] == 'a@b.com'
+        assert loaded['custom_key'] == 'keep-me'
 
 
 class TestRenew:
@@ -5184,6 +5405,9 @@ class TestMainMigrateGlennr:
         assert result == 0
 
 
+_HTTP_ERROR = object()   # sentinel: this queued entry raises instead of returning
+
+
 class _FakeUrlOpen:
     """Context-manager fake for urllib.request.urlopen.
 
@@ -5197,6 +5421,10 @@ class _FakeUrlOpen:
     def queue(self, payload, status=200):
         self._next.append((payload, status))
 
+    def queue_http_error(self, code, body=None):
+        """Queue an HTTPError, e.g. DigitalOcean's 404 for an unowned zone."""
+        self._next.append((_HTTP_ERROR, code, body))
+
     def __call__(self, req, timeout=None):
         self.requests.append({
             'method': req.get_method(),
@@ -5206,7 +5434,12 @@ class _FakeUrlOpen:
         })
         if not self._next:
             raise RuntimeError(f'No queued response for {req.get_method()} {req.full_url}')
-        payload, status = self._next.pop(0)
+        queued = self._next.pop(0)
+        if queued[0] is _HTTP_ERROR:
+            _, code, body = queued
+            raise _http_error(code, body or {'id': 'not_found',
+                                             'message': 'The resource you were accessing could not be found.'})
+        payload, status = queued
         return _FakeResp(payload, status)
 
 
@@ -5261,109 +5494,825 @@ class TestDdnsExtractToken:
         assert unifi_cert._ddns_extract_token('/does/not/exist.ini') is None
 
 
+@pytest.fixture
+def ddns_state(tmp_path):
+    """Redirect DDNS_STATE_FILE into tmp_path so state writes stay hermetic."""
+    path = tmp_path / 'ddns-state.json'
+    with patch.object(unifi_cert, 'DDNS_STATE_FILE', str(path)), \
+         patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)):
+        yield path
+
+
+def _http_error(code, body):
+    """Build a urllib HTTPError carrying a provider JSON error body."""
+    import io
+    return urllib.error.HTTPError(
+        'https://api.cloudflare.com/client/v4/zones', code, 'err', {},
+        io.BytesIO(json.dumps(body).encode('utf-8')),
+    )
+
+
+class TestDdnsRequest:
+    """Transport-layer tests for _ddns_request() across both providers."""
+
+    def test_digitalocean_payload_returned_verbatim(self):
+        """DigitalOcean has no envelope — the parsed body passes through."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domains': [{'name': 'jdlien.com'}]})
+        with patch('urllib.request.urlopen', fake):
+            out = unifi_cert._ddns_request('GET', 'https://x/domains', 'T')
+        assert out == {'domains': [{'name': 'jdlien.com'}]}
+
+    def test_cloudflare_envelope_is_unwrapped(self):
+        """{'success': True, 'result': [...]} → the bare result list."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'errors': [],
+                    'result': [{'id': 'zid', 'name': 'jdlien.ca'}]})
+        with patch('urllib.request.urlopen', fake):
+            out = unifi_cert._ddns_request('GET', 'https://x/zones', 'T',
+                                           provider='cloudflare')
+        assert out == [{'id': 'zid', 'name': 'jdlien.ca'}]
+
+    def test_cloudflare_success_false_raises_with_message(self):
+        """success=false on an HTTP 200 still has to fail, with CF's own text."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': False,
+                    'errors': [{'code': 1000, 'message': 'Invalid API Token'}],
+                    'result': None})
+        with patch('urllib.request.urlopen', fake):
+            with pytest.raises(unifi_cert.DdnsError, match='Invalid API Token'):
+                unifi_cert._ddns_request('GET', 'https://x/zones', 'T',
+                                         provider='cloudflare')
+
+    def test_http_error_body_is_surfaced(self):
+        """A 403 body's error message beats a bare status code."""
+        err = _http_error(403, {'success': False,
+                                'errors': [{'code': 9109, 'message': 'Unauthorized to access requested resource'}]})
+        with patch('urllib.request.urlopen', side_effect=err):
+            with pytest.raises(unifi_cert.DdnsError, match='Unauthorized to access'):
+                unifi_cert._ddns_request('GET', 'https://x/zones', 'T',
+                                         provider='cloudflare')
+
+    def test_digitalocean_http_error_message_surfaced(self):
+        """DigitalOcean's {'id', 'message'} error shape is understood too."""
+        err = _http_error(401, {'id': 'unauthorized', 'message': 'Unable to authenticate you'})
+        with patch('urllib.request.urlopen', side_effect=err):
+            with pytest.raises(unifi_cert.DdnsError, match='Unable to authenticate you'):
+                unifi_cert._ddns_request('GET', 'https://x/domains', 'T')
+
+    def test_transport_error_raises_ddns_error(self):
+        """URLError is translated, not leaked."""
+        with patch('urllib.request.urlopen',
+                   side_effect=urllib.error.URLError('connection refused')):
+            with pytest.raises(unifi_cert.DdnsError, match='connection refused'):
+                unifi_cert._ddns_request('GET', 'https://x/domains', 'T')
+
+    def test_malformed_json_raises_ddns_error(self):
+        """A non-JSON 200 body fails loudly instead of silently returning {}."""
+        fake = _FakeUrlOpen()
+        fake.queue(b'<html>gateway timeout</html>')
+        with patch('urllib.request.urlopen', fake):
+            with pytest.raises(unifi_cert.DdnsError, match='malformed JSON'):
+                unifi_cert._ddns_request('GET', 'https://x/domains', 'T')
+
+    def test_empty_body_returns_empty_dict(self):
+        """204-style empty body is a success, not a parse failure."""
+        fake = _FakeUrlOpen()
+        fake.queue(None)
+        with patch('urllib.request.urlopen', fake):
+            assert unifi_cert._ddns_request('GET', 'https://x/domains', 'T') == {}
+
+    @pytest.mark.parametrize('payload,expected', [
+        (None, 'empty response body'),               # nothing at all
+        ([1, 2, 3], 'expected a Cloudflare envelope'),   # not an object
+        ({'result': []}, 'request failed'),          # no success key
+        ({'success': 'yes', 'result': []}, 'request failed'),   # truthy but not True
+        ({'success': True}, 'carried no result'),    # success without payload
+    ])
+    def test_cloudflare_requires_a_wellformed_success_envelope(self, payload, expected):
+        """Anything that isn't a proper envelope must fail, never pass silently.
+
+        A PATCH whose response we can't confirm is a write we can't claim
+        happened — reporting it as success is the original bug in miniature.
+        """
+        fake = _FakeUrlOpen()
+        fake.queue(payload)
+        with patch('urllib.request.urlopen', fake):
+            with pytest.raises(unifi_cert.DdnsError, match=expected):
+                unifi_cert._ddns_request('PATCH', 'https://x/dns_records/1', 'T',
+                                         body={'content': '1.2.3.4'},
+                                         provider='cloudflare')
+
+    def test_unconfirmable_patch_is_not_recorded_as_success(self, ddns_state):
+        """End-to-end: a malformed PATCH response must fail the update."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [
+            {'id': 'recid', 'type': 'A', 'name': 'home.jdlien.ca', 'content': '1.1.1.1'},
+        ]})
+        fake.queue(None)   # PATCH answers with an empty body
+        with patch('urllib.request.urlopen', fake), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_cf_zone()), \
+             patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError):
+                unifi_cert._ddns_update_target('T', 'cloudflare', 'home.jdlien.ca',
+                                               '5.6.7.8')
+        assert 'home.jdlien.ca' not in unifi_cert._ddns_load_state()['targets']
+
+    def test_http_status_is_attached_to_the_error(self):
+        """Callers branch on 404 vs 401 — don't make them parse the message."""
+        with patch('urllib.request.urlopen', side_effect=_http_error(404, {})):
+            with pytest.raises(unifi_cert.DdnsError) as exc:
+                unifi_cert._ddns_request('GET', 'https://x/domains/z', 'T')
+        assert exc.value.status == 404
+
+
+class TestDdnsZoneCandidates:
+    """The suffix ladder that replaces a capped zone listing."""
+
+    def test_progressively_broader_longest_first(self):
+        assert unifi_cert._ddns_zone_candidates('home.jdlien.ca') == [
+            'home.jdlien.ca', 'jdlien.ca']
+
+    def test_bare_tld_is_never_a_candidate(self):
+        assert unifi_cert._ddns_zone_candidates('jdlien.com') == ['jdlien.com']
+
+    def test_wildcard_label_is_dropped(self):
+        """'*' isn't part of any zone name, but the rest of the ladder is."""
+        assert unifi_cert._ddns_zone_candidates('*.home.jdlien.ca') == [
+            'home.jdlien.ca', 'jdlien.ca']
+
+    def test_multipart_tld_ladder(self):
+        assert unifi_cert._ddns_zone_candidates('foo.example.co.uk') == [
+            'foo.example.co.uk', 'example.co.uk', 'co.uk']
+
+
 class TestDdnsResolveZone:
-    """Tests for _ddns_resolve_zone() — finding the right DigitalOcean zone."""
+    """Tests for _ddns_resolve_zone() across DigitalOcean and Cloudflare."""
 
     def test_subdomain_resolves_to_apex_zone(self):
         """beehive.jdlien.com → zone='jdlien.com', host='beehive'."""
         fake = _FakeUrlOpen()
-        fake.queue({'domains': [{'name': 'jdlien.com'}, {'name': 'other.com'}]})
+        fake.queue_http_error(404)                              # beehive.jdlien.com
+        fake.queue({'domain': {'name': 'jdlien.com'}})          # jdlien.com
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            zone, host = unifi_cert._ddns_resolve_zone('TOKEN', 'beehive.jdlien.com')
-        assert zone == 'jdlien.com'
-        assert host == 'beehive'
+            zone = unifi_cert._ddns_resolve_zone('TOKEN', 'beehive.jdlien.com')
+        assert zone.name == 'jdlien.com'
+        assert zone.host == 'beehive'
+        assert zone.ref == 'jdlien.com'  # DigitalOcean addresses zones by name
+        assert zone.fqdn == 'beehive.jdlien.com'
 
     def test_apex_returns_at_host(self):
-        """jdlien.com → zone='jdlien.com', host='@'."""
+        """jdlien.com → zone='jdlien.com', host='@', fqdn is the bare zone."""
         fake = _FakeUrlOpen()
-        fake.queue({'domains': [{'name': 'jdlien.com'}]})
+        fake.queue({'domain': {'name': 'jdlien.com'}})
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            zone, host = unifi_cert._ddns_resolve_zone('T', 'jdlien.com')
-        assert zone == 'jdlien.com'
-        assert host == '@'
+            zone = unifi_cert._ddns_resolve_zone('T', 'jdlien.com')
+        assert (zone.name, zone.host, zone.fqdn) == ('jdlien.com', '@', 'jdlien.com')
 
     def test_multipart_tld_picks_longest_match(self):
-        """example.co.uk owned + co.uk also owned → longest suffix wins."""
+        """example.co.uk owned + co.uk also owned → the more specific one wins."""
         fake = _FakeUrlOpen()
-        fake.queue({'domains': [{'name': 'example.co.uk'}, {'name': 'co.uk'}]})
+        fake.queue_http_error(404)                                 # foo.example.co.uk
+        fake.queue({'domain': {'name': 'example.co.uk'}})          # example.co.uk
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            zone, host = unifi_cert._ddns_resolve_zone('T', 'foo.example.co.uk')
-        assert zone == 'example.co.uk'
-        assert host == 'foo'
+            zone = unifi_cert._ddns_resolve_zone('T', 'foo.example.co.uk')
+        assert zone.name == 'example.co.uk'
+        assert zone.host == 'foo'
+        # co.uk is never probed — the ladder stops at the first hit.
+        assert len(fake.requests) == 2
 
-    def test_no_match_returns_none(self):
-        """Domain isn't owned by user → (None, None)."""
+    def test_non_404_error_is_not_swallowed(self):
+        """A 401 mid-ladder must fail loudly, not read as 'zone not owned'."""
         fake = _FakeUrlOpen()
-        fake.queue({'domains': [{'name': 'other.com'}]})
+        fake.queue_http_error(401, {'id': 'unauthorized',
+                                    'message': 'Unable to authenticate you'})
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            zone, host = unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
-        assert zone is None
-        assert host is None
+            with pytest.raises(unifi_cert.DdnsError, match='Unable to authenticate'):
+                unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
 
-    def test_network_error_returns_none(self):
-        """urlopen raising URLError → (None, None) with logged error."""
+    def test_no_match_raises_naming_visible_zones(self):
+        """Unowned domain → DdnsError that says what the token *can* see."""
+        fake = _FakeUrlOpen()
+        fake.queue_http_error(404)      # beehive.jdlien.com
+        fake.queue_http_error(404)      # jdlien.com
+        fake.queue({'domains': [{'name': 'other.com'}]})   # diagnostic listing
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError, match='other.com'):
+                unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
+        assert 'per_page=200' in fake.requests[-1]['url']
+
+    def test_diagnostic_listing_failure_still_reports_the_miss(self):
+        """The 'token sees' nicety must not replace the actual error."""
+        fake = _FakeUrlOpen()
+        fake.queue_http_error(404)
+        fake.queue_http_error(404)
+        fake.queue_http_error(403)      # listing denied
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError, match='no zones at all'):
+                unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
+
+    def test_network_error_raises(self):
+        """Transport failure propagates as DdnsError."""
         with patch('urllib.request.urlopen',
                    side_effect=urllib.error.URLError('connection refused')), \
              patch.object(unifi_cert, 'ui'):
-            zone, host = unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
-        assert zone is None
-        assert host is None
+            with pytest.raises(unifi_cert.DdnsError):
+                unifi_cert._ddns_resolve_zone('T', 'beehive.jdlien.com')
 
-
-class TestDdnsGetARecord:
-    """Tests for _ddns_get_a_record() and _ddns_put_a_record()."""
-
-    def test_get_a_record_returns_id_and_data(self):
-        """API returns one matching A record → (id, ip) tuple."""
+    def test_cloudflare_zone_ref_is_the_zone_id(self):
+        """Cloudflare record endpoints are keyed by zone id, not name."""
         fake = _FakeUrlOpen()
-        fake.queue({'domain_records': [{'id': 12345, 'data': '1.2.3.4'}]})
+        fake.queue({'success': True, 'result': []})          # home.jdlien.ca
+        fake.queue({'success': True, 'result': [             # jdlien.ca
+            {'id': 'f625a1d7dbb0228633c5273a1a66ea4c', 'name': 'jdlien.ca'},
+        ]})
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            rid, ip = unifi_cert._ddns_get_a_record('T', 'jdlien.com', 'beehive')
-        assert rid == 12345
-        assert ip == '1.2.3.4'
-        # URL includes type=A and the fully-qualified name.
+            zone = unifi_cert._ddns_resolve_zone('T', 'home.jdlien.ca',
+                                                 provider='cloudflare')
+        assert zone.name == 'jdlien.ca'
+        assert zone.ref == 'f625a1d7dbb0228633c5273a1a66ea4c'
+        assert zone.host == 'home'
+        assert zone.provider == 'cloudflare'
+        assert 'name=jdlien.ca' in fake.requests[1]['url']
+
+    def test_cloudflare_ignores_non_exact_name_match(self):
+        """A row whose name isn't the candidate must not be accepted as the zone."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [{'id': 'wrong', 'name': 'other.ca'}]})
+        fake.queue({'success': True, 'result': [{'id': 'wrong2', 'name': 'nope.ca'}]})
+        fake.queue({'success': True, 'result': []})   # diagnostic listing
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError, match='No cloudflare zone owns'):
+                unifi_cert._ddns_resolve_zone('T', 'home.jdlien.ca',
+                                              provider='cloudflare')
+
+    def test_cloudflare_wildcard_target_resolves(self):
+        """'*.home.jdlien.ca' resolves with a '*.home' label in jdlien.ca."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': []})
+        fake.queue({'success': True, 'result': [{'id': 'zid', 'name': 'jdlien.ca'}]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            zone = unifi_cert._ddns_resolve_zone('T', '*.home.jdlien.ca',
+                                                 provider='cloudflare')
+        assert zone.host == '*.home'
+        assert zone.fqdn == '*.home.jdlien.ca'
+
+    def test_zone_beyond_any_listing_page_still_resolves(self):
+        """Exact lookup means a large account can't produce a false negative.
+
+        A paged listing has to stop somewhere; whatever cap it picks reports a
+        zone you do own as unowned. Targeted lookups have no such boundary.
+        """
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': []})
+        fake.queue({'success': True, 'result': [{'id': 'zid', 'name': 'jdlien.ca'}]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            zone = unifi_cert._ddns_resolve_zone('T', 'home.jdlien.ca',
+                                                 provider='cloudflare')
+        assert zone.ref == 'zid'
+        assert len(fake.requests) == 2          # no listing walk at all
+        assert all('page=' not in r['url'] for r in fake.requests)
+
+    def test_unsupported_provider_raises(self):
+        """A provider with ACME support but no DDNS backend fails clearly."""
+        with pytest.raises(unifi_cert.DdnsError, match='route53'):
+            unifi_cert._ddns_resolve_zone('T', 'x.example.com', provider='route53')
+
+
+def _do_zone(host='beehive', name='jdlien.com'):
+    return unifi_cert.DdnsZone(name=name, ref=name, host=host,
+                               provider='digitalocean')
+
+
+def _cf_zone(host='home', name='jdlien.ca', ref='zid'):
+    return unifi_cert.DdnsZone(name=name, ref=ref, host=host,
+                               provider='cloudflare')
+
+
+class TestDdnsRecords:
+    """Record lookup and update, per provider. The never-create invariant."""
+
+    def test_digitalocean_get_returns_id_value_and_count(self):
+        """One matching A record → (id, ip, 1)."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domain_records': [
+            {'id': 12345, 'type': 'A', 'name': 'beehive', 'data': '1.2.3.4'},
+        ]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            rid, ip, count = unifi_cert._ddns_get_a_record('T', _do_zone())
+        assert (rid, ip, count) == (12345, '1.2.3.4', 1)
         assert 'type=A' in fake.requests[0]['url']
         assert 'beehive.jdlien.com' in fake.requests[0]['url']
 
-    def test_get_a_record_apex_uses_zone_as_name(self):
-        """For host='@' the API name parameter is just the zone."""
+    def test_apex_queries_the_bare_zone_name(self):
+        """host='@' must not leak an '@' into the API name parameter."""
         fake = _FakeUrlOpen()
-        fake.queue({'domain_records': []})
+        fake.queue({'domain_records': [
+            {'id': 1, 'type': 'A', 'name': '@', 'data': '1.2.3.4'},
+        ]})
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            unifi_cert._ddns_get_a_record('T', 'jdlien.com', '@')
+            rid, _, _ = unifi_cert._ddns_get_a_record('T', _do_zone(host='@'))
         url = fake.requests[0]['url']
         assert 'name=jdlien.com' in url
-        assert 'name=@' not in url
+        assert '%40' not in url and 'name=@' not in url
+        assert rid == 1   # DigitalOcean's '@' normalizes back to the apex FQDN
 
-    def test_get_a_record_missing_returns_none(self):
-        """No matching record → (None, None)."""
+    def test_cloudflare_get_reads_content_field(self):
+        """Cloudflare puts the IP in 'content', not DigitalOcean's 'data'."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [
+            {'id': 'recid', 'type': 'A', 'name': 'home.jdlien.ca',
+             'content': '198.53.200.179'},
+        ]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            rid, ip, count = unifi_cert._ddns_get_a_record('T', _cf_zone())
+        assert (rid, ip, count) == ('recid', '198.53.200.179', 1)
+        assert '/zones/zid/dns_records' in fake.requests[0]['url']
+
+    def test_wildcard_name_is_url_encoded(self):
+        """'*' must be percent-encoded in the name query parameter."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [
+            {'id': 'r', 'type': 'A', 'name': '*.home.jdlien.ca', 'content': '1.2.3.4'},
+        ]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            rid, _, _ = unifi_cert._ddns_get_a_record('T', _cf_zone(host='*.home'))
+        url = fake.requests[0]['url']
+        assert 'name=%2A.home.jdlien.ca' in url
+        assert '*' not in url
+        assert rid == 'r'
+
+    def test_record_for_a_different_name_is_rejected(self):
+        """A row the server-side filter let through must not be edited.
+
+        We only ever write by id, so accepting a mismatched row would mean
+        repointing some other hostname's A record — 'never create' would hold
+        while the safety property it stands for would not.
+        """
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [
+            {'id': 'other', 'type': 'A', 'name': 'unrelated.jdlien.ca',
+             'content': '9.9.9.9'},
+        ]})
+        fake.queue({'success': True, 'result': []})   # CNAME probe
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError, match='No A record found'):
+                unifi_cert._ddns_get_a_record('T', _cf_zone())
+
+    def test_record_of_a_different_type_is_rejected(self):
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [
+            {'id': 'aaaa', 'type': 'AAAA', 'name': 'home.jdlien.ca',
+             'content': '2606:4700::1111'},
+        ]})
+        fake.queue({'success': True, 'result': []})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError, match='No A record found'):
+                unifi_cert._ddns_get_a_record('T', _cf_zone())
+
+    def test_record_without_an_id_is_rejected(self):
+        """No id means no safe way to address the write — refuse, don't guess."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [
+            {'type': 'A', 'name': 'home.jdlien.ca', 'content': '1.2.3.4'},
+        ]})
+        fake.queue({'success': True, 'result': []})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError, match='No A record found'):
+                unifi_cert._ddns_get_a_record('T', _cf_zone())
+
+    def test_duplicate_a_records_warn_and_use_first(self):
+        """Two A records is the inadyn-duplicate fingerprint — warn every run."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': [
+            {'id': 'live', 'type': 'A', 'name': 'home.jdlien.ca',
+             'content': '198.53.200.179'},
+            {'id': 'stale', 'type': 'A', 'name': 'home.jdlien.ca',
+             'content': '173.183.229.156'},
+        ]})
+        mock_ui = MagicMock()
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui', mock_ui):
+            rid, ip, count = unifi_cert._ddns_get_a_record('T', _cf_zone())
+        assert (rid, count) == ('live', 2)
+        warning = ' '.join(str(c) for c in mock_ui.warning.call_args_list)
+        assert '2 A records' in warning
+        assert '173.183.229.156' in warning
+
+    def test_missing_record_raises_and_never_posts(self):
+        """No A record → DdnsError; crucially, no POST is attempted."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': []})   # A lookup: empty
+        fake.queue({'success': True, 'result': []})   # CNAME probe: empty
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError, match='never creates them'):
+                unifi_cert._ddns_get_a_record('T', _cf_zone())
+        assert [r['method'] for r in fake.requests] == ['GET', 'GET']
+
+    def test_missing_record_names_the_cname(self):
+        """The CNAME-at-the-target case gets a diagnosis, not just 'not found'."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domain_records': []})  # no A record
+        fake.queue({'domain_records': [
+            {'id': 9, 'type': 'CNAME', 'name': 'beehive', 'data': 'home.jdlien.com'},
+        ]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError) as exc:
+                unifi_cert._ddns_get_a_record('T', _do_zone())
+        message = str(exc.value)
+        assert 'CNAME' in message
+        assert 'ddns_domain = home.jdlien.com' in message
+
+    def test_cname_into_another_zone_names_all_three_keys(self):
+        """The Beehive shape: repointing ddns_domain alone would still fail."""
+        fake = _FakeUrlOpen()
+        fake.queue({'domain_records': []})
+        fake.queue({'domain_records': [
+            {'id': 9, 'type': 'CNAME', 'name': 'beehive', 'data': 'home.jdlien.ca'},
+        ]})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            with pytest.raises(unifi_cert.DdnsError) as exc:
+                unifi_cert._ddns_get_a_record('T', _do_zone())
+        message = str(exc.value)
+        assert 'ddns_domain = home.jdlien.ca' in message
+        assert 'ddns_provider' in message
+        assert 'ddns_credentials' in message
+
+    def test_cname_probe_failure_falls_back_to_generic_message(self):
+        """A failing CNAME probe must not mask the original missing-record error."""
         fake = _FakeUrlOpen()
         fake.queue({'domain_records': []})
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            rid, ip = unifi_cert._ddns_get_a_record('T', 'jdlien.com', 'beehive')
-        assert (rid, ip) == (None, None)
+            with pytest.raises(unifi_cert.DdnsError, match='No A record found'):
+                unifi_cert._ddns_get_a_record('T', _do_zone())
 
-    def test_put_a_record_sends_data_field(self):
-        """PUT body is JSON {'data': new_ip}, Authorization header set."""
+    def test_digitalocean_put_sends_data_field_by_id(self):
+        """DigitalOcean: PUT /records/{id} with {'data': ip}, bearer auth."""
         fake = _FakeUrlOpen()
-        fake.queue({'domain_record': {'id': 1, 'data': '5.6.7.8'}})
+        fake.queue({'domain_record': {'id': 12345, 'data': '5.6.7.8'}})
         with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
-            ok = unifi_cert._ddns_put_a_record('TOKEN', 'jdlien.com', 12345, '5.6.7.8')
-        assert ok is True
+            unifi_cert._ddns_put_a_record('TOKEN', _do_zone(), 12345, '5.6.7.8')
         req = fake.requests[0]
         assert req['method'] == 'PUT'
         assert '/domains/jdlien.com/records/12345' in req['url']
         assert json.loads(req['body']) == {'data': '5.6.7.8'}
-        # Header keys are case-insensitive in Request; urllib title-cases them.
         auth = next((v for k, v in req['headers'].items() if k.lower() == 'authorization'), None)
         assert auth == 'Bearer TOKEN'
 
-    def test_put_a_record_network_error_returns_false(self):
-        """urlopen raising → False, error logged."""
+    def test_cloudflare_patch_sends_content_field_by_id(self):
+        """Cloudflare: PATCH /dns_records/{id} with {'content': ip}."""
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': {'id': 'recid', 'content': '5.6.7.8'}})
+        with patch('urllib.request.urlopen', fake), patch.object(unifi_cert, 'ui'):
+            unifi_cert._ddns_put_a_record('TOKEN', _cf_zone(), 'recid', '5.6.7.8')
+        req = fake.requests[0]
+        assert req['method'] == 'PATCH'
+        assert '/zones/zid/dns_records/recid' in req['url']
+        assert json.loads(req['body']) == {'content': '5.6.7.8'}
+
+    def test_put_network_error_raises(self):
+        """A failed write must raise so the caller records a failure."""
         with patch('urllib.request.urlopen',
                    side_effect=urllib.error.URLError('boom')), \
              patch.object(unifi_cert, 'ui'):
-            assert unifi_cert._ddns_put_a_record('T', 'jdlien.com', 1, '1.2.3.4') is False
+            with pytest.raises(unifi_cert.DdnsError):
+                unifi_cert._ddns_put_a_record('T', _do_zone(), 1, '1.2.3.4')
+
+
+class TestDdnsSettings:
+    """ddns_* config resolution and its fallbacks to the cert values."""
+
+    def _cfg(self, **overrides):
+        cfg = {
+            'domain': 'beehive.jdlien.com',
+            'email': 'a@b.com',
+            'dns_provider': 'digitalocean',
+            'dns_credentials': '/secrets/do.ini',
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def test_falls_back_to_cert_values(self, tmp_path):
+        """No ddns_* keys → target/provider/creds all mirror the cert config."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        s = unifi_cert._ddns_settings(self._cfg(dns_credentials=str(creds)))
+        assert s.targets == ['beehive.jdlien.com']
+        assert s.provider == 'digitalocean'
+        assert s.credentials == str(creds)
+
+    def test_ddns_keys_override_cert_values(self, tmp_path):
+        """The decoupled case: different name, provider, and token."""
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_api_token = T\n')
+        s = unifi_cert._ddns_settings(self._cfg(
+            ddns_domain='home.jdlien.ca',
+            ddns_provider='cloudflare',
+            ddns_credentials=str(creds),
+        ))
+        assert s.targets == ['home.jdlien.ca']
+        assert s.provider == 'cloudflare'
+        assert s.credentials == str(creds)
+
+    def test_target_list_is_split(self, tmp_path):
+        """ddns_domain accepts a list so the wildcard is maintained too."""
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_api_token = T\n')
+        s = unifi_cert._ddns_settings(self._cfg(
+            ddns_domain='home.jdlien.ca, *.home.jdlien.ca',
+            ddns_provider='cloudflare',
+            ddns_credentials=str(creds),
+        ))
+        assert s.targets == ['home.jdlien.ca', '*.home.jdlien.ca']
+
+    def test_explicit_args_beat_config(self, tmp_path):
+        """CLI overrides win over everything in the provisioning file."""
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_api_token = T\n')
+        s = unifi_cert._ddns_settings(
+            self._cfg(ddns_domain='wrong.example.com'),
+            domain='home.jdlien.ca', provider='cloudflare', credentials=str(creds),
+        )
+        assert s.targets == ['home.jdlien.ca']
+        assert s.provider == 'cloudflare'
+
+    def test_no_target_raises(self):
+        """Empty config → a message naming both keys that could supply it."""
+        with pytest.raises(unifi_cert.DdnsError, match='ddns_domain'):
+            unifi_cert._ddns_settings({})
+
+    def test_provider_without_ddns_backend_raises(self, tmp_path):
+        """route53 has ACME support but no DDNS backend — say so."""
+        creds = tmp_path / 'r53.ini'
+        creds.write_text('aws_access_key_id = T\n')
+        with pytest.raises(unifi_cert.DdnsError, match='route53'):
+            unifi_cert._ddns_settings(self._cfg(dns_provider='route53',
+                                                dns_credentials=str(creds)))
+
+    def test_cross_provider_without_credentials_refuses(self):
+        """ddns_provider != dns_provider with no ddns_credentials must not
+        silently hand the DigitalOcean token to Cloudflare's API."""
+        with pytest.raises(unifi_cert.DdnsError, match='wrong API'):
+            unifi_cert._ddns_settings(self._cfg(ddns_provider='cloudflare'))
+
+    def test_missing_credentials_file_raises(self):
+        """A configured but absent credentials path fails before any request."""
+        with pytest.raises(unifi_cert.DdnsError, match='not found'):
+            unifi_cert._ddns_settings(self._cfg(dns_credentials='/does/not/exist.ini'))
+
+
+class TestDdnsToken:
+    """Token extraction, including the Cloudflare legacy-key trap."""
+
+    def test_cloudflare_token_read(self, tmp_path):
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_api_token = cfut_abc123\n')
+        settings = unifi_cert.DdnsSettings(targets=['x'], provider='cloudflare',
+                                           credentials=str(creds))
+        assert unifi_cert._ddns_token(settings) == 'cfut_abc123'
+
+    def test_legacy_global_key_is_refused_with_guidance(self, tmp_path):
+        """A global API key can't do bearer auth — name the fix, don't just fail."""
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_email = a@b.com\n'
+                         'dns_cloudflare_api_key = deadbeef\n')
+        settings = unifi_cert.DdnsSettings(targets=['x'], provider='cloudflare',
+                                           credentials=str(creds))
+        with pytest.raises(unifi_cert.DdnsError, match='dns_cloudflare_api_token'):
+            unifi_cert._ddns_token(settings)
+
+    def test_missing_field_raises(self, tmp_path):
+        creds = tmp_path / 'do.ini'
+        creds.write_text('# empty\n')
+        settings = unifi_cert.DdnsSettings(targets=['x'], provider='digitalocean',
+                                           credentials=str(creds))
+        with pytest.raises(unifi_cert.DdnsError, match='dns_digitalocean_token'):
+            unifi_cert._ddns_token(settings)
+
+
+class TestDdnsState:
+    """Failure-streak tracking and the escalating report schedule."""
+
+    def test_success_records_ip_and_clears_streak(self, ddns_state):
+        with patch.object(unifi_cert, 'ui'):
+            unifi_cert._ddns_note_failure('home.jdlien.ca', 'cloudflare', 'boom')
+            unifi_cert._ddns_note_success('home.jdlien.ca', 'cloudflare', '1.2.3.4', 1)
+        entry = unifi_cert._ddns_load_state()['targets']['home.jdlien.ca']
+        assert entry['consecutive_failures'] == 0
+        assert entry['last_ip'] == '1.2.3.4'
+        assert entry['last_success']
+
+    def test_recovery_is_announced(self, ddns_state):
+        """Going from broken to working is worth a line in the log."""
+        mock_ui = MagicMock()
+        with patch.object(unifi_cert, 'ui', mock_ui):
+            unifi_cert._ddns_note_failure('t', 'cloudflare', 'boom')
+            mock_ui.reset_mock()
+            unifi_cert._ddns_note_success('t', 'cloudflare', '1.2.3.4', 1)
+        assert 'recovered' in ' '.join(str(c) for c in mock_ui.success.call_args_list)
+
+    def test_repeated_identical_failures_are_throttled(self, ddns_state):
+        """The 6,295-identical-lines bug: only milestones get reported."""
+        mock_ui = MagicMock()
+        with patch.object(unifi_cert, 'ui', mock_ui):
+            for _ in range(11):
+                unifi_cert._ddns_note_failure('t', 'cloudflare', 'same error')
+        # Failure #1 is reported; #2..#11 are debug-only (next alert is #12).
+        assert mock_ui.error.call_count == 1
+        assert mock_ui.debug.call_count == 10
+        assert unifi_cert._ddns_load_state()['targets']['t']['consecutive_failures'] == 11
+
+    def test_hourly_milestone_escalates(self, ddns_state):
+        """Failure #12 (~1h at a 5-min cadence) breaks the silence."""
+        mock_ui = MagicMock()
+        with patch.object(unifi_cert, 'ui', mock_ui):
+            for _ in range(11):
+                unifi_cert._ddns_note_failure('t', 'cloudflare', 'same error')
+            mock_ui.reset_mock()
+            unifi_cert._ddns_note_failure('t', 'cloudflare', 'same error')
+        assert mock_ui.error.called
+        assert '12 consecutive failures' in ' '.join(
+            str(c) for c in mock_ui.error.call_args_list)
+
+    def test_new_failure_mode_always_reports(self, ddns_state):
+        """A *different* error mid-streak is new information — never throttle it."""
+        mock_ui = MagicMock()
+        with patch.object(unifi_cert, 'ui', mock_ui):
+            unifi_cert._ddns_note_failure('t', 'cloudflare', 'first error')
+            unifi_cert._ddns_note_failure('t', 'cloudflare', 'first error')
+            mock_ui.reset_mock()
+            unifi_cert._ddns_note_failure('t', 'cloudflare', 'a different error')
+        assert mock_ui.error.called
+
+    def test_corrupt_state_file_is_survivable(self, ddns_state):
+        """A truncated JSON file must not break the update path."""
+        ddns_state.write_text('{not json')
+        assert unifi_cert._ddns_load_state() == {'targets': {}}
+
+    def test_config_failure_clears_once_config_is_fixed(self, tmp_path, ddns_state):
+        """A synthetic key that can only accumulate stays red forever."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        cfg = {'domain': 'x.example.com', 'dns_provider': 'digitalocean',
+               'dns_credentials': str(creds)}
+
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value={}), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.ddns_update()          # no target → config failure recorded
+        assert unifi_cert.DDNS_CONFIG_TARGET in unifi_cert._ddns_load_state()['targets']
+
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(1, '1.2.3.4', 1)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.ddns_update()
+        assert unifi_cert.DDNS_CONFIG_TARGET not in unifi_cert._ddns_load_state()['targets']
+
+    def test_public_ip_failure_clears_on_recovery(self, tmp_path, ddns_state):
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        cfg = {'domain': 'x.example.com', 'dns_provider': 'digitalocean',
+               'dns_credentials': str(creds)}
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value=None), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.ddns_update()
+        assert unifi_cert.DDNS_PUBLIC_IP_TARGET in unifi_cert._ddns_load_state()['targets']
+
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(1, '1.2.3.4', 1)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.ddns_update()
+        assert unifi_cert.DDNS_PUBLIC_IP_TARGET not in unifi_cert._ddns_load_state()['targets']
+
+    def test_removed_targets_are_pruned(self, tmp_path, ddns_state):
+        """Renaming ddns_domain must not leave the old name failing forever."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        ddns_state.write_text(json.dumps({'targets': {
+            'old.example.com': {'consecutive_failures': 99, 'last_error': 'gone'},
+        }}))
+        cfg = {'domain': 'x.example.com', 'dns_provider': 'digitalocean',
+               'dns_credentials': str(creds)}
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(1, '1.2.3.4', 1)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.ddns_update()
+        targets = unifi_cert._ddns_load_state()['targets']
+        assert 'old.example.com' not in targets
+        assert 'x.example.com' in targets
+
+    def test_one_shot_override_does_not_prune_configured_targets(self, tmp_path,
+                                                                  ddns_state):
+        """Testing one name by hand must not erase what cron maintains.
+
+        --ddns-domain is an override for a single run, not a reconfiguration;
+        discarding the real targets' history would blank --status until the
+        next cron firing.
+        """
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        ddns_state.write_text(json.dumps({'targets': {
+            'home.jdlien.ca': {'consecutive_failures': 0,
+                               'last_success': '2026-07-31T03:00:00',
+                               'last_ip': '198.53.200.179'},
+        }}))
+        cfg = {'domain': 'home.jdlien.ca', 'dns_provider': 'digitalocean',
+               'dns_credentials': str(creds)}
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(1, '1.2.3.4', 1)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.ddns_update(domain='scratch.example.com')
+        targets = unifi_cert._ddns_load_state()['targets']
+        assert 'home.jdlien.ca' in targets
+        assert targets['home.jdlien.ca']['last_ip'] == '198.53.200.179'
+
+
+class TestDdnsValidate:
+    """ddns_validate(): the provisioning-time check, read-only."""
+
+    def test_cname_target_is_refused(self, tmp_path):
+        """The check that would have caught this in April instead of July."""
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        cfg = {'domain': 'beehive.jdlien.com', 'dns_provider': 'digitalocean',
+               'dns_credentials': str(creds)}
+        with patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          side_effect=unifi_cert.DdnsError('It is a CNAME → home.jdlien.ca')), \
+             patch.object(unifi_cert, 'ui'):
+            ok, message = unifi_cert.ddns_validate(cfg)
+        assert ok is False
+        assert 'CNAME' in message
+
+    def test_updatable_target_passes_without_writing(self, tmp_path):
+        creds = tmp_path / 'do.ini'
+        creds.write_text('dns_digitalocean_token = T\n')
+        cfg = {'domain': 'x.example.com', 'dns_provider': 'digitalocean',
+               'dns_credentials': str(creds)}
+        with patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=(1, '1.2.3.4', 1)), \
+             patch.object(unifi_cert, '_ddns_put_a_record') as put, \
+             patch.object(unifi_cert, 'ui'):
+            ok, message = unifi_cert.ddns_validate(cfg)
+        assert ok is True
+        assert 'editable A records' in message
+        put.assert_not_called()
+
+    def test_disabled_ddns_short_circuits(self):
+        ok, message = unifi_cert.ddns_validate({'ddns_enabled': 'false'})
+        assert ok is True
+        assert 'disabled' in message
+
+    def test_misconfiguration_is_reported(self):
+        ok, message = unifi_cert.ddns_validate({})
+        assert ok is False
+        assert 'No DDNS target configured' in message
+
+
+class TestDdnsEnabled:
+    """ddns_enabled: the supported way to turn the 5-minute job off."""
+
+    @pytest.mark.parametrize('value,expected', [
+        ('false', False), ('False', False), ('no', False), ('0', False),
+        ('off', False), ('true', True), ('yes', True), ('1', True),
+    ])
+    def test_parsing(self, value, expected):
+        assert unifi_cert.ddns_is_enabled({'ddns_enabled': value}) is expected
+
+    def test_defaults_to_enabled(self):
+        assert unifi_cert.ddns_is_enabled({}) is True
+
+    def test_cron_omits_ddns_line_when_disabled(self, tmp_path):
+        """self_heal() rewrites cron constantly; hand-deleting the line can't stick."""
+        cron = tmp_path / 'unifi-cert'
+        with patch.object(unifi_cert, 'CRON_FILE', str(cron)), \
+             patch.object(unifi_cert, 'ddns_is_enabled', return_value=False), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.install_cron_schedule() is True
+        content = cron.read_text()
+        assert '--renew' in content
+        assert '--ddns-update' not in content
+        assert 'DDNS disabled' in content
+
+    def test_cron_includes_ddns_line_by_default(self, tmp_path):
+        cron = tmp_path / 'unifi-cert'
+        with patch.object(unifi_cert, 'CRON_FILE', str(cron)), \
+             patch.object(unifi_cert, 'ddns_is_enabled', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.install_cron_schedule()
+        assert '--ddns-update' in cron.read_text()
 
 
 class TestDdnsUpdate:
@@ -5379,86 +6328,147 @@ class TestDdnsUpdate:
         cfg.update(overrides)
         return cfg
 
-    def test_no_op_when_record_matches(self, tmp_path):
-        """Current public IP equals A-record value → no PUT, returns True."""
+    def test_no_op_when_record_matches(self, tmp_path, ddns_state):
+        """Current public IP equals A-record value → no write, returns True."""
         creds = tmp_path / 'do.ini'
         creds.write_text('dns_digitalocean_token = TOKEN\n')
 
         with patch.object(unifi_cert, 'load_provisioning_config',
                           return_value=self._provisioning(dns_credentials=str(creds))), \
              patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
-             patch.object(unifi_cert, '_ddns_resolve_zone',
-                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
              patch.object(unifi_cert, '_ddns_get_a_record',
-                          return_value=(12345, '1.2.3.4')), \
+                          return_value=(12345, '1.2.3.4', 1)), \
              patch.object(unifi_cert, '_ddns_put_a_record') as put, \
              patch.object(unifi_cert, 'ui'):
             ok = unifi_cert.ddns_update()
         assert ok is True
         put.assert_not_called()
 
-    def test_patch_when_record_stale(self, tmp_path):
-        """A-record IP differs from current → PUT new IP, return True."""
+    def test_update_when_record_stale(self, tmp_path, ddns_state):
+        """A-record IP differs from current → write new IP by ID, return True."""
         creds = tmp_path / 'do.ini'
         creds.write_text('dns_digitalocean_token = TOKEN\n')
+        zone = _do_zone()
 
         with patch.object(unifi_cert, 'load_provisioning_config',
                           return_value=self._provisioning(dns_credentials=str(creds))), \
              patch.object(unifi_cert, 'get_public_ip', return_value='5.6.7.8'), \
-             patch.object(unifi_cert, '_ddns_resolve_zone',
-                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=zone), \
              patch.object(unifi_cert, '_ddns_get_a_record',
-                          return_value=(12345, '1.2.3.4')), \
-             patch.object(unifi_cert, '_ddns_put_a_record',
-                          return_value=True) as put, \
+                          return_value=(12345, '1.2.3.4', 1)), \
+             patch.object(unifi_cert, '_ddns_put_a_record') as put, \
              patch.object(unifi_cert, 'ui'):
             ok = unifi_cert.ddns_update()
         assert ok is True
-        put.assert_called_once_with('TOKEN', 'jdlien.com', 12345, '5.6.7.8')
+        put.assert_called_once_with('TOKEN', zone, 12345, '5.6.7.8')
 
-    def test_force_patches_even_when_match(self, tmp_path):
-        """force=True → PUT even when current IP equals record."""
+    def test_force_writes_even_when_match(self, tmp_path, ddns_state):
+        """force=True → write even when the record already matches."""
         creds = tmp_path / 'do.ini'
         creds.write_text('dns_digitalocean_token = TOKEN\n')
 
         with patch.object(unifi_cert, 'load_provisioning_config',
                           return_value=self._provisioning(dns_credentials=str(creds))), \
              patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
-             patch.object(unifi_cert, '_ddns_resolve_zone',
-                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
              patch.object(unifi_cert, '_ddns_get_a_record',
-                          return_value=(12345, '1.2.3.4')), \
-             patch.object(unifi_cert, '_ddns_put_a_record',
-                          return_value=True) as put, \
+                          return_value=(12345, '1.2.3.4', 1)), \
+             patch.object(unifi_cert, '_ddns_put_a_record') as put, \
              patch.object(unifi_cert, 'ui'):
             ok = unifi_cert.ddns_update(force=True)
         assert ok is True
         put.assert_called_once()
 
-    def test_no_domain_errors(self):
+    def test_cloudflare_target_end_to_end(self, tmp_path, ddns_state):
+        """The decoupled Beehive shape: DO cert, Cloudflare DDNS anchor."""
+        creds = tmp_path / 'cloudflare.ini'
+        creds.write_text('dns_cloudflare_api_token = cfut_abc\n')
+        cfg = self._provisioning(ddns_domain='home.jdlien.ca',
+                                 ddns_provider='cloudflare',
+                                 ddns_credentials=str(creds))
+        fake = _FakeUrlOpen()
+        fake.queue({'success': True, 'result': []})              # zone: home.jdlien.ca
+        fake.queue({'success': True, 'result': [{'id': 'zid', 'name': 'jdlien.ca'}]})
+        fake.queue({'success': True, 'result': [
+            {'id': 'recid', 'type': 'A', 'name': 'home.jdlien.ca', 'content': '1.1.1.1'},
+        ]})
+        fake.queue({'success': True, 'result': {'id': 'recid', 'content': '5.6.7.8'}})
+
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='5.6.7.8'), \
+             patch('urllib.request.urlopen', fake), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.ddns_update()
+
+        assert ok is True
+        assert [r['method'] for r in fake.requests] == ['GET', 'GET', 'GET', 'PATCH']
+        assert json.loads(fake.requests[3]['body']) == {'content': '5.6.7.8'}
+        entry = unifi_cert._ddns_load_state()['targets']['home.jdlien.ca']
+        assert entry['last_ip'] == '5.6.7.8'
+        assert entry['provider'] == 'cloudflare'
+
+    def test_multiple_targets_partial_failure(self, tmp_path, ddns_state):
+        """One broken target fails the run but must not skip the others."""
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_api_token = T\n')
+        cfg = self._provisioning(ddns_domain='home.jdlien.ca,*.home.jdlien.ca',
+                                 ddns_provider='cloudflare',
+                                 ddns_credentials=str(creds))
+        attempted = []
+
+        def _update(token, provider, target, ip, force=False):
+            attempted.append(target)
+            if target.startswith('*'):
+                raise unifi_cert.DdnsError('no A record')
+
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='5.6.7.8'), \
+             patch.object(unifi_cert, '_ddns_update_target', side_effect=_update), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.ddns_update()
+
+        assert ok is False
+        assert attempted == ['home.jdlien.ca', '*.home.jdlien.ca']
+        assert unifi_cert._ddns_load_state()['targets'][
+            '*.home.jdlien.ca']['consecutive_failures'] == 1
+
+    def test_no_domain_errors(self, ddns_state):
         """No domain in args or provisioning → False."""
         with patch.object(unifi_cert, 'load_provisioning_config', return_value={}), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert.ddns_update() is False
 
-    def test_non_digitalocean_provider_errors(self, tmp_path):
-        """provisioning dns_provider != digitalocean → False (v1 limitation)."""
+    def test_config_failures_are_tracked(self, ddns_state):
+        """A misconfigured install fires every 5 min too — escalate it the same."""
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value={}), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.ddns_update()
+        assert unifi_cert._ddns_load_state()['targets'][
+            '(configuration)']['consecutive_failures'] == 1
+
+    def test_cloudflare_provider_now_supported(self, tmp_path, ddns_state):
+        """Regression guard: cloudflare used to be rejected outright."""
         creds = tmp_path / 'cf.ini'
         creds.write_text('dns_cloudflare_api_token = T\n')
         cfg = self._provisioning(dns_provider='cloudflare', dns_credentials=str(creds))
         with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
+             patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_cf_zone()), \
+             patch.object(unifi_cert, '_ddns_get_a_record',
+                          return_value=('recid', '1.2.3.4', 1)), \
              patch.object(unifi_cert, 'ui'):
-            assert unifi_cert.ddns_update() is False
+            assert unifi_cert.ddns_update() is True
 
-    def test_missing_credentials_file_errors(self):
+    def test_missing_credentials_file_errors(self, ddns_state):
         """dns_credentials path doesn't exist → False."""
         cfg = self._provisioning(dns_credentials='/does/not/exist.ini')
         with patch.object(unifi_cert, 'load_provisioning_config', return_value=cfg), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert.ddns_update() is False
 
-    def test_public_ip_lookup_failure_errors(self, tmp_path):
-        """get_public_ip returning None → False."""
+    def test_public_ip_lookup_failure_errors(self, tmp_path, ddns_state):
+        """get_public_ip returning None → False, tracked under its own key."""
         creds = tmp_path / 'do.ini'
         creds.write_text('dns_digitalocean_token = T\n')
         with patch.object(unifi_cert, 'load_provisioning_config',
@@ -5466,18 +6476,18 @@ class TestDdnsUpdate:
              patch.object(unifi_cert, 'get_public_ip', return_value=None), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert.ddns_update() is False
+        assert '(public-ip)' in unifi_cert._ddns_load_state()['targets']
 
-    def test_record_not_found_errors(self, tmp_path):
-        """_ddns_get_a_record returning (None, None) → False."""
+    def test_record_not_found_errors(self, tmp_path, ddns_state):
+        """_ddns_get_a_record raising → False."""
         creds = tmp_path / 'do.ini'
         creds.write_text('dns_digitalocean_token = T\n')
         with patch.object(unifi_cert, 'load_provisioning_config',
                           return_value=self._provisioning(dns_credentials=str(creds))), \
              patch.object(unifi_cert, 'get_public_ip', return_value='1.2.3.4'), \
-             patch.object(unifi_cert, '_ddns_resolve_zone',
-                          return_value=('jdlien.com', 'beehive')), \
+             patch.object(unifi_cert, '_ddns_resolve_zone', return_value=_do_zone()), \
              patch.object(unifi_cert, '_ddns_get_a_record',
-                          return_value=(None, None)), \
+                          side_effect=unifi_cert.DdnsError('No A record found')), \
              patch.object(unifi_cert, 'ui'):
             assert unifi_cert.ddns_update() is False
 
@@ -5516,6 +6526,35 @@ class TestMainDdnsUpdate:
             result = unifi_cert.main()
         assert result == 0
 
+    def test_ddns_flags_are_threaded_through(self):
+        """--ddns-domain/-provider/-credentials reach ddns_update()."""
+        argv = ['unifi-cert', '--ddns-update',
+                '--ddns-domain', 'home.jdlien.ca,*.home.jdlien.ca',
+                '--ddns-provider', 'cloudflare',
+                '--ddns-credentials', '/data/unifi-cert/credentials/cloudflare.ini']
+        with patch('sys.argv', argv), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'rotate_log'), \
+             patch.object(unifi_cert, 'ddns_update', return_value=True) as fn:
+            assert unifi_cert.main() == 0
+        fn.assert_called_once_with(
+            domain='home.jdlien.ca,*.home.jdlien.ca',
+            credentials='/data/unifi-cert/credentials/cloudflare.ini',
+            provider='cloudflare',
+            force=False,
+        )
+
+    def test_bare_domain_flag_still_honoured(self):
+        """-d keeps working as the DDNS target for pre-decoupling invocations."""
+        with patch('sys.argv', ['unifi-cert', '--ddns-update', '-d', 'x.example.com']), \
+             patch('sys.stdout.isatty', return_value=False), \
+             patch.object(unifi_cert, 'ui'), \
+             patch.object(unifi_cert, 'rotate_log'), \
+             patch.object(unifi_cert, 'ddns_update', return_value=True) as fn:
+            assert unifi_cert.main() == 0
+        assert fn.call_args.kwargs['domain'] == 'x.example.com'
+
 
 # =============================================================================
 # STATUS REPORT
@@ -5549,6 +6588,7 @@ def status_paths(tmp_path):
         'LOCK_FILE': str(cert_root / 'unifi-cert.lock'),
         'LOG_FILE': str(cert_root / 'unifi-cert.log'),
         'PROVISIONING_CONFIG': str(cert_root / 'unifi-cert.conf'),
+        'DDNS_STATE_FILE': str(cert_root / 'ddns-state.json'),
     }
 
     unifi_paths = dict(unifi_cert.UNIFI_PATHS)
@@ -5696,6 +6736,134 @@ class TestPrintStatus:
             unifi_cert.release_lock(lock_fh)
 
 
+class TestPrintDdnsSection:
+    """The --status DDNS block: config, last success, failure streaks."""
+
+    def _run(self, cfg):
+        with patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert._print_ddns_section(cfg)
+
+    def test_unconfigured_reports_why(self, status_paths, capsys):
+        """No target anywhere → say so rather than printing an empty block."""
+        self._run({})
+        assert 'DDNS not configured' in capsys.readouterr().out
+
+    def test_shows_resolved_targets_and_provider(self, status_paths, tmp_path, capsys):
+        """The decoupled config is echoed back so a typo is visible."""
+        creds = tmp_path / 'cf.ini'
+        creds.write_text('dns_cloudflare_api_token = T\n')
+        self._run({
+            'domain': 'beehive.jdlien.com',
+            'dns_provider': 'digitalocean',
+            'ddns_domain': 'home.jdlien.ca,*.home.jdlien.ca',
+            'ddns_provider': 'cloudflare',
+            'ddns_credentials': str(creds),
+        })
+        out = capsys.readouterr().out
+        assert 'home.jdlien.ca, *.home.jdlien.ca' in out
+        assert 'cloudflare' in out
+
+    def test_no_run_recorded_yet(self, status_paths, capsys):
+        """A configured-but-never-run install says so explicitly."""
+        self._run({'domain': 'x.example.com', 'dns_provider': 'digitalocean',
+                   'dns_credentials': __file__})
+        assert 'No DDNS run recorded yet' in capsys.readouterr().out
+
+    def test_failure_streak_surfaced(self, status_paths, capsys):
+        """The number that went unnoticed for months is now in the report."""
+        Path(status_paths['DDNS_STATE_FILE']).write_text(json.dumps({'targets': {
+            'beehive.jdlien.com': {
+                'consecutive_failures': 6295,
+                'last_success': None,
+                'last_error': 'No A record found for beehive.jdlien.com',
+            },
+        }}))
+        self._run({})
+        captured = capsys.readouterr()
+        # ui.error goes to stderr; cron folds both streams into the log.
+        combined = captured.out + captured.err
+        assert '6295 consecutive failure(s)' in combined
+        assert 'last success never' in combined
+        assert 'No A record found' in combined
+
+    def test_healthy_target_shows_last_ip(self, status_paths, capsys):
+        Path(status_paths['DDNS_STATE_FILE']).write_text(json.dumps({'targets': {
+            'home.jdlien.ca': {
+                'consecutive_failures': 0,
+                'last_success': '2026-07-31T03:00:00',
+                'last_ip': '198.53.200.179',
+                'record_count': 1,
+            },
+        }}))
+        self._run({})
+        out = capsys.readouterr().out
+        assert '198.53.200.179' in out
+        assert '2026-07-31T03:00:00' in out
+
+    def test_duplicate_record_count_warns(self, status_paths, capsys):
+        """>1 A record is the inadyn fingerprint — flag it even when updates work."""
+        Path(status_paths['DDNS_STATE_FILE']).write_text(json.dumps({'targets': {
+            'home.jdlien.ca': {
+                'consecutive_failures': 0,
+                'last_success': '2026-07-31T03:00:00',
+                'last_ip': '198.53.200.179',
+                'record_count': 2,
+            },
+        }}))
+        self._run({})
+        assert '2 A records' in capsys.readouterr().out
+
+    def test_stale_success_is_flagged_not_green(self, status_paths, capsys):
+        """Zero failures + an old timestamp means cron stopped, not health.
+
+        Rendering that as a reassuring green line is the same failure mode as
+        the silent errors: the report says fine while nothing is happening.
+        """
+        old = (datetime.now() - timedelta(hours=9)).isoformat(timespec='seconds')
+        Path(status_paths['DDNS_STATE_FILE']).write_text(json.dumps({'targets': {
+            'home.jdlien.ca': {'consecutive_failures': 0, 'last_success': old,
+                               'last_ip': '198.53.200.179', 'record_count': 1},
+        }}))
+        self._run({})
+        out = capsys.readouterr().out
+        assert 'looks stopped' in out
+        assert '9h ago' in out
+
+    def test_recent_success_is_green(self, status_paths, capsys):
+        recent = (datetime.now() - timedelta(minutes=4)).isoformat(timespec='seconds')
+        Path(status_paths['DDNS_STATE_FILE']).write_text(json.dumps({'targets': {
+            'home.jdlien.ca': {'consecutive_failures': 0, 'last_success': recent,
+                               'last_ip': '198.53.200.179', 'record_count': 1},
+        }}))
+        self._run({})
+        out = capsys.readouterr().out
+        assert 'looks stopped' not in out
+        assert '198.53.200.179' in out
+
+    def test_disabled_ddns_does_not_warn_about_staleness(self, status_paths, capsys):
+        """If DDNS is intentionally off, an old timestamp isn't a problem."""
+        old = (datetime.now() - timedelta(days=30)).isoformat(timespec='seconds')
+        Path(status_paths['DDNS_STATE_FILE']).write_text(json.dumps({'targets': {
+            'home.jdlien.ca': {'consecutive_failures': 0, 'last_success': old,
+                               'last_ip': '198.53.200.179', 'record_count': 1},
+        }}))
+        self._run({'ddns_enabled': 'false'})
+        out = capsys.readouterr().out
+        assert 'looks stopped' not in out
+        assert 'nothing here is being refreshed' in out
+
+    def test_status_includes_ddns_header(self, status_paths, capsys):
+        """print_status() wires the section in."""
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=unifi_cert.GlennRInventory()), \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert.print_status()
+        assert 'DDNS' in capsys.readouterr().out
+
+
 class TestRemoteVerbs:
     """Tests for dispatch_remote_verb() and ensure_remote_script()."""
 
@@ -5808,6 +6976,35 @@ class TestRemoteVerbs:
         assert ' -v' in cmd
         assert '--skip-postgres' in cmd
         assert '--skip-restart' not in cmd
+
+    def test_build_remote_command_forwards_ddns_flags(self):
+        """The ddns_* overrides have to survive the trip to the device."""
+        args = argparse.Namespace(
+            domain=None, email=None, dns_provider=None, dns_credentials=None,
+            ddns_domain='home.jdlien.ca,*.home.jdlien.ca',
+            ddns_provider='cloudflare',
+            ddns_credentials='/data/unifi-cert/credentials/cloudflare.ini',
+            dry_run=False, force=False, verbose=False, no_color=False,
+            skip_postgres=False, skip_restart=False,
+        )
+        cmd = unifi_cert._build_remote_command('--ddns-update', args)
+        assert '--ddns-provider cloudflare' in cmd
+        assert '/data/unifi-cert/credentials/cloudflare.ini' in cmd
+        # The wildcard must reach the device intact — an unquoted '*' would be
+        # glob-expanded by the remote shell against its cwd.
+        assert "'home.jdlien.ca,*.home.jdlien.ca'" in cmd
+
+    def test_build_remote_command_omits_absent_ddns_flags(self):
+        """Verbs on hosts predating these flags must not receive empty values."""
+        args = argparse.Namespace(
+            domain='example.com', email=None, dns_provider=None,
+            dns_credentials=None, dry_run=False, force=False, verbose=False,
+            no_color=False, skip_postgres=False, skip_restart=False,
+        )
+        cmd = unifi_cert._build_remote_command('--status', args)
+        assert '--ddns-domain' not in cmd
+        assert '--ddns-provider' not in cmd
+        assert '--ddns-credentials' not in cmd
 
 
 class TestEnsureRemoteScript:
