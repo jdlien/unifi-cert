@@ -4578,6 +4578,179 @@ class TestDefaultCredentialsPath:
         assert path.endswith('/.secrets/certbot/digitalocean.ini')
 
 
+class TestProvisioningConfigCommentPreservation:
+    """save_provisioning_config() rewrites with 'w'; prose must survive that.
+
+    The 2.1.0 fix made hand-added *keys* durable, after a dropped ddns_domain
+    reintroduced a real outage. It left hand-written *comments* to be destroyed
+    silently, and the rewritten file looks freshly auto-generated — no hint
+    anything was lost. Found in the field 2026-09-21 on a device whose conf
+    recorded why two boxes deliberately share one certificate.
+    """
+
+    HAND_WRITTEN = """\
+# UniFi Certificate Manager provisioning config
+# Auto-generated; consumed by --renew when called without flags
+#
+# Cert CN stays example.com so https://example.com:8443 keeps working.
+#
+# NOTE (2026-09-21): DDNS IS ACTIVE here and that is intentional -- omitting
+# the ddns_* keys is not an opt-out. The only real opt-out is an explicit
+# `ddns_enabled = false` here -- deleting the cron line does not stick.
+#
+# WARNING: these comments are not durable on older versions of the script.
+domain = example.com
+email = admin@example.com
+dns_provider = cloudflare
+"""
+
+    def _write(self, path, text):
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+
+    def test_comment_block_survives_a_rewrite(self, tmp_path):
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), self.HAND_WRITTEN)
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            assert unifi_cert.save_provisioning_config(email='new@example.com') is True
+        out = conf.read_text()
+        assert 'Cert CN stays example.com' in out
+        assert 'DDNS IS ACTIVE here' in out
+        assert 'WARNING: these comments are not durable' in out
+        assert 'email = new@example.com' in out
+
+    def test_comment_containing_equals_does_not_end_the_preamble(self, tmp_path):
+        """`# ... ddns_enabled = false ...` is prose, not a key line.
+
+        The real-world file carries exactly this. A naive "first line with an
+        '=' ends the comment block" rule truncates everything after it.
+        """
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), self.HAND_WRITTEN)
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='new@example.com')
+        out = conf.read_text()
+        assert '`ddns_enabled = false` here' in out
+        # ...and everything after that line survived too.
+        assert 'WARNING: these comments are not durable' in out
+
+    def test_headers_are_not_duplicated(self, tmp_path):
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), self.HAND_WRITTEN)
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='a@example.com')
+            unifi_cert.save_provisioning_config(email='b@example.com')
+        out = conf.read_text()
+        for header in unifi_cert.PROVISIONING_HEADER_LINES:
+            assert out.count(header) == 1
+
+    def test_repeated_saves_are_idempotent(self, tmp_path):
+        """Two saves with the same values produce a byte-identical file."""
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), self.HAND_WRITTEN)
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='x@example.com')
+            first = conf.read_text()
+            unifi_cert.save_provisioning_config(email='x@example.com')
+            second = conf.read_text()
+        assert first == second
+
+    def test_keys_are_still_merged(self, tmp_path):
+        """Regression guard on the 2.1.0 behaviour this must not disturb."""
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf),
+                    '# note\ndomain = example.com\nddns_domain = ddns.example.com\n'
+                    'custom_key = keep-me\n')
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='admin@example.com')
+        cfg_text = conf.read_text()
+        assert 'ddns_domain = ddns.example.com' in cfg_text
+        assert 'custom_key = keep-me' in cfg_text
+        assert '# note' in cfg_text
+
+    def test_no_existing_file_writes_clean(self, tmp_path):
+        conf = tmp_path / 'unifi-cert.conf'
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(domain='example.com')
+        lines = conf.read_text().splitlines()
+        assert lines[:2] == list(unifi_cert.PROVISIONING_HEADER_LINES)
+        assert lines[2] == 'domain = example.com'   # no spurious blank line
+
+    def test_headers_only_file_gains_no_blank_lines(self, tmp_path):
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), '\n'.join(unifi_cert.PROVISIONING_HEADER_LINES)
+                    + '\ndomain = example.com\n')
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='a@example.com')
+        assert '\n\n' not in conf.read_text()
+
+    def test_comments_without_our_headers_are_kept(self, tmp_path):
+        """A hand-made file that never had the auto-generated headers."""
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), '# purely hand-written\ndomain = example.com\n')
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='a@example.com')
+        assert '# purely hand-written' in conf.read_text()
+
+    def test_interleaved_comments_are_dropped(self, tmp_path):
+        """Documented limitation: only the block above the keys is anchored."""
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf),
+                    '# top block\ndomain = example.com\n'
+                    '# stranded between keys\nemail = a@example.com\n')
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(dns_provider='cloudflare')
+        out = conf.read_text()
+        assert '# top block' in out
+        assert '# stranded between keys' not in out
+
+    def test_mode_is_still_0600(self, tmp_path):
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), self.HAND_WRITTEN)
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='a@example.com')
+        assert oct(os.stat(str(conf)).st_mode)[-3:] == '600'
+
+    def test_preamble_helper_returns_empty_when_absent(self, tmp_path):
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG',
+                          str(tmp_path / 'nope.conf')):
+            assert unifi_cert._preserved_config_preamble() == []
+
+    def test_config_still_parses_after_round_trip(self, tmp_path):
+        """The surviving prose must not confuse load_provisioning_config()."""
+        conf = tmp_path / 'unifi-cert.conf'
+        self._write(str(conf), self.HAND_WRITTEN)
+        with patch.object(unifi_cert, 'PROVISIONING_CONFIG', str(conf)), \
+             patch.object(unifi_cert, 'UNIFI_CERT_ROOT', str(tmp_path)), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.save_provisioning_config(email='new@example.com')
+            cfg = unifi_cert.load_provisioning_config()
+        assert cfg['domain'] == 'example.com'
+        assert cfg['email'] == 'new@example.com'
+        assert cfg['dns_provider'] == 'cloudflare'
+        assert 'ddns_enabled' not in cfg     # the prose mention is not a key
+
+
 class TestProvisioningConfig:
     """Tests for save_provisioning_config() / load_provisioning_config()."""
 
