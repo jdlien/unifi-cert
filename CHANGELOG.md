@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] - 2026-09-21
+
+`save_provisioning_config()` destroyed hand-written comments in the provisioning config. Found in the field on a device whose config file recorded *why* it was deliberately configured the way it was — reasoning that obtain-new would have erased without a word.
+
+### Fixed
+
+- **The provisioning config's comment block now survives a rewrite.** `save_provisioning_config()` opens the file with `'w'` and re-emitted only its two hardcoded header lines plus `key = value` pairs, so every hand-written comment below them was destroyed. The rewritten file looks freshly auto-generated, so nothing hints that documentation was lost.
+
+  The sharp edge is that the docstring directly above that code claimed the opposite: *"Merges with what's already on disk rather than overwriting it."* That was the 2.1.0 fix, added after a hand-added `ddns_domain` was silently dropped and reintroduced a real outage. It made **keys** durable and left **prose** to be destroyed — so the function's own documentation misdescribed its behaviour, and anyone who read it before annotating a config had every reason to think their notes were safe.
+
+  Only two callers reach it: obtain-new (the default verb) and `--migrate-glennr`. `--renew`, `--self-heal`, `--deploy-hook` and `--ddns-update` only read the file, so routine operation was never at risk — which is exactly why this could sit unnoticed. New `_preserved_config_preamble()` captures everything above the first `key = value` line, minus the auto-generated headers, and the writer re-emits it in the same slot. `--migrate-glennr` inherits the behaviour, so importing over an annotated config no longer discards the operator's notes either.
+
+  **Documented limitation:** comments interleaved *between* key lines are not preserved. The writer emits `PROVISIONING_KEYS` in fixed order and then unknown keys sorted, so there is no stable position to anchor them to, and a parser that kept positions would have to retain state it currently discards. Notes belong above the keys; that shape is supported and tested.
+
+  A comment containing an `=` — `` # the only opt-out is `ddns_enabled = false` `` — is prose, not a key line, and does not terminate the block. That case appears in the real-world file that surfaced this, where a naive rule would have truncated everything after it.
+
+### Tests
+
+- 543 → 555 (`+12`), coverage held at 89.9%. Covers the block surviving a rewrite, headers not duplicating across repeated saves, byte-identical output on a second save with the same values, an `=` inside a comment not ending the preamble, a hand-made file that never carried the auto-generated headers, interleaved comments being dropped as documented, no spurious blank lines on a headers-only or absent file, mode `0600` preserved, the 2.1.0 key-merge behaviour intact, and `load_provisioning_config()` still parsing the result with the prose not mistaken for a key.
+
+Separately verified against the real 48-line file that surfaced this: round-tripping it through `save_provisioning_config()` returns it byte-identical, sha256 unchanged, all 44 comment lines intact.
+
 ## [2.2.1] - 2026-09-21
 
 Makes the advertised one-liner actually safe to use, so upgrading a device is one command again rather than a hand-written shell incantation.

@@ -600,6 +600,60 @@ PROVISIONING_KEYS = (
 )
 
 
+# The two lines save_provisioning_config() emits itself. Kept as a constant so
+# the writer and the preamble-preserver cannot drift apart on the exact text.
+PROVISIONING_HEADER_LINES = (
+    '# UniFi Certificate Manager provisioning config',
+    '# Auto-generated; consumed by --renew when called without flags',
+)
+
+
+def _preserved_config_preamble() -> list:
+    """Return the hand-written comment block from the existing config file.
+
+    Everything above the first `key = value` line, verbatim, minus our own
+    auto-generated headers (the writer re-emits those).
+
+    This exists because save_provisioning_config() rewrites the file with 'w'.
+    It merges *keys* — that was the 2.1.0 fix, after a hand-added ddns_domain
+    was silently dropped and reintroduced a real outage — but it used to
+    re-emit only headers and key/value pairs, so every hand-written comment
+    below them was destroyed. The result looked freshly auto-generated, giving
+    no hint that anything had been lost. Found in the field 2026-09-21 on a
+    device whose conf carried the operator's reasoning about why two boxes
+    deliberately share a certificate; obtain-new would have erased it without
+    a word.
+
+    The block is preserved as a unit and re-emitted in the same slot. Comments
+    interleaved *between* key lines are not preserved: the writer emits
+    PROVISIONING_KEYS in fixed order and then unknown keys sorted, so there is
+    no stable position to anchor them to, and a parser that kept positions
+    would have to keep state it currently discards. Putting notes above the
+    keys is the supported shape.
+    """
+    try:
+        with open(PROVISIONING_CONFIG, 'r', encoding='utf-8') as fh:
+            raw = fh.read().splitlines()
+    except OSError:
+        return []
+
+    preamble = []
+    for line in raw:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#') and '=' in stripped:
+            break                    # first key = value ends the preamble
+        preamble.append(line)
+
+    preamble = [ln for ln in preamble
+                if ln.strip() not in PROVISIONING_HEADER_LINES]
+
+    while preamble and not preamble[0].strip():
+        preamble.pop(0)
+    while preamble and not preamble[-1].strip():
+        preamble.pop()
+    return preamble
+
+
 def save_provisioning_config(domain: str = None, email: str = None,
                               dns_provider: str = None,
                               dns_credentials: str = None,
@@ -612,11 +666,16 @@ def save_provisioning_config(domain: str = None, email: str = None,
     self-configure. Stores the credentials *path*; secrets stay in the
     credentials file under CREDENTIALS_DIR (mode 0600).
 
-    Merges with what's already on disk rather than overwriting it. The ddns_*
-    keys are typically hand-added after install, and a later obtain-new run
-    must not silently drop them — a wiped ddns_domain falls back to the cert
-    CN, which is exactly the misconfiguration this tool exists to prevent.
+    Merges with what's already on disk rather than overwriting it — both the
+    keys and the hand-written comment block above them. The ddns_* keys are
+    typically hand-added after install, and a later obtain-new run must not
+    silently drop them — a wiped ddns_domain falls back to the cert CN, which
+    is exactly the misconfiguration this tool exists to prevent. The same
+    argument applies to the prose recording *why* a device is configured the
+    way it is; see _preserved_config_preamble().
     """
+    # Read before the 'w' below truncates the file.
+    preamble = _preserved_config_preamble()
     config = load_provisioning_config()
     updates = {
         'domain': domain,
@@ -632,8 +691,10 @@ def save_provisioning_config(domain: str = None, email: str = None,
     try:
         os.makedirs(UNIFI_CERT_ROOT, mode=0o755, exist_ok=True)
         with open(PROVISIONING_CONFIG, 'w', encoding='utf-8') as fh:
-            fh.write('# UniFi Certificate Manager provisioning config\n')
-            fh.write('# Auto-generated; consumed by --renew when called without flags\n')
+            for header in PROVISIONING_HEADER_LINES:
+                fh.write(header + '\n')
+            for line in preamble:
+                fh.write(line + '\n')
             for key in PROVISIONING_KEYS:
                 if key in config:
                     fh.write(f'{key} = {config[key]}\n')
