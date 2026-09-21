@@ -32,3 +32,7 @@ logs/
 
 # GlennR reference material (not part of the project)
 reference/
+
+# Private deployment notes (site-specific hostnames / IPs / device state).
+# The repo is public; keep anything instance-identifying in *.local.md.
+*.local.md

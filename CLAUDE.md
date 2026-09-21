@@ -185,6 +185,14 @@ python3 unifi-cert.py --install --cert test.crt --key test.key -d example.com --
 python3 unifi-cert.py ... -v
 ```
 
+### Deployment notes (private)
+
+Site-specific facts — real hostnames, IPs, per-device Python/certbot/venv state,
+and why a given site is configured the way it is — live in `DEPLOYMENT.local.md`,
+which is **gitignored** because this repo is public. Read it before doing work
+against real hardware; it is the difference between "this looks misconfigured"
+and "this is deliberate, here's why". It won't exist in a fresh clone.
+
 ### Test Devices
 
 - **Beehive (home)**: 192.168.1.1, domain: beehive.jdlien.com
