@@ -2393,6 +2393,83 @@ def bootstrap_certbot(dns_provider: str, force: bool = False) -> tuple[bool, str
     return True, "bootstrapped"
 
 
+SCRIPT_SOURCE_URL = ('https://raw.githubusercontent.com/jdlien/unifi-cert/'
+                     'main/unifi-cert.py')
+
+# A marker that must appear in a downloaded script for it to be ours. Being
+# valid Python is not a high enough bar on its own.
+SCRIPT_SENTINEL = b'UniFi Certificate Manager'
+
+
+def _unlink_quietly(path: str) -> None:
+    """Remove `path`, ignoring absence or permission trouble."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def download_script(dest: str) -> tuple[bool, str]:
+    """Fetch the script from GitHub and atomically install it at `dest`.
+
+    Every step defends the same thing: `dest` is live. Cron runs it every
+    five minutes for --ddns-update and nightly for --renew, and certbot's
+    post-renewal hook shells out to it.
+
+    The version this replaces was `curl -sL <url> -o <dest>`, which has two
+    ways to destroy a working install. Without --fail, curl exits 0 on a 404
+    having written the error body to the file — which then got chmod +x and
+    was reported as a successful install, leaving `404: Not Found` where cron
+    expects a program. And writing in place is not atomic, so a cron firing
+    mid-download executes a half-written file. Trading a recoverable broken
+    venv for a broken *installer* is strictly worse: the installer is what
+    repairs the venv.
+
+    So: --fail, download beside the target (same filesystem, so os.replace is
+    a true atomic rename), refuse anything that will not compile or does not
+    carry SCRIPT_SENTINEL, and keep the previous copy at <dest>.bak.
+
+    Returns: (success, message)
+    """
+    tmp = f'{dest}.new'
+    try:
+        result = subprocess.run(
+            ['curl', '-fsSL', SCRIPT_SOURCE_URL, '-o', tmp],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _unlink_quietly(tmp)
+        return False, f'download errored: {e}'
+
+    if result.returncode != 0:
+        _unlink_quietly(tmp)
+        stderr = (result.stderr or '').strip()
+        return False, stderr or f'curl exited {result.returncode}'
+
+    # A 200 can still carry the wrong thing — a CDN error page, a truncated
+    # body, someone else's file. Check before it becomes the file cron runs.
+    try:
+        with open(tmp, 'rb') as fh:
+            source = fh.read()
+        compile(source, tmp, 'exec')
+    except (OSError, SyntaxError, ValueError) as e:
+        _unlink_quietly(tmp)
+        return False, f'downloaded file is not valid Python ({e})'
+    if SCRIPT_SENTINEL not in source:
+        _unlink_quietly(tmp)
+        return False, 'downloaded file does not look like unifi-cert.py'
+
+    try:
+        if os.path.exists(dest):
+            shutil.copy2(dest, f'{dest}.bak')
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)   # atomic within a single filesystem
+    except OSError as e:
+        _unlink_quietly(tmp)
+        return False, f'could not install to {dest}: {e}'
+    return True, f'installed {dest}'
+
+
 PERMANENT_SCRIPT_PATH = '/data/scripts/unifi-cert.py'
 
 
@@ -2437,18 +2514,13 @@ def ensure_script_installed() -> str:
             os.chmod(PERMANENT_SCRIPT_PATH, 0o755)
             ui.info(f"Installed script to {PERMANENT_SCRIPT_PATH}")
         else:
-            # Running from stdin (curl pipe) - download from GitHub
+            # Running from stdin (curl pipe) - download from GitHub.
             ui.info("Downloading script to permanent location...")
-            result = subprocess.run(
-                ['curl', '-sL', 'https://raw.githubusercontent.com/jdlien/unifi-cert/main/unifi-cert.py',
-                 '-o', PERMANENT_SCRIPT_PATH],
-                capture_output=True, timeout=30
-            )
-            if result.returncode == 0:
-                os.chmod(PERMANENT_SCRIPT_PATH, 0o755)
+            ok, msg = download_script(PERMANENT_SCRIPT_PATH)
+            if ok:
                 ui.success(f"Installed script to {PERMANENT_SCRIPT_PATH}")
             else:
-                ui.warning(f"Could not download script: {result.stderr.decode()}")
+                ui.warning(f"Could not download script: {msg}")
     except subprocess.TimeoutExpired:
         ui.warning("Download timed out")
     except IOError as e:
@@ -2672,7 +2744,13 @@ def self_heal(dns_provider: Optional[str] = None,
             ui.warning(f'self-heal: bootstrap deferred ({msg})')
             ok = False
     else:
-        ui.debug('self-heal: no dns_provider known; skipping bootstrap')
+        # Not debug. Without a provider we cannot bootstrap the venv at all —
+        # the one repair that matters — and reporting that as a clean run is
+        # the same lie --status used to tell about a dead venv.
+        ui.warning(f'self-heal: no dns_provider in {PROVISIONING_CONFIG}; '
+                   'cannot bootstrap the certbot venv (set dns_provider '
+                   'there, or pass --dns-provider)')
+        ok = False
 
     ensure_script_installed()
     ok = install_cron_schedule() and ok
