@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-09-21
+
+Makes the advertised one-liner actually safe to use, so upgrading a device is one command again rather than a hand-written shell incantation.
+
+2.2.0 shipped with a documented upgrade path that nobody could follow simply. The README has always advertised `curl -sL jdlien.com/unifi-cert | python3 -`, and that works for upgrades too — piped from stdin there is no `__file__`, so `ensure_script_installed()` downloads the script to `/data/scripts/unifi-cert.py` itself. But that download carried the same defect this project keeps finding in its own reporting: it could fail and announce success.
+
+### Fixed
+
+- **The curl-pipe installer no longer writes a failed download over a working script.** `ensure_script_installed()` ran `curl -sL <url> -o /data/scripts/unifi-cert.py`. Without `--fail`, curl exits **0** on a 404 having written the error body to the file; `-s` hid the error. The result was then `chmod +x`'d and reported as `✓ Installed script`, leaving `404: Not Found` at the path cron invokes every five minutes for `--ddns-update`, nightly for `--renew`, and that certbot's post-renewal hook shells out to. That trades a recoverable broken venv for a broken *installer* — strictly worse, because the installer is what repairs the venv.
+
+  The write was also in place and therefore not atomic, so a cron firing mid-download would execute a half-written file.
+
+  New `download_script()` uses `curl -fsSL`, downloads to `<dest>.new` beside the target (same filesystem, so `os.replace()` is a true atomic rename), refuses a body that will not `compile()` or does not carry `SCRIPT_SENTINEL`, and keeps the previous copy at `<dest>.bak`. On any failure the live script is untouched.
+
+  Worth noting the safe pattern already existed in this repo: the opt-in `--enable-hook-autoupdate` block has always done temp-file → sha-verify → atomic `mv`. The path that is disabled by default was more careful than the one every user takes.
+
+- **`self_heal()` no longer reports success when it skipped the bootstrap entirely.** With no `dns_provider` resolvable from the provisioning config, it logged `no dns_provider known; skipping bootstrap` at **debug** level and returned `True`. The certbot venv — the one thing self-heal exists to repair — was never even examined, and cron, `--renew`, and the exit code all read it as a clean run. Two opposite states produced byte-identical output at default verbosity: a healthy venv, and a venv nobody had looked at since install. Now a warning, and `ok = False`.
+
+### Added
+
+- **README documents the upgrade path.** `curl -sL jdlien.com/unifi-cert | python3 - --self-heal`, including that it is the recovery route after a UniFi OS update bumps the system Python, and the `--host` equivalent for workstation use.
+
+### Tests
+
+- 530 → 543 (`+13`), coverage held at 89.9%. `download_script()` is covered for the `--fail` flag, the temp-file-then-rename sequence, and four ways a bad download must leave the live script untouched: curl failure, an HTML error page behind a 200, valid Python that is not this program, and a body truncated mid-statement. Plus `.bak` retention, first-install with nothing to back up, and the `self_heal()` warn-and-fail path.
+
 ## [2.2.0] - 2026-09-21
 
 Surviving a Python minor-version bump. On 2026-09-21 the certbot venv on the affected device (UDM Pro) was found dead, and `--status` was reporting it with a green checkmark.

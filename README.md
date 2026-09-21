@@ -43,6 +43,28 @@ That's it. The interactive wizard will walk you through everything:
 - API credentials (creates the file for you if needed)
 - **Automatic renewal hook** (keeps WebUI in sync after renewals)
 
+### Upgrading an existing install
+
+Same one-liner, with `--self-heal`:
+
+```bash
+curl -sL jdlien.com/unifi-cert | python3 - --self-heal
+```
+
+It installs the new script to `/data/scripts/unifi-cert.py`, repairs the certbot
+venv if it needs it, and re-asserts cron and the renewal hook. It never runs ACME,
+so it is safe to run at any time. The previous script is kept at
+`/data/scripts/unifi-cert.py.bak`.
+
+This is also the recovery path after a UniFi OS update bumps the system Python:
+a venv built against the old interpreter is detected and rebuilt from scratch.
+
+From a workstation with the repo checked out, the equivalent is:
+
+```bash
+python3 unifi-cert.py --self-heal --host <device>
+```
+
 > **Coming from GlennR's `unifi-easy-encrypt.sh`?** Run `--migrate-glennr` instead — it snapshots GlennR's state to a tarball, imports its provisioning, and uninstalls the footprint via an explicit allowlist. See the [Migrating From GlennR](#migrating-from-glennrs-unifi-easy-encryptsh) section below.
 
 ### Sync Existing Certificate to WebUI

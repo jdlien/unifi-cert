@@ -1722,12 +1722,16 @@ class TestCertbot:
         def mock_run(cmd, *args, **kwargs):
             result = MagicMock()
             if 'curl' in cmd:
-                # Simulate successful download
+                # Simulate a successful download. Must compile and carry the
+                # sentinel, or download_script() refuses to install it.
                 with open(cmd[cmd.index('-o') + 1], 'w') as f:
-                    f.write('#!/usr/bin/env python3\n# Downloaded script')
+                    f.write('#!/usr/bin/env python3\n'
+                            '# UniFi Certificate Manager (downloaded)\n')
                 result.returncode = 0
+                result.stderr = ''
             else:
                 result.returncode = 1
+                result.stderr = ''
             return result
 
         with patch.object(unifi_cert, 'ui'), \
@@ -4327,7 +4331,7 @@ class TestSelfHeal:
         hook.assert_called_once_with('beehive.example.com')
 
     def test_self_heal_skips_bootstrap_when_no_provider(self):
-        """No dns_provider known + no provisioning config → skip bootstrap, still install cron."""
+        """No dns_provider → bootstrap impossible; warn, fail, but still fix the rest."""
         with patch.object(unifi_cert, 'load_provisioning_config', return_value={}), \
              patch.object(unifi_cert, 'bootstrap_certbot') as boot, \
              patch.object(unifi_cert, 'ensure_script_installed'), \
@@ -4336,10 +4340,13 @@ class TestSelfHeal:
              patch.object(unifi_cert, 'install_boot_script', return_value=True), \
              patch.object(unifi_cert, 'ui'):
             ok = unifi_cert.self_heal()
-        assert ok is True  # no domain → hook skipped, but cron still installed
+        # Bootstrap could not run at all, so this is NOT a clean heal. It used
+        # to return True, which let cron and --renew treat a device whose venv
+        # was never even checked as healthy.
+        assert ok is False
         boot.assert_not_called()
-        cron.assert_called_once()
-        hook.assert_not_called()
+        cron.assert_called_once()   # the rest is still repaired
+        hook.assert_not_called()    # no domain → no hook
 
     def test_self_heal_reports_failure_when_bootstrap_fails(self):
         """Bootstrap failure → ok=False but cron + hook still attempted."""
@@ -4353,6 +4360,200 @@ class TestSelfHeal:
             ok = unifi_cert.self_heal(dns_provider='digitalocean', domain='example.com')
         assert ok is False
         cron.assert_called_once()
+
+
+class TestDownloadScript:
+    """The curl-pipe installer writes to a path cron executes every 5 minutes.
+
+    The version this replaces was `curl -sL <url> -o <dest>`: no --fail, so a
+    404 exited 0 with the error body in the file, which then got chmod +x and
+    was announced as a successful install. And the write was in place, so a
+    cron firing mid-download ran a half-written file.
+    """
+
+    GOOD = b'#!/usr/bin/env python3\n# UniFi Certificate Manager\nx = 1\n'
+
+    def _curl(self, payload=None, returncode=0, stderr=''):
+        """subprocess.run stand-in that writes `payload` to curl's -o target."""
+        def _run(cmd, *a, **kw):
+            if payload is not None and '-o' in cmd:
+                with open(cmd[cmd.index('-o') + 1], 'wb') as fh:
+                    fh.write(payload)
+            return MagicMock(returncode=returncode, stdout='', stderr=stderr)
+        return _run
+
+    def test_uses_fail_flag(self, tmp_path):
+        """--fail is the whole point: no more 404-bodies-as-programs."""
+        dest = str(tmp_path / 'unifi-cert.py')
+        seen = {}
+
+        def _run(cmd, *a, **kw):
+            seen['cmd'] = cmd
+            with open(cmd[cmd.index('-o') + 1], 'wb') as fh:
+                fh.write(self.GOOD)
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch('subprocess.run', side_effect=_run), patch.object(unifi_cert, 'ui'):
+            ok, _ = unifi_cert.download_script(dest)
+        assert ok is True
+        assert '-fsSL' in seen['cmd']
+        assert '-sL' not in seen['cmd']
+
+    def test_installs_atomically_via_temp_file(self, tmp_path):
+        """Downloads to <dest>.new beside the target, then renames."""
+        dest = str(tmp_path / 'unifi-cert.py')
+        targets = []
+
+        def _run(cmd, *a, **kw):
+            target = cmd[cmd.index('-o') + 1]
+            targets.append(target)
+            with open(target, 'wb') as fh:
+                fh.write(self.GOOD)
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch('subprocess.run', side_effect=_run), patch.object(unifi_cert, 'ui'):
+            ok, _ = unifi_cert.download_script(dest)
+        assert ok is True
+        # curl never wrote to the live path...
+        assert targets == [dest + '.new']
+        # ...and the temp file is gone, consumed by the rename.
+        assert not os.path.exists(dest + '.new')
+        assert open(dest, 'rb').read() == self.GOOD
+        assert os.access(dest, os.X_OK)
+
+    def test_temp_file_shares_filesystem_with_dest(self, tmp_path):
+        """os.replace is only atomic within one filesystem, so .new sits beside dest."""
+        dest = str(tmp_path / 'sub' / 'unifi-cert.py')
+        assert os.path.dirname(dest + '.new') == os.path.dirname(dest)
+
+    def test_curl_failure_leaves_dest_untouched(self, tmp_path):
+        """A 404 (now a curl error) must not touch the live script."""
+        dest = tmp_path / 'unifi-cert.py'
+        dest.write_bytes(b'#!/usr/bin/env python3\n# the working one\n')
+        with patch('subprocess.run',
+                   side_effect=self._curl(b'404: Not Found', returncode=22,
+                                          stderr='curl: (22) HTTP 404')), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.download_script(str(dest))
+        assert ok is False
+        assert '404' in msg
+        assert dest.read_bytes() == b'#!/usr/bin/env python3\n# the working one\n'
+        assert not os.path.exists(str(dest) + '.new')
+
+    def test_non_python_body_is_refused(self, tmp_path):
+        """A 200 carrying a CDN error page must not become the file cron runs."""
+        dest = tmp_path / 'unifi-cert.py'
+        dest.write_bytes(self.GOOD)
+        with patch('subprocess.run',
+                   side_effect=self._curl(b'<html><body>502 Bad Gateway</body></html>')), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.download_script(str(dest))
+        assert ok is False
+        assert 'not valid Python' in msg
+        assert dest.read_bytes() == self.GOOD
+        assert not os.path.exists(str(dest) + '.new')
+
+    def test_valid_python_that_is_not_our_script_is_refused(self, tmp_path):
+        """Compiling is not a high enough bar on its own."""
+        dest = tmp_path / 'unifi-cert.py'
+        dest.write_bytes(self.GOOD)
+        with patch('subprocess.run',
+                   side_effect=self._curl(b'print("some other project")\n')), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.download_script(str(dest))
+        assert ok is False
+        assert 'does not look like' in msg
+        assert dest.read_bytes() == self.GOOD
+
+    def test_truncated_download_is_refused(self, tmp_path):
+        """A body cut mid-statement fails to compile rather than being installed."""
+        dest = tmp_path / 'unifi-cert.py'
+        dest.write_bytes(self.GOOD)
+        with patch('subprocess.run',
+                   side_effect=self._curl(b'# UniFi Certificate Manager\ndef f(:\n')), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.download_script(str(dest))
+        assert ok is False
+        assert dest.read_bytes() == self.GOOD
+
+    def test_previous_version_kept_as_bak(self, tmp_path):
+        """Rollback is `mv <dest>.bak <dest>`."""
+        dest = tmp_path / 'unifi-cert.py'
+        dest.write_bytes(b'#!/usr/bin/env python3\n# UniFi Certificate Manager old\n')
+        with patch('subprocess.run', side_effect=self._curl(self.GOOD)), \
+             patch.object(unifi_cert, 'ui'):
+            ok, _ = unifi_cert.download_script(str(dest))
+        assert ok is True
+        assert dest.read_bytes() == self.GOOD
+        assert (tmp_path / 'unifi-cert.py.bak').read_bytes().endswith(b'old\n')
+
+    def test_first_install_needs_no_bak(self, tmp_path):
+        """Nothing to back up on a fresh device."""
+        dest = tmp_path / 'unifi-cert.py'
+        with patch('subprocess.run', side_effect=self._curl(self.GOOD)), \
+             patch.object(unifi_cert, 'ui'):
+            ok, _ = unifi_cert.download_script(str(dest))
+        assert ok is True
+        assert not (tmp_path / 'unifi-cert.py.bak').exists()
+
+    def test_timeout_leaves_dest_untouched(self, tmp_path):
+        dest = tmp_path / 'unifi-cert.py'
+        dest.write_bytes(self.GOOD)
+        with patch('subprocess.run',
+                   side_effect=subprocess.TimeoutExpired('curl', 30)), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.download_script(str(dest))
+        assert ok is False
+        assert dest.read_bytes() == self.GOOD
+
+    def test_pulls_from_the_canonical_url(self, tmp_path):
+        seen = {}
+
+        def _run(cmd, *a, **kw):
+            seen['cmd'] = cmd
+            with open(cmd[cmd.index('-o') + 1], 'wb') as fh:
+                fh.write(self.GOOD)
+            return MagicMock(returncode=0, stdout='', stderr='')
+
+        with patch('subprocess.run', side_effect=_run), patch.object(unifi_cert, 'ui'):
+            unifi_cert.download_script(str(tmp_path / 'x.py'))
+        assert unifi_cert.SCRIPT_SOURCE_URL in seen['cmd']
+        assert unifi_cert.SCRIPT_SOURCE_URL.startswith('https://')
+
+
+class TestSelfHealNoProvider:
+    """A self-heal that cannot bootstrap must not report a clean run."""
+
+    def test_missing_provider_warns_and_fails(self, capsys):
+        with patch.object(unifi_cert, 'load_provisioning_config', return_value={}), \
+             patch.object(unifi_cert, 'bootstrap_certbot') as boot, \
+             patch.object(unifi_cert, 'ensure_script_installed'), \
+             patch.object(unifi_cert, 'install_cron_schedule', return_value=True), \
+             patch.object(unifi_cert, 'install_boot_script', return_value=True), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            ok = unifi_cert.self_heal()
+        out = capsys.readouterr().out
+        assert ok is False
+        boot.assert_not_called()
+        # Visible at default verbosity — it used to be ui.debug().
+        assert 'no dns_provider' in out
+        assert '⚠' in out
+
+    def test_provider_present_still_bootstraps(self):
+        with patch.object(unifi_cert, 'load_provisioning_config',
+                          return_value={'dns_provider': 'cloudflare',
+                                        'domain': 'example.com'}), \
+             patch.object(unifi_cert, 'bootstrap_certbot',
+                          return_value=(True, 'already healthy')) as boot, \
+             patch.object(unifi_cert, 'ensure_script_installed'), \
+             patch.object(unifi_cert, 'install_cron_schedule', return_value=True), \
+             patch.object(unifi_cert, 'setup_renewal_hook', return_value=True), \
+             patch.object(unifi_cert, 'install_boot_script', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            ok = unifi_cert.self_heal()
+        assert ok is True
+        boot.assert_called_once_with('cloudflare')
 
 
 class TestDefaultCredentialsPath:
