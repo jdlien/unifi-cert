@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -128,9 +128,34 @@ LOCK_FILE = f'{UNIFI_CERT_ROOT}/unifi-cert.lock'
 PROVISIONING_CONFIG = f'{UNIFI_CERT_ROOT}/unifi-cert.conf'
 
 # apt prerequisites for the bootstrap path. UDM Pro firmware ships python3 but
-# strips python3-pip / python3-venv / python3-distutils; bootstrap re-installs
-# them and re-asserts on every boot via self-heal.
-APT_PREREQS = ('python3-pip', 'python3-venv', 'python3-distutils')
+# strips python3-pip / python3-venv; bootstrap re-installs them and re-asserts
+# on every boot via self-heal.
+APT_PREREQS = ('python3-pip', 'python3-venv')
+
+# python3-distutils is requested only below Python 3.12. distutils left the
+# stdlib in 3.12 (PEP 632) and Debian dropped the package with it, so on a
+# Debian 13 image `apt-cache policy python3-distutils` answers
+# `Candidate: (none)`. _ensure_apt_prereqs() installs the whole set in one
+# apt-get call, so one unavailable member takes the entire install down with
+# "Package 'python3-distutils' has no installation candidate" — which is
+# exactly what blocked 14 consecutive nightly self-heal rebuilds in the wild
+# after a UniFi OS update moved a device from Python 3.9 to 3.13. Devices still on
+# older firmware genuinely need the package, so it stays, gated on the version
+# of the interpreter actually running rather than deleted outright.
+APT_PREREQS_PRE_312 = ('python3-distutils',)
+
+
+def apt_prereqs() -> tuple:
+    """Return the apt packages the bootstrap needs on the *running* interpreter.
+
+    The venv follows `python3`, and this script is invoked as `/usr/bin/python3
+    unifi-cert.py` from cron and the boot script, so sys.version_info is the
+    version the venv will be built against.
+    """
+    if sys.version_info < (3, 12):
+        return APT_PREREQS + APT_PREREQS_PRE_312
+    return APT_PREREQS
+
 
 # Config file for persisting user preferences
 CONFIG_FILE = os.path.expanduser('~/.secrets/certbot/config.ini')
@@ -237,6 +262,17 @@ class UI:
     def error(self, text: str) -> None:
         """Print an error message."""
         print(self._c(self.RED, '✗ ') + text, file=sys.stderr)
+
+    def failure(self, text: str) -> None:
+        """Print a red ✗ on *stdout* — the negative counterpart to success().
+
+        error() is for things going wrong in a run and correctly goes to
+        stderr. A bad finding inside a report is different: it belongs in the
+        report. run_remote() returns only stdout, so a --status ✗ written to
+        stderr would be dropped on the floor by `--status --host <device>`,
+        which is the reading that matters most.
+        """
+        print(self._c(self.RED, '✗ ') + text)
 
     def info(self, text: str) -> None:
         """Print an info message."""
@@ -418,6 +454,20 @@ class CertMetadata:
             serial=serial,
             fingerprint=fingerprint,
         )
+
+
+def parse_cert_timestamp(value: str) -> datetime:
+    """Parse a CertMetadata valid_from / valid_to into a tz-aware UTC datetime.
+
+    convert_date() above normalizes openssl's output to the PostgreSQL literal
+    `%Y-%m-%d %H:%M:%S+00`, which strptime reads as *naive*. The `+00` is not
+    decoration — the value is UTC — so we attach the tzinfo here. Every caller
+    compares this against datetime.now(timezone.utc), and mixing a naive value
+    into that raises TypeError rather than quietly drifting, so the attachment
+    has to happen in one place. Raises ValueError on anything unparseable.
+    """
+    return datetime.strptime(value, '%Y-%m-%d %H:%M:%S+00').replace(
+        tzinfo=timezone.utc)
 
 
 def detect_domain_from_cert(cert_path: str = None) -> Optional[str]:
@@ -1033,7 +1083,7 @@ def snapshot_glennr(inv: GlennRInventory,
     Recovery is `tar xzf <tarball>` from /. Returns the tarball path on
     success, None on failure (no removals should follow a snapshot failure).
     """
-    timestamp = timestamp or datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    timestamp = timestamp or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     try:
         os.makedirs(BACKUPS_DIR, mode=0o755, exist_ok=True)
     except OSError as e:
@@ -1377,7 +1427,7 @@ def migrate_glennr(dry_run: bool = False, force: bool = False,
         return False
 
     # 2. Snapshot — must happen before any deletion.
-    timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     if snapshot_glennr(inv, timestamp) is None:
         ui.error('Snapshot failed; aborting before any destructive change.')
         return False
@@ -1997,18 +2047,116 @@ def certbot_live_dir(domain: str) -> str:
     return f'/etc/letsencrypt/live/{domain}'
 
 
-def certbot_health_check() -> bool:
-    """Return True iff the persistent certbot binary executes and reports a version."""
+def probe_certbot() -> tuple[bool, str]:
+    """Run `certbot --version` in the persistent venv. Returns (ok, output).
+
+    `ok` is the *return code* being zero, never the presence of output. A venv
+    orphaned by a Python minor-version bump still has bin/certbot on disk and
+    still writes plenty to stderr — a ModuleNotFoundError traceback — so any
+    caller that reads the streams without checking the status reports a dead
+    venv as a healthy one. Both certbot_health_check() and the --status
+    renderer go through here so there is one answer to "does this run?".
+    """
     if not os.path.exists(CERTBOT_BIN):
-        return False
+        return False, f'{CERTBOT_BIN} does not exist'
     try:
         result = subprocess.run(
             [CERTBOT_BIN, '--version'],
             capture_output=True, text=True, timeout=10,
         )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f'{type(e).__name__}: {e}'
+    output = (result.stdout or result.stderr).strip() or '(no output)'
+    return result.returncode == 0, output
+
+
+def certbot_health_check() -> bool:
+    """Return True iff the persistent certbot binary executes and reports a version."""
+    ok, _ = probe_certbot()
+    return ok
+
+
+def venv_python_version() -> Optional[str]:
+    """Return the `version` recorded in certbot-venv/pyvenv.cfg, or None.
+
+    `bin/python3` inside the venv is a symlink to /usr/bin/python3, so the venv
+    follows the system interpreter across a firmware update while pyvenv.cfg
+    keeps recording the version it was *built* against. The difference between
+    the two is the whole failure: site-packages lives under lib/python<built>/
+    and a bumped interpreter looks for lib/python<running>/, which does not
+    exist.
+    """
+    cfg_path = os.path.join(CERTBOT_VENV, 'pyvenv.cfg')
+    try:
+        with open(cfg_path, 'r', encoding='utf-8') as fh:
+            for line in fh:
+                key, sep, value = line.partition('=')
+                # Exact match — 3.12+ also writes `version_info = 3.13.5.final.0`.
+                if sep and key.strip() == 'version':
+                    return value.strip() or None
+    except OSError:
+        return None
+    return None
+
+
+def _major_minor(version: Optional[str]) -> Optional[str]:
+    """Reduce '3.13.5' to '3.13'. Returns None for anything unparseable."""
+    if not version:
+        return None
+    parts = version.strip().split('.')
+    if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+        return None
+    return f'{parts[0]}.{parts[1]}'
+
+
+def running_python_version() -> str:
+    """major.minor of the interpreter running this script, e.g. '3.13'."""
+    return f'{sys.version_info[0]}.{sys.version_info[1]}'
+
+
+def venv_version_mismatch_reason() -> Optional[str]:
+    """Name a pyvenv.cfg / running-interpreter major.minor mismatch, or None.
+
+    Split out from stale_venv_reason() because this is the half that explains
+    *why* — worth printing in --status next to the traceback, where "exists but
+    does not execute" would only restate the ✗ above it.
+    """
+    built = _major_minor(venv_python_version())
+    running = running_python_version()
+    if built and built != running:
+        return (f'certbot venv was built against Python {built} but python3 is '
+                f'now {running}; its site-packages are unreachable')
+    return None
+
+
+def stale_venv_reason(healthy: Optional[bool] = None) -> Optional[str]:
+    """Explain why the certbot venv needs a from-scratch rebuild, or None.
+
+    Two independent signals, version first because it names the cause in the
+    log rather than just the symptom:
+
+      1. pyvenv.cfg records a different major.minor than the running python3.
+         This is the firmware-update case, and it is detectable even while
+         certbot happens to still run.
+      2. CERTBOT_BIN exists but will not execute — a corrupt venv, a
+         half-finished pip install, or a version bump we could not name.
+
+    Returns None when there is no venv at all: that is bootstrap's ordinary
+    create path, not a rebuild.
+    """
+    if not os.path.exists(CERTBOT_BIN):
+        return None
+
+    mismatch = venv_version_mismatch_reason()
+    if mismatch:
+        return mismatch
+
+    if healthy is None:
+        healthy = certbot_health_check()
+    if not healthy:
+        return f'{CERTBOT_BIN} exists but does not execute'
+
+    return None
 
 
 def _dpkg_installed(package: str) -> bool:
@@ -2025,15 +2173,16 @@ def _dpkg_installed(package: str) -> bool:
 
 def _ensure_apt_prereqs() -> tuple[bool, str]:
     """
-    Ensure apt prereqs (python3-pip / python3-venv / python3-distutils) are installed.
+    Ensure the apt prereqs for the running interpreter are installed.
 
     These ship pre-stripped on UniFi OS firmware images, so we apt-install them
     on demand. They get wiped on every firmware update — self-heal handles the
-    re-install on next renewal.
+    re-install on next renewal. apt_prereqs() decides whether the set includes
+    python3-distutils; see the note on APT_PREREQS_PRE_312.
 
     Returns: (success, message)
     """
-    needed = [pkg for pkg in APT_PREREQS if not _dpkg_installed(pkg)]
+    needed = [pkg for pkg in apt_prereqs() if not _dpkg_installed(pkg)]
     if not needed:
         return True, "all prereqs present"
 
@@ -2129,8 +2278,9 @@ def bootstrap_certbot(dns_provider: str, force: bool = False) -> tuple[bool, str
     Build /data/unifi-cert/certbot-venv and install certbot + the requested DNS plugin.
 
     Idempotent — if the venv is healthy and the plugin is already present, returns
-    immediately without invoking pip or apt. Set force=True to rebuild from scratch
-    (e.g., after a Python minor-version bump that broke the venv).
+    immediately without invoking pip or apt. Set force=True to rebuild from scratch;
+    stale_venv_reason() also promotes a plain call to a rebuild when the existing
+    venv was built against a different Python minor version or no longer executes.
 
     Tries the wheel cache (offline path) before reaching for PyPI, so a previously
     bootstrapped device with a populated /data/unifi-cert/wheels/ can recover after
@@ -2145,9 +2295,31 @@ def bootstrap_certbot(dns_provider: str, force: bool = False) -> tuple[bool, str
     if not dirs_ok:
         return False, dirs_msg
 
-    if not force and certbot_health_check() and _dns_plugin_installed(dns_provider):
-        ui.debug(f"certbot venv at {CERTBOT_VENV} is healthy; skipping bootstrap")
-        return True, "already healthy"
+    if not force:
+        healthy = certbot_health_check()
+
+        # Self-promote to a rebuild. Without this, a venv stranded by a Python
+        # minor-version bump falls straight through the `not os.path.exists
+        # (CERTBOT_BIN)` guard below — the console script is still on disk, it
+        # just cannot import certbot — and every pip call downstream is then
+        # driven through the same dead shim. Observed in the wild 2026-09-21:
+        # self-heal retried nightly for two weeks and recreated nothing.
+        #
+        # This is checked BEFORE the healthy-and-plugin-present early return,
+        # not after. A pyvenv.cfg that no longer matches the interpreter means
+        # the venv is untrustworthy even while it happens to still import —
+        # and that mismatch is the only signal available *before* the next
+        # firmware update finishes the job. Ordering it the other way round
+        # made the version check unreachable whenever certbot still ran, which
+        # is exactly the case it exists to catch early. The rebuild regenerates
+        # pyvenv.cfg, so this cannot loop.
+        reason = stale_venv_reason(healthy)
+        if reason:
+            ui.warning(f'{reason}; rebuilding venv from scratch')
+            force = True
+        elif healthy and _dns_plugin_installed(dns_provider):
+            ui.debug(f"certbot venv at {CERTBOT_VENV} is healthy; skipping bootstrap")
+            return True, "already healthy"
 
     ok, msg = _ensure_apt_prereqs()
     if not ok:
@@ -2395,10 +2567,10 @@ def is_renewal_due(domain: str, days: int = 30) -> bool:
     if not meta.valid_to:
         return True
     try:
-        expiry = datetime.strptime(meta.valid_to, '%Y-%m-%d %H:%M:%S+00')
+        expiry = parse_cert_timestamp(meta.valid_to)
     except ValueError:
         return True
-    remaining = expiry - datetime.utcnow()
+    remaining = expiry - datetime.now(timezone.utc)
     return remaining.days < days
 
 
@@ -3388,6 +3560,9 @@ fi
 
 RENEWAL_HOOK_PATH = '/etc/letsencrypt/renewal-hooks/post/unifi-cert-hook.sh'
 STATUS_LOG_TAIL_LINES = 20
+# A broken certbot answers with a full traceback; quote the tail of it (where
+# the actual exception lives) rather than the whole stack.
+STATUS_CERTBOT_ERROR_LINES = 3
 
 
 def _format_cert_block(meta: 'CertMetadata', source_label: str,
@@ -3396,8 +3571,8 @@ def _format_cert_block(meta: 'CertMetadata', source_label: str,
     days_remaining = ''
     try:
         if meta.valid_to:
-            expiry = datetime.strptime(meta.valid_to, '%Y-%m-%d %H:%M:%S+00')
-            delta = expiry - datetime.utcnow()
+            expiry = parse_cert_timestamp(meta.valid_to)
+            delta = expiry - datetime.now(timezone.utc)
             days_remaining = f'{delta.days} days'
     except ValueError:
         days_remaining = '(unparseable)'
@@ -3450,22 +3625,38 @@ def _print_certificate_section(domain: Optional[str]) -> bool:
     return False
 
 
-def _print_certbot_section() -> None:
-    """Report certbot venv presence + reported version."""
+def _print_certbot_section(dns_provider: Optional[str] = None) -> bool:
+    """Report certbot venv presence + reported version.
+
+    Returns False only when the venv is *broken* — present on disk but unable
+    to execute. A venv that was never built is reported as missing and returns
+    True, because an unprovisioned device is empty rather than broken.
+
+    Goes through probe_certbot() rather than re-running `certbot --version`
+    here. The reimplementation this replaces read the streams and never looked
+    at the return code, so a dead venv printed its ModuleNotFoundError as the
+    version string under a green check — the reason a two-week outage looked
+    healthy in --status.
+    """
     if not os.path.exists(CERTBOT_BIN):
         ui.warning(f'Certbot venv missing: {CERTBOT_BIN}')
-        return
-    try:
-        result = subprocess.run(
-            [CERTBOT_BIN, '--version'],
-            capture_output=True, text=True, timeout=10,
-        )
-        version = (result.stdout or result.stderr).strip() or '(no output)'
-    except (subprocess.TimeoutExpired, OSError) as e:
-        ui.warning(f'Certbot venv at {CERTBOT_BIN} but failed to run: {e}')
-        return
+        return True
+
+    ok, output = probe_certbot()
+    if not ok:
+        ui.failure(f'Certbot venv BROKEN: {CERTBOT_BIN} (certbot --version failed)')
+        mismatch = venv_version_mismatch_reason()
+        if mismatch:
+            ui.info(f'  {mismatch}')
+        for line in output.splitlines()[-STATUS_CERTBOT_ERROR_LINES:]:
+            ui.info(f'  {line.strip()}')
+        ui.info(f'  Repair: python3 {PERMANENT_SCRIPT_PATH} --bootstrap '
+                f'--dns-provider {dns_provider or "<provider>"}')
+        return False
+
     ui.success(f'Certbot venv: {CERTBOT_BIN}')
-    ui.info(f'  {version}')
+    ui.info(f'  {output}')
+    return True
 
 
 def _print_schedule_section() -> None:
@@ -3622,6 +3813,11 @@ def print_status(host: Optional[str] = None,
     venv, cron/hook/boot script, lock state, GlennR residue, and log tail.
     Remote mode (host=...): SCP the script to the device if needed and
     SSH-execute `--status` there, forwarding stdout back to the caller.
+
+    Exit code is 0 for a readable report and 1 when something is actively
+    broken, so `--status || alert` is a usable monitor. Only the certbot venv
+    failing to execute qualifies today — missing pieces on an unprovisioned
+    device still exit 0.
     """
     if host:
         if args is None:
@@ -3649,7 +3845,7 @@ def print_status(host: Optional[str] = None,
     _print_certificate_section(domain)
 
     ui.header('Certbot')
-    _print_certbot_section()
+    certbot_ok = _print_certbot_section(cfg.get('dns_provider'))
 
     ui.header('Schedule & hooks')
     _print_schedule_section()
@@ -3664,7 +3860,7 @@ def print_status(host: Optional[str] = None,
     ui.header('Log tail')
     _print_log_tail_section()
 
-    return 0
+    return 0 if certbot_ok else 1
 
 
 # =============================================================================
@@ -4642,6 +4838,29 @@ VERB_HANDLERS = (
     ('install', _handle_install),
 )
 
+# Verbs that run unattended: cron fires --renew and --ddns-update, certbot's
+# post-renewal hook fires --deploy-hook, on_boot.d fires --self-heal, and
+# --bootstrap / --migrate-glennr arrive over BatchMode SSH from --host dispatch.
+# Two behaviours key off this single list — interactive prompting is skipped,
+# and the startup banner is suppressed.
+#
+# The banner is not cosmetic. --ddns-update fires every five minutes, so
+# `━━━ UniFi Certificate Manager ━━━` plus its leading blank line was appended
+# to unifi-cert.log ~288 times a day. The 20-line tail that --status prints was
+# therefore *entirely* banner, which is how 14 consecutive nights of
+# `⚠ self-heal: bootstrap deferred` stayed invisible while the certbot venv was
+# dead. (The DDNS no-op itself already logs at debug level and contributed
+# nothing; the banner was the whole of it.)
+AUTOMATION_VERB_ATTRS = (
+    'renew', 'deploy_hook', 'self_heal', 'bootstrap',
+    'migrate_glennr', 'ddns_update',
+)
+
+
+def is_automation_verb(args: argparse.Namespace) -> bool:
+    """True when this invocation came from cron, a certbot hook, or on_boot.d."""
+    return any(getattr(args, attr, False) for attr in AUTOMATION_VERB_ATTRS)
+
 
 def main() -> int:
     """Main entry point."""
@@ -4650,7 +4869,15 @@ def main() -> int:
     args = parse_args()
     ui = UI(color=not args.no_color, verbose=args.verbose)
 
-    ui.header('UniFi Certificate Manager')
+    # Automation verbs run non-interactively even on a TTY — cron, certbot
+    # deploy-hooks, and on_boot.d invoke us, never a human.
+    automation_verb = is_automation_verb(args)
+
+    # Banner for humans at a terminal only. Everything else — cron redirecting
+    # into LOG_FILE, --host dispatch capturing stdout, a piped run — gets a
+    # report that starts with its first real line. See AUTOMATION_VERB_ATTRS.
+    if not automation_verb and sys.stdout.isatty():
+        ui.header('UniFi Certificate Manager')
 
     # Remote dispatch short-circuit. Verbs in REMOTE_DISPATCH_VERBS combined
     # with --host SCP the script to the device (when sha differs) and SSH-
@@ -4678,13 +4905,6 @@ def main() -> int:
     # Status report (local). Compose existing helpers — no side effects.
     if args.status:
         return print_status()
-
-    # Automation verbs run non-interactively even on a TTY — cron, certbot
-    # deploy-hooks, and on_boot.d invoke us, never a human.
-    automation_verb = (
-        args.renew or args.deploy_hook or args.self_heal or args.bootstrap
-        or args.migrate_glennr or args.ddns_update
-    )
 
     # Determine if we should run interactive mode
     # Run interactive if: TTY available (check stdout since stdin may be pipe from curl),

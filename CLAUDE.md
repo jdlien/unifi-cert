@@ -63,6 +63,15 @@ Everything that needs to survive UniFi OS firmware updates lives under `/data/un
 
 The script itself stays at `/data/scripts/unifi-cert.py` — that path is referenced by cron and the renewal hook.
 
+## Bootstrap Resilience (Python minor-version bumps)
+
+`certbot-venv/bin/python3` is a symlink to `/usr/bin/python3`, so the venv follows the system interpreter across a UniFi OS firmware update while its `site-packages` stay under the `lib/python<built>/` it was created with. A Debian 12 → 13 bump (3.9 → 3.13) therefore strands certbot without removing anything: `bin/certbot` is still on disk, it just cannot import. Observed in the wild 2026-09-21, two weeks after the fact. Invariants:
+
+- **`apt_prereqs()` is derived per-run, not a constant.** `python3-distutils` is requested only below Python 3.12 (PEP 632 removed distutils; Debian dropped the package). `_ensure_apt_prereqs()` installs the set in one `apt-get install`, so one unavailable member fails the whole call — that alone blocked 14 nightly self-heal rebuilds. Don't flatten the two tuples back together, and don't delete the package: devices on older firmware still need it.
+- **`bootstrap_certbot()` self-promotes to `force`** via `stale_venv_reason()`, which fires on a `pyvenv.cfg` `version` whose major.minor differs from the running interpreter (names the cause in the log) or on `CERTBOT_BIN` existing but not executing (catches corruption and half-finished installs). Without it the `if not os.path.exists(CERTBOT_BIN)` guard skips recreation and every pip call below runs through the dead shim. Nothing in the tree passes `force=True` on its own.
+- **`probe_certbot()` is the single `certbot --version` implementation.** Health is the *return code*. A stranded venv writes a `ModuleNotFoundError` traceback to stderr, so any caller reading the streams without checking status reports it as healthy — which is exactly what `--status` did.
+- **The banner is suppressed for `AUTOMATION_VERB_ATTRS` and whenever stdout is not a TTY.** `--ddns-update` runs every 5 minutes; ~288 banners a day filled `LOG_FILE` and pushed everything real out of the 20-line tail `--status` prints. The same tuple drives non-interactive dispatch, so there is one list.
+
 ## Verbs (mutually exclusive)
 
 Each verb has a `_handle_<verb>(args) -> int` function; `main()` dispatches via the `VERB_HANDLERS` table after the shared prep (UI, `--host` short-circuit, interactive mode, domain auto-detect, validation).
@@ -126,7 +135,7 @@ Cron line is installed alongside `--renew` by `install_cron_schedule()`:
 - `load_provisioning_config()` — domain / email / DNS provider / credentials path
 - `CertMetadata.from_cert_file()` — issuer, valid_from, valid_to, SANs (tries persistent lineage first, then EUS path)
 - `is_renewal_due()` — within-30-days check
-- `subprocess.run([CERTBOT_BIN, '--version'])` — venv health
+- `probe_certbot()` — venv health; the *return code*, never the presence of output (a venv orphaned by a Python bump still writes a traceback to stderr)
 - `os.path.exists()` against `CRON_FILE` / `RENEWAL_HOOK_PATH` / `BOOT_SCRIPT_PATH`
 - `acquire_lock(timeout=0)` round-trip — held vs idle
 - `inventory_glennr()` — residue scan (reuses the migration allowlist)
@@ -134,6 +143,8 @@ Cron line is installed alongside `--renew` by `install_cron_schedule()`:
 - last `STATUS_LOG_TAIL_LINES` (20) of `LOG_FILE`
 
 When `host` is set, `print_status()` short-circuits to `dispatch_remote_verb('--status', host, args)` so the same code path runs on the device.
+
+Exit code: 0 for a readable report, 1 when something is actively **broken** — today, only the certbot venv existing but failing to execute. Missing pieces on an unprovisioned device stay 0, so `--status || alert` doesn't cry wolf on a fresh box. Findings inside the report use `ui.failure()` (a red ✗ on **stdout**), not `ui.error()` — `run_remote()` forwards only stdout, so a ✗ on stderr is dropped by `--status --host`.
 
 ## UniFi Certificate Paths
 

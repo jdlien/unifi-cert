@@ -21,7 +21,8 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
-from datetime import datetime, timedelta
+import warnings
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, mock_open, patch
 
@@ -70,6 +71,25 @@ class TestUI:
         result = ui._c(ui.GREEN, "test")
         assert result == "test"
         assert ui.GREEN not in result
+
+    def test_ui_failure_goes_to_stdout(self, capsys):
+        """failure() is success()'s counterpart: a ✗ inside the report body.
+
+        error() stays on stderr, which run_remote() discards — a --status
+        finding written there is invisible over --host.
+        """
+        ui = unifi_cert.UI(color=False)
+        ui.failure("Certbot venv BROKEN")
+        captured = capsys.readouterr()
+        assert '✗ Certbot venv BROKEN' in captured.out
+        assert captured.err == ''
+
+    def test_ui_error_stays_on_stderr(self, capsys):
+        ui = unifi_cert.UI(color=False)
+        ui.error("something broke")
+        captured = capsys.readouterr()
+        assert '✗ something broke' in captured.err
+        assert captured.out == ''
 
     def test_ui_header(self, capsys):
         """Test header output."""
@@ -3379,6 +3399,388 @@ class TestCertbotBootstrap:
 
 
 # =============================================================================
+# PYTHON MINOR-VERSION BUMP RESILIENCE
+# =============================================================================
+#
+# In the wild, 2026-09-21: a UniFi OS update moved a device from Debian 12 /
+# Python 3.9.2 to Debian 13 / Python 3.13.5. The certbot venv followed the
+# system interpreter (bin/python3 is a symlink) but its site-packages stayed
+# under lib/python3.9/, so certbot stopped importing. Nightly --self-heal
+# detected the breakage and failed to repair it for 14 consecutive nights,
+# for two independent reasons covered below.
+
+@pytest.fixture
+def certbot_venv(tmp_path):
+    """A certbot venv on disk: bin/certbot plus a writable pyvenv.cfg.
+
+    Patches CERTBOT_VENV / CERTBOT_BIN / CERTBOT_PIP at the module so the
+    bootstrap and status paths probe this tree instead of /data.
+    """
+    venv = tmp_path / 'certbot-venv'
+    (venv / 'bin').mkdir(parents=True)
+    certbot_bin = venv / 'bin' / 'certbot'
+    certbot_bin.write_text('#!/bin/sh\necho "certbot 4.2.0"\n')
+    certbot_bin.chmod(0o755)
+
+    def write_pyvenv(version, extra=''):
+        (venv / 'pyvenv.cfg').write_text(
+            'home = /usr/bin\n'
+            'include-system-site-packages = false\n'
+            f'version = {version}\n'
+            f'{extra}'
+        )
+
+    with patch.multiple(unifi_cert,
+                        CERTBOT_VENV=str(venv),
+                        CERTBOT_BIN=str(certbot_bin),
+                        CERTBOT_PIP=str(venv / 'bin' / 'pip')):
+        yield {'venv': venv, 'bin': certbot_bin, 'write_pyvenv': write_pyvenv}
+
+
+class TestAptPrereqVersionGating:
+    """Fix 1: python3-distutils is only requested below Python 3.12."""
+
+    def test_distutils_requested_below_312(self):
+        """Older UniFi OS images still need python3-distutils."""
+        with patch.object(sys, 'version_info', (3, 9, 2, 'final', 0)):
+            prereqs = unifi_cert.apt_prereqs()
+        assert 'python3-distutils' in prereqs
+        assert 'python3-pip' in prereqs
+        assert 'python3-venv' in prereqs
+
+    def test_distutils_requested_at_311(self):
+        """3.11 is the last release that still ships distutils."""
+        with patch.object(sys, 'version_info', (3, 11, 9, 'final', 0)):
+            assert 'python3-distutils' in unifi_cert.apt_prereqs()
+
+    def test_distutils_dropped_at_312(self):
+        """PEP 632 removed distutils in 3.12; Debian dropped the package."""
+        with patch.object(sys, 'version_info', (3, 12, 0, 'final', 0)):
+            prereqs = unifi_cert.apt_prereqs()
+        assert 'python3-distutils' not in prereqs
+        assert tuple(prereqs) == ('python3-pip', 'python3-venv')
+
+    def test_distutils_dropped_at_313(self):
+        """The version the affected device actually landed on."""
+        with patch.object(sys, 'version_info', (3, 13, 5, 'final', 0)):
+            assert 'python3-distutils' not in unifi_cert.apt_prereqs()
+
+    def test_apt_install_argv_omits_distutils_on_313(self):
+        """The whole point: the apt-get argv must not carry the dead package.
+
+        `apt-get install -y python3-pip python3-venv python3-distutils` fails
+        as a unit on Debian 13 with "Package 'python3-distutils' has no
+        installation candidate", taking the two available packages down with
+        it.
+        """
+        update_result = MagicMock(returncode=0)
+        install_result = MagicMock(returncode=0, stdout='', stderr='')
+        with patch.object(sys, 'version_info', (3, 13, 5, 'final', 0)), \
+             patch.object(unifi_cert, '_dpkg_installed', return_value=False), \
+             patch('subprocess.run',
+                   side_effect=[update_result, install_result]) as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert._ensure_apt_prereqs()
+        assert ok is True
+        install_cmd = mock_run.call_args_list[1].args[0]
+        assert 'python3-distutils' not in install_cmd
+        assert install_cmd[-2:] == ['python3-pip', 'python3-venv']
+
+    def test_apt_install_argv_includes_distutils_on_39(self):
+        """A device still on 3.9 keeps getting the package it needs."""
+        update_result = MagicMock(returncode=0)
+        install_result = MagicMock(returncode=0, stdout='', stderr='')
+        with patch.object(sys, 'version_info', (3, 9, 2, 'final', 0)), \
+             patch.object(unifi_cert, '_dpkg_installed', return_value=False), \
+             patch('subprocess.run',
+                   side_effect=[update_result, install_result]) as mock_run, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert._ensure_apt_prereqs()
+        assert ok is True
+        assert 'python3-distutils' in mock_run.call_args_list[1].args[0]
+
+
+class TestVenvPythonVersion:
+    """Reading the interpreter version a venv was built against."""
+
+    def test_reads_version_from_pyvenv_cfg(self, certbot_venv):
+        certbot_venv['write_pyvenv']('3.9.2')
+        assert unifi_cert.venv_python_version() == '3.9.2'
+
+    def test_version_info_line_is_not_mistaken_for_version(self, certbot_venv):
+        """3.12+ writes both `version` and `version_info`; match exactly."""
+        certbot_venv['write_pyvenv']('3.13.5',
+                                     extra='version_info = 3.13.5.final.0\n')
+        assert unifi_cert.venv_python_version() == '3.13.5'
+
+    def test_missing_pyvenv_cfg_returns_none(self, certbot_venv):
+        """No pyvenv.cfg (hand-built tree) is unknown, not a mismatch."""
+        assert unifi_cert.venv_python_version() is None
+
+    def test_pyvenv_cfg_without_version_key_returns_none(self, certbot_venv):
+        (certbot_venv['venv'] / 'pyvenv.cfg').write_text('home = /usr/bin\n')
+        assert unifi_cert.venv_python_version() is None
+
+    def test_major_minor_truncates(self):
+        assert unifi_cert._major_minor('3.13.5') == '3.13'
+        assert unifi_cert._major_minor('3.9.2') == '3.9'
+        assert unifi_cert._major_minor('3.9') == '3.9'
+
+    def test_major_minor_rejects_garbage(self):
+        assert unifi_cert._major_minor(None) is None
+        assert unifi_cert._major_minor('') is None
+        assert unifi_cert._major_minor('3') is None
+        assert unifi_cert._major_minor('three.point.nine') is None
+
+    def test_running_python_version_matches_interpreter(self):
+        assert unifi_cert.running_python_version() == (
+            f'{sys.version_info[0]}.{sys.version_info[1]}')
+
+
+class TestStaleVenvReason:
+    """Fix 2's detector: when does an existing venv need a full rebuild?"""
+
+    def test_no_venv_is_not_stale(self, tmp_path):
+        """A device that has never bootstrapped needs a create, not a rebuild."""
+        with patch.object(unifi_cert, 'CERTBOT_BIN',
+                          str(tmp_path / 'nope' / 'certbot')):
+            assert unifi_cert.stale_venv_reason() is None
+
+    def test_matching_version_and_healthy_is_not_stale(self, certbot_venv):
+        certbot_venv['write_pyvenv'](
+            f'{sys.version_info[0]}.{sys.version_info[1]}.0')
+        assert unifi_cert.stale_venv_reason(healthy=True) is None
+
+    def test_version_mismatch_reason_is_reusable_on_its_own(self, certbot_venv):
+        """--status prints just this half; the health half would be noise there."""
+        certbot_venv['write_pyvenv']('3.9.2')
+        assert '3.9' in unifi_cert.venv_version_mismatch_reason()
+        certbot_venv['write_pyvenv'](
+            f'{sys.version_info[0]}.{sys.version_info[1]}.0')
+        assert unifi_cert.venv_version_mismatch_reason() is None
+
+    def test_version_mismatch_is_stale(self, certbot_venv):
+        """The field case, named in the log line rather than just detected."""
+        certbot_venv['write_pyvenv']('3.9.2')
+        reason = unifi_cert.stale_venv_reason(healthy=True)
+        assert reason is not None
+        assert '3.9' in reason
+        assert unifi_cert.running_python_version() in reason
+
+    def test_unexecutable_venv_is_stale(self, certbot_venv):
+        """Matching version but certbot won't run: corrupt / half-installed."""
+        certbot_venv['write_pyvenv'](
+            f'{sys.version_info[0]}.{sys.version_info[1]}.0')
+        reason = unifi_cert.stale_venv_reason(healthy=False)
+        assert reason is not None
+        assert 'does not execute' in reason
+
+    def test_unknown_version_falls_back_to_health(self, certbot_venv):
+        """No pyvenv.cfg: healthy is fine, unhealthy is a rebuild."""
+        assert unifi_cert.stale_venv_reason(healthy=True) is None
+        assert unifi_cert.stale_venv_reason(healthy=False) is not None
+
+    def test_health_is_probed_when_not_supplied(self, certbot_venv):
+        """Callers may omit `healthy`; it is then measured, not assumed."""
+        certbot_venv['write_pyvenv'](
+            f'{sys.version_info[0]}.{sys.version_info[1]}.0')
+        with patch.object(unifi_cert, 'certbot_health_check',
+                          return_value=False) as hc:
+            reason = unifi_cert.stale_venv_reason()
+        hc.assert_called_once()
+        assert 'does not execute' in reason
+
+
+class TestBootstrapRebuildsStaleVenv:
+    """Fix 2: bootstrap_certbot() self-promotes to force when the venv is stale.
+
+    Before this, the non-force path read `if not os.path.exists(CERTBOT_BIN)`.
+    In the field CERTBOT_BIN *did* exist — it was the 3.9 console script — so the
+    venv was never recreated and every pip call below was driven through the
+    equally dead 3.9 shim. Nothing ever passed force=True.
+    """
+
+    def test_version_mismatch_beats_the_healthy_early_return(self, certbot_venv,
+                                                             capsys):
+        """A stale pyvenv.cfg rebuilds even when certbot runs and the plugin is in.
+
+        Regression test with a scar: the staleness check originally sat *after*
+        `if healthy and _dns_plugin_installed(...)`, so on real hardware — where
+        a mislabelled venv still imports — the early return fired and nothing
+        was rebuilt. Caught on hardware, not here, because the first version of
+        this test mocked the plugin away and never reached the branch.
+        """
+        certbot_venv['write_pyvenv']('3.9.2')
+        results = [MagicMock(returncode=0, stderr='') for _ in range(4)]
+        with patch.object(unifi_cert, '_ensure_persistent_dirs',
+                          return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check', return_value=True), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=True), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(True, 'ok')), \
+             patch('subprocess.run', side_effect=results) as mock_run, \
+             patch.object(unifi_cert, 'cache_wheels', return_value=True), \
+             patch.object(unifi_cert, 'ui', new=unifi_cert.UI(color=False)):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+
+        assert ok is True
+        assert msg == 'bootstrapped'
+        # The old tree is gone (rmtree was real, not mocked) ...
+        assert not os.path.exists(str(certbot_venv['venv']))
+        # ... and the very first subprocess call recreated it, rather than
+        # falling through to pip inside the dead venv.
+        first_cmd = mock_run.call_args_list[0].args[0]
+        assert first_cmd[:3] == ['python3', '-m', 'venv']
+        out = capsys.readouterr().out
+        assert 'built against Python 3.9' in out
+        assert 'rebuilding venv from scratch' in out
+
+    def test_version_mismatch_with_dead_certbot_rebuilds(self, certbot_venv):
+        """The literal field shape: stale label *and* certbot cannot import."""
+        certbot_venv['write_pyvenv']('3.9.2')
+        results = [MagicMock(returncode=0, stderr='') for _ in range(4)]
+        with patch.object(unifi_cert, '_ensure_persistent_dirs',
+                          return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check',
+                          side_effect=[False, True]), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(True, 'ok')), \
+             patch('subprocess.run', side_effect=results) as mock_run, \
+             patch.object(unifi_cert, 'cache_wheels', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert ok is True
+        assert not os.path.exists(str(certbot_venv['venv']))
+        assert mock_run.call_args_list[0].args[0][:3] == ['python3', '-m', 'venv']
+
+    def test_broken_venv_triggers_rebuild(self, certbot_venv, capsys):
+        """certbot present but not executable is also promoted to a rebuild."""
+        certbot_venv['write_pyvenv'](
+            f'{sys.version_info[0]}.{sys.version_info[1]}.0')
+        results = [MagicMock(returncode=0, stderr='') for _ in range(4)]
+        with patch.object(unifi_cert, '_ensure_persistent_dirs',
+                          return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check',
+                          side_effect=[False, True]), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(True, 'ok')), \
+             patch('subprocess.run', side_effect=results) as mock_run, \
+             patch.object(unifi_cert, 'cache_wheels', return_value=True), \
+             patch.object(unifi_cert, 'ui', new=unifi_cert.UI(color=False)):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+
+        assert ok is True
+        assert not os.path.exists(str(certbot_venv['venv']))
+        assert mock_run.call_args_list[0].args[0][:3] == ['python3', '-m', 'venv']
+        assert 'does not execute' in capsys.readouterr().out
+
+    def test_healthy_matching_venv_is_left_alone(self, certbot_venv):
+        """No rebuild when the venv works and was built against this Python."""
+        certbot_venv['write_pyvenv'](
+            f'{sys.version_info[0]}.{sys.version_info[1]}.0')
+        with patch.object(unifi_cert, '_ensure_persistent_dirs',
+                          return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check', return_value=True), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=True), \
+             patch('subprocess.run') as mock_run, \
+             patch('shutil.rmtree') as mock_rmtree, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert (ok, msg) == (True, 'already healthy')
+        mock_run.assert_not_called()
+        mock_rmtree.assert_not_called()
+
+    def test_health_check_runs_once_per_bootstrap_decision(self, certbot_venv):
+        """The promotion reuses the health result instead of re-probing.
+
+        certbot --version is a subprocess against a possibly-hung binary; the
+        decision path should pay for it once.
+        """
+        certbot_venv['write_pyvenv'](
+            f'{sys.version_info[0]}.{sys.version_info[1]}.0')
+        results = [MagicMock(returncode=0, stderr='') for _ in range(4)]
+        with patch.object(unifi_cert, '_ensure_persistent_dirs',
+                          return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check',
+                          side_effect=[False, True]) as hc, \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs', return_value=(True, 'ok')), \
+             patch('subprocess.run', side_effect=results), \
+             patch.object(unifi_cert, 'cache_wheels', return_value=True), \
+             patch.object(unifi_cert, 'ui'):
+            unifi_cert.bootstrap_certbot('digitalocean')
+        # One probe for the decision, one to verify the result.
+        assert hc.call_count == 2
+
+    def test_stale_venv_still_fails_cleanly_when_apt_is_unavailable(
+            self, certbot_venv):
+        """Fix 2 does not paper over Fix 1: apt failure still reports itself."""
+        certbot_venv['write_pyvenv']('3.9.2')
+        with patch.object(unifi_cert, '_ensure_persistent_dirs',
+                          return_value=(True, 'ok')), \
+             patch.object(unifi_cert, 'certbot_health_check', return_value=False), \
+             patch.object(unifi_cert, '_dns_plugin_installed', return_value=False), \
+             patch.object(unifi_cert, '_ensure_apt_prereqs',
+                          return_value=(False, "Package 'python3-distutils' "
+                                               "has no installation candidate")), \
+             patch('shutil.rmtree') as mock_rmtree, \
+             patch.object(unifi_cert, 'ui'):
+            ok, msg = unifi_cert.bootstrap_certbot('digitalocean')
+        assert ok is False
+        assert 'distutils' in msg
+        # And it bails before destroying the only venv it has.
+        mock_rmtree.assert_not_called()
+
+
+class TestProbeCertbot:
+    """The shared `certbot --version` probe behind health check + --status."""
+
+    def test_missing_binary(self, tmp_path):
+        with patch.object(unifi_cert, 'CERTBOT_BIN', str(tmp_path / 'certbot')):
+            ok, output = unifi_cert.probe_certbot()
+        assert ok is False
+        assert 'does not exist' in output
+
+    def test_healthy_returns_version_string(self):
+        result = MagicMock(returncode=0, stdout='certbot 5.8.0\n', stderr='')
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            assert unifi_cert.probe_certbot() == (True, 'certbot 5.8.0')
+
+    def test_nonzero_returncode_is_not_ok(self):
+        """The live field output: a traceback on stderr, exit 1."""
+        traceback = ("Traceback (most recent call last):\n"
+                     "  File \"/data/unifi-cert/certbot-venv/bin/certbot\", line 5\n"
+                     "ModuleNotFoundError: No module named 'certbot'")
+        result = MagicMock(returncode=1, stdout='', stderr=traceback)
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            ok, output = unifi_cert.probe_certbot()
+        assert ok is False
+        assert "No module named 'certbot'" in output
+
+    def test_timeout_is_not_ok(self):
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run',
+                   side_effect=subprocess.TimeoutExpired('certbot', 10)):
+            ok, output = unifi_cert.probe_certbot()
+        assert ok is False
+        assert 'TimeoutExpired' in output
+
+    def test_silent_success_reports_no_output(self):
+        result = MagicMock(returncode=0, stdout='', stderr='')
+        with patch('os.path.exists', return_value=True), \
+             patch('subprocess.run', return_value=result):
+            assert unifi_cert.probe_certbot() == (True, '(no output)')
+
+    def test_health_check_delegates_to_probe(self):
+        """certbot_health_check() is now a thin wrapper — one implementation."""
+        with patch.object(unifi_cert, 'probe_certbot',
+                          return_value=(False, 'boom')) as probe:
+            assert unifi_cert.certbot_health_check() is False
+        probe.assert_called_once_with()
+
+
+# =============================================================================
 # UNIFI OS 5.x cert-deploy fixes (override removal, nginx config, Java keystore)
 # =============================================================================
 
@@ -3751,6 +4153,83 @@ class TestRenewalDue:
         with patch.object(unifi_cert, 'certbot_live_dir', return_value=str(tmp_path)), \
              patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=meta):
             assert unifi_cert.is_renewal_due('example.com') is False
+
+
+class TestCertTimestampTimezone:
+    """datetime.utcnow() is deprecated in 3.12 and slated for removal.
+
+    Python 3.13 emits a DeprecationWarning per call; cron redirects stderr
+    into unifi-cert.log, so each one landed in the log. Swapping to
+    datetime.now(timezone.utc) makes the left-hand side of every expiry
+    subtraction tz-aware, so the cert timestamp — parsed from a naive
+    `%Y-%m-%d %H:%M:%S+00` literal — has to be made aware in step or Python
+    raises TypeError instead of drifting silently.
+    """
+
+    def test_parse_cert_timestamp_is_utc_aware(self):
+        dt = unifi_cert.parse_cert_timestamp('2026-11-25 12:00:00+00')
+        assert dt.tzinfo is not None
+        assert dt.utcoffset() == timedelta(0)
+        assert (dt.year, dt.month, dt.day, dt.hour) == (2026, 11, 25, 12)
+
+    def test_parse_cert_timestamp_rejects_garbage(self):
+        with pytest.raises(ValueError):
+            unifi_cert.parse_cert_timestamp('garbage-date')
+
+    def test_renewal_due_does_not_mix_naive_and_aware(self, tmp_path):
+        """The regression this guards: TypeError, not a wrong answer."""
+        (tmp_path / 'cert.pem').write_text('fake')
+        soon = datetime.now(timezone.utc) + timedelta(days=5)
+        meta = MagicMock(valid_to=soon.strftime('%Y-%m-%d %H:%M:%S+00'))
+        with patch.object(unifi_cert, 'certbot_live_dir', return_value=str(tmp_path)), \
+             patch.object(unifi_cert.CertMetadata, 'from_cert_file', return_value=meta):
+            assert unifi_cert.is_renewal_due('example.com', days=30) is True
+
+    def test_format_cert_block_computes_days_remaining(self, capsys):
+        """--status's days-remaining does the same subtraction."""
+        expiry = datetime.now(timezone.utc) + timedelta(days=65)
+        meta = unifi_cert.CertMetadata(
+            cn='example.com', issuer_c='US', issuer_o="Let's Encrypt",
+            issuer_cn='R11', sans=['example.com'],
+            valid_from='2026-01-01 00:00:00+00',
+            valid_to=expiry.strftime('%Y-%m-%d %H:%M:%S+00'),
+            serial='ABCD', fingerprint='AA:BB',
+        )
+        with patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert._format_cert_block(meta, 'EUS cert', None)
+        assert '64 days' in capsys.readouterr().out
+
+    def test_no_deprecation_warning_from_expiry_math(self, tmp_path):
+        """pyproject silences DeprecationWarning globally; opt back in here."""
+        (tmp_path / 'cert.pem').write_text('fake')
+        future = datetime.now(timezone.utc) + timedelta(days=90)
+        meta = MagicMock(valid_to=future.strftime('%Y-%m-%d %H:%M:%S+00'))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with patch.object(unifi_cert, 'certbot_live_dir',
+                              return_value=str(tmp_path)), \
+                 patch.object(unifi_cert.CertMetadata, 'from_cert_file',
+                              return_value=meta):
+                unifi_cert.is_renewal_due('example.com')
+        assert not [w for w in caught
+                    if issubclass(w.category, DeprecationWarning)
+                    and 'utcnow' in str(w.message)]
+
+    def test_snapshot_timestamp_still_utc_and_zulu_formatted(self):
+        """The backup tarball name must keep its shape: <YYYYmmdd>T<HHMMSS>Z."""
+        inv = unifi_cert.GlennRInventory()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with patch('os.makedirs'), \
+                 patch('tarfile.open', side_effect=OSError('stop here')), \
+                 patch.object(unifi_cert, 'ui'):
+                unifi_cert.snapshot_glennr(inv)
+        assert not [w for w in caught
+                    if issubclass(w.category, DeprecationWarning)
+                    and 'utcnow' in str(w.message)]
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        assert len(stamp) == 16 and stamp.endswith('Z') and 'T' in stamp
 
 
 class TestSchedule:
@@ -6734,6 +7213,233 @@ class TestPrintStatus:
             assert 'HELD' in out
         finally:
             unifi_cert.release_lock(lock_fh)
+
+
+class TestPrintCertbotSection:
+    """Fix 3: --status must not badge a dead venv with a green check.
+
+    The live field report read:
+
+        ✓ Certbot venv: /data/unifi-cert/certbot-venv/bin/certbot
+            ModuleNotFoundError: No module named 'certbot'
+
+    — because the renderer took `(stdout or stderr).strip()` as the version
+    string and never looked at the return code.
+    """
+
+    def test_broken_venv_reports_error_not_success(self, certbot_venv, capsys):
+        """Non-zero exit → ✗ on stderr, no success line, error text quoted."""
+        traceback = ("Traceback (most recent call last):\n"
+                     "  File \"/data/unifi-cert/certbot-venv/bin/certbot\", line 5\n"
+                     "ModuleNotFoundError: No module named 'certbot'")
+        result = MagicMock(returncode=1, stdout='', stderr=traceback)
+        with patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            ok = unifi_cert._print_certbot_section()
+        captured = capsys.readouterr()
+        assert ok is False
+        # On stdout, not stderr: run_remote() forwards only stdout, so a ✗
+        # written to stderr never survives `--status --host <device>`.
+        assert 'BROKEN' in captured.out
+        assert '✗' in captured.out
+        assert "No module named 'certbot'" in captured.out
+        assert 'Certbot venv: ' not in captured.out
+        assert '✓' not in captured.out
+
+    def test_broken_venv_names_the_version_bump(self, certbot_venv, capsys):
+        """A stale pyvenv.cfg turns "it's broken" into "here's why"."""
+        certbot_venv['write_pyvenv']('3.9.2')
+        result = MagicMock(returncode=1, stdout='', stderr='ModuleNotFoundError')
+        with patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert._print_certbot_section()
+        out = capsys.readouterr().out
+        assert 'built against Python 3.9' in out
+        assert '--bootstrap' in out  # and the repair command
+
+    def test_generic_breakage_does_not_restate_the_check(self, certbot_venv, capsys):
+        """With no pyvenv.cfg to explain it, don't echo "does not execute"."""
+        result = MagicMock(returncode=1, stdout='', stderr='ModuleNotFoundError')
+        with patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert._print_certbot_section()
+        out = capsys.readouterr().out
+        assert 'does not execute' not in out
+        assert 'BROKEN' in out
+
+    def test_repair_line_names_the_configured_provider(self, certbot_venv, capsys):
+        """The repair command should be copy-pasteable, not a template."""
+        result = MagicMock(returncode=1, stdout='', stderr='ModuleNotFoundError')
+        with patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert._print_certbot_section('cloudflare')
+        assert '--bootstrap --dns-provider cloudflare' in capsys.readouterr().out
+
+    def test_repair_line_falls_back_when_provider_unknown(self, certbot_venv, capsys):
+        result = MagicMock(returncode=1, stdout='', stderr='ModuleNotFoundError')
+        with patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert._print_certbot_section(None)
+        assert '--dns-provider <provider>' in capsys.readouterr().out
+
+    def test_healthy_venv_reports_version(self, certbot_venv, capsys):
+        result = MagicMock(returncode=0, stdout='certbot 5.8.0\n', stderr='')
+        with patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            ok = unifi_cert._print_certbot_section()
+        out = capsys.readouterr().out
+        assert ok is True
+        assert 'Certbot venv: ' in out
+        assert 'certbot 5.8.0' in out
+
+    def test_missing_venv_is_missing_not_broken(self, tmp_path, capsys):
+        """An unprovisioned device is empty, not broken — still returns True."""
+        with patch.object(unifi_cert, 'CERTBOT_BIN', str(tmp_path / 'certbot')), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            ok = unifi_cert._print_certbot_section()
+        assert ok is True
+        assert 'Certbot venv missing' in capsys.readouterr().out
+
+    def test_hung_certbot_reports_error(self, certbot_venv, capsys):
+        with patch('subprocess.run',
+                   side_effect=subprocess.TimeoutExpired('certbot', 10)), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            ok = unifi_cert._print_certbot_section()
+        assert ok is False
+        assert 'BROKEN' in capsys.readouterr().out
+
+    def test_traceback_is_truncated_to_its_tail(self, certbot_venv, capsys):
+        """Quote where the exception is, not the whole stack."""
+        stderr = '\n'.join(f'frame line {i}' for i in range(20)) + '\nBoomError: x'
+        result = MagicMock(returncode=1, stdout='', stderr=stderr)
+        with patch('subprocess.run', return_value=result), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            unifi_cert._print_certbot_section()
+        out = capsys.readouterr().out
+        assert 'BoomError: x' in out
+        assert 'frame line 0' not in out
+
+
+class TestStatusExitCode:
+    """--status exits non-zero when it finds something actively broken."""
+
+    def test_broken_certbot_makes_status_exit_1(self, status_paths, capsys):
+        """`--status || alert` is now a usable monitor for the venv."""
+        certbot_bin = status_paths['CERTBOT_BIN']
+        os.makedirs(os.path.dirname(certbot_bin), exist_ok=True)
+        with open(certbot_bin, 'w') as fh:
+            fh.write('#!/bin/sh\nexit 1\n')
+        os.chmod(certbot_bin, 0o755)
+
+        def fake_run(cmd, *args, **kwargs):
+            return MagicMock(returncode=1, stdout='',
+                             stderr="ModuleNotFoundError: No module named 'certbot'")
+
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=unifi_cert.GlennRInventory()), \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
+             patch('subprocess.run', side_effect=fake_run), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            rc = unifi_cert.print_status()
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert 'BROKEN' in captured.out
+        assert captured.err == ''
+        # The rest of the report still renders — this is a report, not an abort.
+        assert 'Log tail' in captured.out
+        assert 'No GlennR residue' in captured.out
+
+    def test_unprovisioned_device_still_exits_0(self, status_paths, capsys):
+        """Missing pieces are not a broken device; exit code stays 0."""
+        with patch.object(unifi_cert, 'inventory_glennr',
+                          return_value=unifi_cert.GlennRInventory()), \
+             patch.object(unifi_cert, 'detect_domain_from_cert', return_value=None), \
+             patch.object(unifi_cert, 'ui',
+                          new=unifi_cert.UI(color=False, verbose=False)):
+            rc = unifi_cert.print_status()
+        assert rc == 0
+        assert 'Certbot venv missing' in capsys.readouterr().out
+
+
+class TestStartupBanner:
+    """Fix 4: the banner is for humans at a terminal, not for the log.
+
+    --ddns-update fires every five minutes, so `━━━ UniFi Certificate Manager
+    ━━━` plus its blank line landed in unifi-cert.log ~288 times a day. The
+    20-line tail --status prints was entirely banner, which is why 14
+    consecutive `self-heal: bootstrap deferred` warnings were never seen.
+    """
+
+    BANNER = 'UniFi Certificate Manager'
+
+    def _run_main(self, argv, isatty):
+        with patch('sys.argv', argv), \
+             patch('sys.stdout.isatty', return_value=isatty), \
+             patch('sys.stdin.isatty', return_value=False), \
+             patch.object(unifi_cert, 'rotate_log'), \
+             patch.object(unifi_cert, 'ddns_update', return_value=True), \
+             patch.object(unifi_cert, 'self_heal', return_value=True), \
+             patch.object(unifi_cert, 'print_status', return_value=0):
+            return unifi_cert.main()
+
+    def test_ddns_update_prints_no_banner_even_on_a_tty(self, capsys):
+        """The 288-a-day case."""
+        assert self._run_main(['unifi-cert', '--ddns-update'], isatty=True) == 0
+        assert self.BANNER not in capsys.readouterr().out
+
+    def test_self_heal_prints_no_banner(self, capsys):
+        assert self._run_main(['unifi-cert', '--self-heal'], isatty=True) == 0
+        assert self.BANNER not in capsys.readouterr().out
+
+    def test_status_on_a_tty_keeps_the_banner(self, capsys):
+        """Interactive use is unchanged."""
+        assert self._run_main(['unifi-cert', '--status'], isatty=True) == 0
+        assert self.BANNER in capsys.readouterr().out
+
+    def test_status_redirected_to_a_file_prints_no_banner(self, capsys):
+        """Anything piped or redirected starts at its first real line."""
+        assert self._run_main(['unifi-cert', '--status'], isatty=False) == 0
+        assert self.BANNER not in capsys.readouterr().out
+
+
+class TestAutomationVerbs:
+    """One list drives both non-interactive dispatch and banner suppression."""
+
+    @pytest.mark.parametrize('attr', [
+        'renew', 'deploy_hook', 'self_heal', 'bootstrap',
+        'migrate_glennr', 'ddns_update',
+    ])
+    def test_each_automation_verb_is_recognized(self, attr):
+        args = argparse.Namespace(**{a: False for a in
+                                     unifi_cert.AUTOMATION_VERB_ATTRS})
+        setattr(args, attr, True)
+        assert unifi_cert.is_automation_verb(args) is True
+
+    def test_human_verbs_are_not_automation(self):
+        args = argparse.Namespace(**{a: False for a in
+                                     unifi_cert.AUTOMATION_VERB_ATTRS})
+        assert unifi_cert.is_automation_verb(args) is False
+
+    def test_missing_attribute_does_not_raise(self):
+        """A partial Namespace (as tests and --host dispatch build) is fine."""
+        assert unifi_cert.is_automation_verb(argparse.Namespace()) is False
+
+    def test_every_automation_attr_is_a_real_verb_flag(self):
+        """Guard against the list drifting away from the parser."""
+        with patch('sys.argv', ['unifi-cert']):
+            args = unifi_cert.parse_args()
+        for attr in unifi_cert.AUTOMATION_VERB_ATTRS:
+            assert hasattr(args, attr), f'{attr} is not a parsed flag'
 
 
 class TestPrintDdnsSection:

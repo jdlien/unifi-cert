@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-09-21
+
+Surviving a Python minor-version bump. On 2026-09-21 the certbot venv on the affected device (UDM Pro) was found dead, and `--status` was reporting it with a green checkmark.
+
+The venv was built on 2026-04-27 against Python 3.9.2. `certbot-venv/bin/python3` is a symlink to `/usr/bin/python3`, so when a UniFi OS update between 2026-08-27 and 2026-09-08 took the box to Debian 13 / **Python 3.13.5**, the venv followed the interpreter while its `site-packages` stayed under `lib/python3.9/` — with `cpython-39-aarch64` `.so` files 3.13 could not have loaded in any case. certbot 4.2.0 was stranded in place: `bin/certbot` still on disk, unable to import.
+
+`self_heal()` ran nightly at 03:17, detected the breakage correctly via `certbot_health_check()`, and failed to repair it **14 nights running**. Nobody noticed, because a broken venv only matters at renewal time — thirty days before expiry, still five weeks out — and because every surface that should have said so was lying or buried. Four independent faults, each sufficient on its own to prevent recovery.
+
+The box was repaired by hand the same day (fresh 3.13 venv, certbot 5.8.0, cp313 wheel cache, existing lineage verified). Everything below is so that the next bump is a non-event and the recovery is `--self-heal` rather than a person with an SSH session.
+
+### Fixed
+
+- **`python3-distutils` is no longer requested on Python 3.12+.** `APT_PREREQS` was a flat tuple and `_ensure_apt_prereqs()` installs every missing member in a single `apt-get install -y`, so one unavailable package takes the whole call down. distutils left the stdlib in 3.12 (PEP 632) and Debian dropped the package with it; on the affected device `apt-cache policy python3-distutils` answers `Candidate: (none)`. Every nightly rebuild attempt for two weeks died on `E: Package 'python3-distutils' has no installation candidate`, never reaching the venv. New `apt_prereqs()` derives the set from the running interpreter, so devices on older firmware still get the package and Debian 13 devices stop asking for a package that cannot exist.
+
+- **`bootstrap_certbot()` now rebuilds a stale venv without being told to.** This is the fault that actually prevented recovery, and it survives the distutils fix on its own. The non-`force` path read `if not os.path.exists(CERTBOT_BIN)` — and `CERTBOT_BIN` *did* exist; it was the broken 3.9 console script. So the venv was never recreated, and execution fell straight through to `CERTBOT_PIP`, the equally dead 3.9 shim, for the pip upgrade and both install attempts. The docstring had anticipated exactly this case (*"after a Python minor-version bump that broke the venv"*) but nothing in the tree ever passed `force=True`.
+
+  New `stale_venv_reason()` promotes a plain call to a from-scratch rebuild on either of two signals: the `version` in `certbot-venv/pyvenv.cfg` differing in major.minor from the running `python3` — the firmware-update case, which is detectable even while certbot happens to still run, and which names the cause in the log rather than just the symptom — or `CERTBOT_BIN` existing and refusing to execute, which additionally catches a corrupt venv or a half-finished install. A venv that has never been built is still an ordinary create, not a rebuild, and an apt failure still aborts *before* the existing venv is torn down.
+
+  That check runs **before** the `healthy and plugin-present` early return, not after. Ordering it after made the version signal unreachable in exactly the case it exists to catch early: on hardware, a mislabelled venv still imports, so the early return fired and nothing was rebuilt. Found on hardware, not in the suite — the first version of the test mocked the DNS plugin away and so never reached the branch. The rebuild regenerates `pyvenv.cfg`, so a mismatch cannot loop.
+
+- **`--status` no longer badges a dead venv with a green checkmark.** `_print_certbot_section()` ran `certbot --version`, took `(result.stdout or result.stderr).strip()` as the version string, and called `ui.success()` unconditionally — `result.returncode` was never read. The live report read:
+
+  ```
+  ✓ Certbot venv: /data/unifi-cert/certbot-venv/bin/certbot
+      ModuleNotFoundError: No module named 'certbot'
+  ```
+
+  `certbot_health_check()` had this right all along (`return result.returncode == 0`); the reporting path had reimplemented the probe and got it wrong. Both now go through one `probe_certbot()`. A broken venv reports `✗ Certbot venv BROKEN`, quotes the tail of the traceback, names the version bump when `pyvenv.cfg` explains it, and prints the repair command with the configured DNS provider filled in.
+
+- **The log is readable again.** `ui.header('UniFi Certificate Manager')` fired on every invocation, including the `--ddns-update` that cron runs every five minutes — roughly 288 banners a day, each with a leading blank line. `/data/unifi-cert/unifi-cert.log` had reached 673 KB and its last 20 lines were *entirely* banner and whitespace, which meant the log tail inside `--status` was equally useless and 14 consecutive nights of `⚠ self-heal: bootstrap deferred` scrolled past unseen. The banner is now printed only for a human at a terminal: suppressed for the automation verbs and whenever stdout is not a TTY. (The successful no-op DDNS update already logged at debug level and contributed nothing; the banner was the whole of it.)
+
+- **`datetime.utcnow()` replaced with `datetime.now(timezone.utc)`** at all four call sites. Python 3.13 emits a `DeprecationWarning` per call, and since cron redirects stderr into the log, each one landed there too. The result is tz-aware, so the certificate expiry it is subtracted from — parsed from a naive `%Y-%m-%d %H:%M:%S+00` literal — is now made aware in step by the new `parse_cert_timestamp()` helper, shared by `is_renewal_due()` and the `--status` days-remaining block. Mixing the two would raise `TypeError` rather than drift quietly, but only at renewal time; a test now covers each.
+
+### Changed
+
+- **`--status` exits 1 when it finds something actively broken**, so `--status --host <device> || alert` is a usable monitor. Today that means the certbot venv existing but failing to execute. An unprovisioned device with nothing installed still exits 0 — missing is not broken, and a fresh box should not cry wolf.
+- **New `ui.failure()`: a red `✗` on stdout**, the negative counterpart to `ui.success()`. `ui.error()` keeps its stderr contract for things going wrong during a run, but `run_remote()` forwards only stdout, so a finding written to stderr is dropped on the floor by `--status --host` — the reading that matters most here.
+- **`AUTOMATION_VERB_ATTRS`** replaces the inline boolean in `main()`. One tuple now drives both non-interactive dispatch and banner suppression, rather than two lists drifting apart.
+- Declared Python 3.13 support in `pyproject.toml`.
+
+### Tests
+
+- 466 → 530 collected (`+64`), coverage 89.4% → 89.9%. New fixtures: a `certbot_venv` tree with a writable `pyvenv.cfg` (the stale-version case, including the `version_info` line 3.12+ adds alongside `version`), and non-zero-returncode / timeout probes for the status renderer. Also covered: the `apt-get` argv with and without `python3-distutils` under a patched `sys.version_info`, that an apt failure does not destroy the existing venv, that the health probe is paid for once per bootstrap decision rather than twice, that the `✗` lands on stdout, and that the banner is absent for `--ddns-update` on a TTY but present for `--status` on one.
+
+### Verified on hardware
+
+Deployed to a UDM Pro (UniFi OS aarch64, Debian 13 / Python 3.13.5) from the working tree before this commit was written.
+
+The log on arrival was the diagnosis in one histogram — 27,833 lines, of which 13,755 were the banner and 13,755 the blank line preceding it. **323 lines, 1.2%, were real content**, and inside those: 13 x `self-heal: bootstrap deferred (... Package 'python3-distutils' has no installation candidate)`, 17 x the doomed `Installing apt prereqs: python3-pip python3-venv python3-distutils`, and 14 x the `utcnow()` DeprecationWarning. Every fault in this release, logged faithfully, and invisible. The file was filtered in place (banner lines dropped, blank runs collapsed, all 323 real lines verified preserved by count): 674 KB -> 28 KB, with a `.pre-2.2.0` copy kept beside it.
+
+- `--status` reports the repaired venv correctly (`certbot 5.8.0`, exit 0) and prints no banner over `--host`.
+- **Fix 2 proven against a real interpreter.** `pyvenv.cfg` was hand-staled to `version = 3.9.2` while certbot still ran — the stronger case, where only the version check can fire. `--self-heal --host` detected it (`certbot venv was built against Python 3.9 but python3 is now 3.13`), tore the venv down, rebuilt it, and **installed from the cp313 wheel cache rather than PyPI**, in 87 s. Verified afterwards: directory inode changed, `lib/python3.9/` replaced by `lib/python3.13/`, `pyvenv.cfg` regenerated to 3.13.5, certbot 5.8.0 + DNS plugin 5.8.0 reinstalled, and the certificate lineage untouched (serial and expiry unchanged, 64 days remaining). A second `--self-heal` took 5.7 s and skipped bootstrap, so the rebuild does not loop.
+- Run exactly as cron does: `--ddns-update` on a successful no-op appended **0 bytes**; `--renew` appended 335 bytes of real content, with no banner and no DeprecationWarning.
+
 ## [2.1.0] - 2026-07-31
 
 Cloudflare DDNS support, and the fix for `--ddns-update` never having succeeded once. See `docs/DDNS-CLOUDFLARE-PLAN.md` for the incident write-up.

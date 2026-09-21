@@ -1,6 +1,6 @@
 [project]
 name = "unifi-cert"
-version = "2.1.0"
+version = "2.2.0"
 description = "UniFi Certificate Manager - Manage Let's Encrypt SSL certificates on UniFi OS devices"
 readme = "README.md"
 license = {text = "MIT"}
@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security :: Cryptography",
     "Topic :: System :: Networking",
 ]
