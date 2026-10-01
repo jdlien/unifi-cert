@@ -36,7 +36,7 @@ clients sit on already carries the prefix. Measured on a UDM with Telus prefix d
 (`DDNS-CLOUDFLARE-PLAN.md`):
 
 ```
-br0  (LAN): 2001:56a:…:e00::1/64
+br0  (LAN): 2001:db8:1234:5600::1/64
 ```
 
 ```sh

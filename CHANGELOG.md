@@ -111,7 +111,7 @@ The log on arrival was the diagnosis in one histogram — 27,833 lines, of which
 
 Cloudflare DDNS support, and the fix for `--ddns-update` never having succeeded once. See `docs/DDNS-CLOUDFLARE-PLAN.md` for the incident write-up.
 
-Deployed and verified end-to-end on beehive (UDM Pro, `beehive.jdlien.com`) on 2026-07-31, against the live `jdlien.ca` zone at Cloudflare. The prior install had logged **6,366** consecutive `No A record found` failures and zero successful updates since April. After deployment: both targets resolve, an unchanged IP is a correct no-op, and a `--force` write edits both records **in place** — verified by record ID before and after (`620dfff9…`, `6088d3ba…` unchanged, zone still holding exactly three A records, the unrelated apex untouched). That last check is the never-create invariant proven against the real API rather than a mock.
+Deployed and verified end-to-end on beehive (UDM Pro, `beehive.jdlien.com`) on 2026-07-31, against the live `jdlien.ca` zone at Cloudflare. The prior install had logged **6,366** consecutive `No A record found` failures and zero successful updates since April. After deployment: both targets resolve, an unchanged IP is a correct no-op, and a `--force` write edits both records **in place** — verified by record ID before and after (both IDs unchanged, zone still holding exactly three A records, the unrelated apex untouched). That last check is the never-create invariant proven against the real API rather than a mock.
 
 ### Added
 
@@ -138,7 +138,7 @@ Deployed and verified end-to-end on beehive (UDM Pro, `beehive.jdlien.com`) on 2
 
 ## [2.0.1] - 2026-04-28
 
-End-to-end verified against bar (UDM Pro SE) + the Rednex NVR (UNVR). Eight migration-flow + remote-dispatch bugs uncovered during back-to-back GlennR cutovers and fixed at the source. Both hosts now on a single canonical lineage with a fresh LE cert; future installs should run end-to-end with no manual sed-and-rename.
+End-to-end verified against a UDM Pro SE and a UNVR at the second site. Eight migration-flow + remote-dispatch bugs uncovered during back-to-back GlennR cutovers and fixed at the source. Both hosts now on a single canonical lineage with a fresh LE cert; future installs should run end-to-end with no manual sed-and-rename.
 
 ### Fixed
 

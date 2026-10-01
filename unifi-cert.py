@@ -169,8 +169,8 @@ CONFIG_FILE = os.path.expanduser('~/.secrets/certbot/config.ini')
 #   1. IPv4-ONLY HOSTNAMES FIRST. We are filling in an A record, which can only
 #      hold an IPv4 address — but a dual-stack device (Telus hands out IPv6)
 #      will happily reach a dual-stack lookup service over v6, and be told its
-#      v6 address. Observed live: ipwho.is answered 2001:56a:… from the same
-#      machine where ipify answered 198.53.200.179. Hostnames that publish only
+#      v6 address. Observed live: ipwho.is answered the machine's IPv6 address
+#      where ipify answered its IPv4 one. Hostnames that publish only
 #      an A record force the connection over v4, so the answer is the address
 #      we actually need. The dual-stack services stay as fallbacks: they're
 #      correct on v4-only networks, and get skipped by is_public_ipv4()
