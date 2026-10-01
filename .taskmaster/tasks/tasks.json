@@ -1,0 +1,73 @@
+{
+  "master": {
+    "tasks": [
+      {
+        "id": 1,
+        "title": "IPv6: publish the LAN's prefix (feature B)",
+        "description": "Publish the /64 that the router's LAN clients get addresses from, as a TXT record on a name of its own, so an app can tell whether an IPv6 client is on the site's network, as it already does over IPv4 with the A record. Read from the LAN interface, never from a lookup service. Opt-in per device, with no fallback; edited by ID, never created; validated as global unicast /64; 'none' when there is no prefix. Plan: docs/DDNS-IPV6-PLAN.md.",
+        "status": "pending",
+        "priority": "low",
+        "dependencies": [],
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Confirm the site has IPv6",
+            "description": "A global address on the WAN, a delegated prefix, the LAN set to prefix delegation, and which bridge the shared devices join. Nothing else is worth building until this is true.",
+            "status": "pending"
+          },
+          {
+            "id": 2,
+            "title": "Settle the open question on multiple prefixes",
+            "description": "Every non-deprecated prefix, space-separated in one TXT value, or only the newest (docs/DDNS-IPV6-PLAN.md, 'Record shape').",
+            "status": "pending"
+          },
+          {
+            "id": 3,
+            "title": "get_lan_prefixes(interface)",
+            "description": "Parse `ip -6 -o addr show dev <if> scope global`; drop deprecated and tentative addresses; validate global unicast /64 (rejecting ULA, link-local and 2001:db8::/32); return CIDRs.",
+            "status": "pending"
+          },
+          {
+            "id": 4,
+            "title": "Generalize the record get/put to a record type",
+            "description": "_ddns_get_a_record() and _ddns_put_a_record() take a type; keep never-create. Check how Cloudflare round-trips TXT content (quoting) before the idempotent comparison.",
+            "status": "pending"
+          },
+          {
+            "id": 5,
+            "title": "Config, --ddns-update and --status",
+            "description": "ddns_lan6_name and ddns_lan6_interface, both required, no fallback. Write 'none' and escalate when there is no prefix. A state key of its own (<name>/TXT). --status shows the interface's prefix beside the published one.",
+            "status": "pending"
+          },
+          {
+            "id": 6,
+            "title": "Tests",
+            "description": "ip output fixtures (one prefix, renumbering with a deprecated prefix, ULA only, no IPv6), validation, never-create (missing TXT errors, no POST), the idempotent no-op, the 'none' sentinel.",
+            "status": "pending"
+          },
+          {
+            "id": 7,
+            "title": "Docs",
+            "description": "README 'DDNS Auto-Refresh' and the invariants in CLAUDE.md.",
+            "status": "pending"
+          },
+          {
+            "id": 8,
+            "title": "Deploy to the router only",
+            "description": "Create the TXT by hand, set the two keys on the router (no other device), run --ddns-update, check --status and the published value. Instance details in DEPLOYMENT.local.md.",
+            "status": "pending"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "IPv6: the router's own AAAA (feature A)",
+        "description": "An AAAA record for the UDM's WAN address on the DDNS name, from a v6-pinned lookup run on the UDM. Blocked on the inbound IPv6 firewall: clients prefer IPv6, so publishing before it is open makes the preferred path the broken one. Needs a reachability gate before the first publish and a ddns_ipv6 = true opt-in. Designed in docs/DDNS-CLOUDFLARE-PLAN.md, 'IPv6 / AAAA — deferred'. Independent of task 1.",
+        "status": "deferred",
+        "priority": "low",
+        "dependencies": [],
+        "subtasks": []
+      }
+    ]
+  }
+}

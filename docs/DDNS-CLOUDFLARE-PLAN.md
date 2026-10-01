@@ -17,7 +17,7 @@
 | ❌ `bar.rednex.ca` — Option A vs B decision, then rollout | not started |
 | ❌ Retire DigitalOcean (`jdlien.com`, `rednex.ca` nameserver moves) | not started |
 | ❌ Open decision 4 — external mismatch monitor | not started |
-| ⏸ AAAA / IPv6 records | deliberately deferred; see below |
+| ⏸ AAAA / IPv6 records | deliberately deferred; see below, and `DDNS-IPV6-PLAN.md` for the LAN prefix |
 
 Keep this document until those are done. Past that it still earns its place as the
 post-mortem behind the invariants in `CLAUDE.md` — "never create" and "DDNS target is
